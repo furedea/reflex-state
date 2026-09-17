@@ -106,16 +106,15 @@ SKILL.state の論文は，各ステップで最新の観測を渡します．Re
 
 ```json
 {
-  "projection": { "placement": "last-message" },
-  "verificationCommands": { "test": ["^make check$"] }
+    "projection": { "placement": "last-message" },
+    "verificationCommands": { "test": ["^make check$"] }
 }
 ```
 
 コマンドの正規表現を追加すると，組み込みの test／build／lint の検出を拡張できます．
 不明なキーには警告を出します．型，閾値，上限値，正規表現が不正な場合や認証情報を含む場合は，
 その設定ファイルを拒否してデフォルトに戻します．
-全デフォルト値は [core/config.ts](https://github.com/furedea/reflex-state/blob/main/src/core/config.ts) と
-[設定の仕様](https://github.com/furedea/reflex-state/blob/main/docs/spec/reflex_state_v0.1_spec_claude.md#21-configuration) を参照してください．
+全デフォルト値は [core/config.ts](https://github.com/furedea/reflex-state/blob/main/src/core/config.ts) を参照してください．
 
 | 操作                         | 動作                                                                                 |
 | ---------------------------- | ------------------------------------------------------------------------------------ |
@@ -224,7 +223,4 @@ Pi のスモークテストは，モデルへのネットワーク通信を無�
   プロバイダーが追加したツール結果ブロックを拒否する場合は，`projection.placement` を `run-start` にするか，
   投影を無効にしてください．`run-start` はプロンプトキャッシュの再利用を減らす可能性があります．
 
-要件の正本は [レビュー済み仕様書](https://github.com/furedea/reflex-state/blob/main/docs/spec/reflex_state_v0.1_spec_claude.md) です．
-[元の草案](https://github.com/furedea/reflex-state/blob/main/docs/spec/reflex_state_v0.1_spec_gpt6_pro.md) は履歴資料として保存しています．
-[Phase 0 の調査結果](https://github.com/furedea/reflex-state/blob/main/docs/spec/phase0_findings.md) に互換性の確認根拠と未実施の実通信チェックを，
 [ADR-0002](https://github.com/furedea/reflex-state/blob/main/docs/adr/0002_compose_adapters_at_entry_points.md) にアダプターの組み立て方針を記載しています．

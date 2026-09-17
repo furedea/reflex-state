@@ -40,7 +40,7 @@ export, and replay commands, or [日本語の README](../README_ja.md).
 
 Offline checks cover Pi's real extension loader, local tools, session persistence, branches,
 projection, packaged command execution, and recorded replay. Successful live provider and Jev
-checks are still outstanding; see the [verification record](spec/phase0_findings.md).
+checks are still outstanding.
 
 This alpha does not establish token savings or better task completion. Context projection omits
 earlier runs and may omit useful information. Bash-driven file changes are not tracked, and

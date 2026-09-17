@@ -102,15 +102,14 @@ Example project config:
 
 ```json
 {
-  "projection": { "placement": "last-message" },
-  "verificationCommands": { "test": ["^make check$"] }
+    "projection": { "placement": "last-message" },
+    "verificationCommands": { "test": ["^make check$"] }
 }
 ```
 
 Additional command regexes extend built-in test/build/lint detection. Unknown keys warn;
 invalid types, thresholds, limits, regexes, or credential fields reject the file and restore
-defaults. Full defaults live in [core/config.ts](https://github.com/furedea/reflex-state/blob/main/src/core/config.ts) and the
-[configuration specification](https://github.com/furedea/reflex-state/blob/main/docs/spec/reflex_state_v0.1_spec_claude.md#21-configuration).
+defaults. Full defaults live in [core/config.ts](https://github.com/furedea/reflex-state/blob/main/src/core/config.ts).
 
 | Control                      | Effect                                                                          |
 | ---------------------------- | ------------------------------------------------------------------------------- |
@@ -213,7 +212,4 @@ Current limitations:
   provider rejects the appended tool-result block, set `projection.placement` to `run-start`
   or disable projection. Run-start placement may reduce prompt-cache reuse.
 
-The [reviewed specification](https://github.com/furedea/reflex-state/blob/main/docs/spec/reflex_state_v0.1_spec_claude.md) owns requirements.
-The [original draft](https://github.com/furedea/reflex-state/blob/main/docs/spec/reflex_state_v0.1_spec_gpt6_pro.md) is archival.
-[Phase 0 findings](https://github.com/furedea/reflex-state/blob/main/docs/spec/phase0_findings.md) record compatibility evidence and outstanding
-live checks; [ADR-0002](https://github.com/furedea/reflex-state/blob/main/docs/adr/0002_compose_adapters_at_entry_points.md) explains composition.
+[ADR-0002](https://github.com/furedea/reflex-state/blob/main/docs/adr/0002_compose_adapters_at_entry_points.md) explains composition.
