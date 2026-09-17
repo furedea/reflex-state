@@ -102,8 +102,8 @@ Example project config:
 
 ```json
 {
-    "projection": { "placement": "last-message" },
-    "verificationCommands": { "test": ["^make check$"] }
+  "projection": { "placement": "last-message" },
+  "verificationCommands": { "test": ["^make check$"] }
 }
 ```
 

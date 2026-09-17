@@ -106,8 +106,8 @@ SKILL.state の論文は，各ステップで最新の観測を渡します．Re
 
 ```json
 {
-    "projection": { "placement": "last-message" },
-    "verificationCommands": { "test": ["^make check$"] }
+  "projection": { "placement": "last-message" },
+  "verificationCommands": { "test": ["^make check$"] }
 }
 ```
 
