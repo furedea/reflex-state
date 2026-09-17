@@ -3,9 +3,10 @@
 This is publication copy for review, not an announcement that a release is available. Update
 the validation status before publishing these notes.
 
-ReflexState adds execution state to Pi coding sessions: the current goal, changed files,
-verification results, and blockers. Inspect them with `/state`, review transitions with
-`/state history`, and export a session for deterministic replay.
+ReflexState gives Pi a working memory you can inspect and replay. It carries your current
+goal, changed files, test results, and blockers into the agent's context, with state changes
+linked to their source events. Inspect `/state`, trace updates with `/state history`, and
+replay recorded state changes without model calls or running tools again.
 
 ## Try the preview
 

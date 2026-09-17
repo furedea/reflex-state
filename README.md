@@ -1,11 +1,27 @@
 # ReflexState
 
+**Give Pi a working memory you can inspect and replay.**
+
 English | [日本語](README_ja.md)
 
-ReflexState v0.1 maintains typed execution state for Pi coding sessions. Code extracts file
-changes, verification results, and activity; optional TypeSafe Jev decisions classify or resolve
-tool errors and recognize task completion. The reducer owns state changes. Evidence remains
-linked to bounded raw events, without generated natural-language summaries.
+ReflexState is a [Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)
+extension that keeps your current goal, changed files, test results, and blockers in the
+agent's context. It builds this working memory from execution events, keeping state changes
+connected to their source evidence.
+
+- **Carry task state forward.** Give the model the current run and a compact state block.
+  The full session history stays on disk.
+- **See what changed and why.** Inspect `/state` and `/state history`. Each transition records
+  its source event and the decisions behind the update.
+- **Reproduce state changes.** Export a session and replay its state updates using recorded
+  decisions, without model calls or running tools again.
+
+State maintenance runs separately from Pi's reasoning model. Code tracks file changes and
+test/build/lint results; optional TypeSafe Jev decisions classify errors and recognize task
+completion. ReflexState maintains structured state without generating prose summaries.
+
+**Alpha preview:** [Try it locally](#run-locally). No additional API key is needed to start.
+See [verification and limitations](#verification-and-limitations) for current coverage.
 
 ## Install the preview
 

@@ -1,15 +1,18 @@
 {
   "name": "reflex-state",
   "version": "0.1.0-alpha.1",
-  "description": "Track goals, tests, and blockers in Pi, with context projection and replay",
+  "description": "Working memory for Pi coding agents: keep goals, checks, and blockers in context, with state you can inspect and replay.",
   "keywords": [
+    "agent-memory",
     "agent-state",
+    "ai-agents",
+    "coding-agent",
+    "context-engineering",
     "context-management",
     "pi-coding-agent",
     "pi-extension",
     "pi-package",
-    "replay",
-    "typescript"
+    "replay"
   ],
   "homepage": "https://github.com/furedea/reflex-state#readme",
   "bugs": {
