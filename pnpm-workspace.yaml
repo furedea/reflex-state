@@ -3,6 +3,12 @@ packages:
 
 catalogs: {}
 
+overrides:
+  # Pi 0.83.0 pins an affected version; 8.9.0 fixes GHSA-4cwx-7wf7-3272.
+  "@earendil-works/pi-coding-agent@0.83.0>undici": 8.9.0
+  # Exclude the affected Vite 8 range from Vitest's peer resolution.
+  "vite@>=8.0.0 <8.0.16": 8.0.16
+
 auditConfig:
   ignoreCves: []
 
