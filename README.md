@@ -1,64 +1,67 @@
 # ReflexState
 
-**Give Pi a working memory you can inspect and replay.**
+**SKILL.state × Jev for Pi.**
 
 English | [日本語](README_ja.md)
 
-ReflexState is a [Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)
-extension that keeps your current goal, changed files, test results, and blockers in the
-agent's context. It builds this working memory from execution events, keeping state changes
-connected to their source evidence.
+ReflexState adapts the explicit execution state idea from Google's
+[SKILL.state](https://arxiv.org/abs/2608.26263) to
+[Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent).
+[TypeSafe Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) and deterministic
+code maintain that state independently of the main reasoning LLM.
 
-- **Carry task state forward.** Give the model the current run and a compact state block.
-  The full session history stays on disk.
-- **See what changed and why.** Inspect `/state` and `/state history`. Each transition records
-  its source event and the decisions behind the update.
-- **Reproduce state changes.** Export a session and replay its state updates using recorded
-  decisions, without model calls or running tools again.
+- **The main model reasons and acts.** It receives the current run and structured state:
+  the goal, changed files, verification results, and active blockers.
+- **Jev makes semantic decisions.** Typed answers determine whether an error is a blocker,
+  whether new evidence resolves it, what remains relevant, and whether the task is complete.
+- **Code extracts facts and applies updates.** File changes and command results come from
+  execution events. Gated Jev decisions update state through deterministic code.
 
-State maintenance runs separately from Pi's reasoning model. Code tracks file changes and
-test/build/lint results; optional TypeSafe Jev decisions classify errors and recognize task
-completion. ReflexState maintains structured state without generating prose summaries.
+The aim is to make repeated state maintenance cheaper and faster while preserving agent
+performance. This alpha provides the runtime and measurements to test that hypothesis.
+State inspection and recorded replay make those updates traceable and reproducible.
 
-**Alpha preview:** [Try it locally](#run-locally). No additional API key is needed to start.
+**Alpha preview:** [Try it locally](#run-locally) with a TypeSafe API key for Jev.
 See [verification and limitations](#verification-and-limitations) for current coverage.
 
 ## Install the preview
 
 The npm command requires the first preview release. Until it is available, use the local
-checkout instructions below. With Pi installed:
+checkout instructions below. With Pi installed and `TYPESAFE_API_KEY` set in your environment:
 
 ```sh
 pi install npm:reflex-state@next
-REFLEX_STATE_DISABLE_JEV=1 pi
+pi
 ```
 
 Run `/state` to see the current goal, changed files, verification results, and blockers.
-The preview works without a TypeSafe key; Jev is an optional addition. Node.js 22.19 or later
-is required, and Pi 0.83.0 is the verified host version.
+For a baseline using only deterministic code, start with `REFLEX_STATE_DISABLE_JEV=1 pi`;
+that mode needs no TypeSafe key. Node.js 22.19 or later is required, and Pi 0.83.0 is the
+verified host version.
 
 ## Run locally
 
 Use Node.js 22.19 or later, pnpm 10.33.0, and Pi 0.83.0. Dependencies are pinned; Pi is a
-development dependency and TypeSafe SDK 0.6.0 is the only runtime dependency.
+development dependency and TypeSafe SDK 0.6.0 is the only runtime dependency. Set
+`TYPESAFE_API_KEY` in your environment to run with Jev.
 
 ```sh
 pnpm install --ignore-scripts
-REFLEX_STATE_DISABLE_JEV=1 pnpm exec pi
+pnpm exec pi
 ```
 
 Trust this checkout in Pi to load its `.pi/extensions/reflex_state.ts` entry automatically.
 To load an explicit path, including from another project:
 
 ```sh
-REFLEX_STATE_DISABLE_JEV=1 pnpm exec pi --no-extensions -e ./src/pi/index.ts
+pnpm exec pi --no-extensions -e ./src/pi/index.ts
 ```
 
 The explicit command disables discovery to avoid loading both entries in this checkout.
 When running elsewhere, use the absolute path to `src/pi/index.ts`. No Pi patch is required.
 
-To enable Jev, provide `TYPESAFE_API_KEY` through the environment and remove
-`REFLEX_STATE_DISABLE_JEV=1`. Keys are read by the SDK and are rejected in ReflexState config
+To try the deterministic baseline, use `REFLEX_STATE_DISABLE_JEV=1 pnpm exec pi`.
+The SDK reads `TYPESAFE_API_KEY` from the environment; keys are rejected in ReflexState config
 files. Missing or rejected credentials disable Jev for that runtime and produce one notification;
 deterministic state updates continue. `/state jev on` creates a fresh updater after credentials
 are corrected.
@@ -77,6 +80,9 @@ Each processed event appends a `reflex-state.transition` custom entry containing
 resulting state, effective config, cwd, and decisions. Restoration follows only the active Pi
 branch after its latest reset. IDs remain monotonic across resets and branch switches.
 The reducer is shared by live execution and replay; core imports no Pi or TypeSafe code.
+
+The SKILL.state paper supplies the latest observation at each step. ReflexState adapts this
+to Pi by retaining the complete current run alongside its execution state.
 
 Projection keeps the complete current run, including steers and matched tool exchanges, then
 appends a bounded `<reflex-state>` text block to its newest user or tool-result message. The

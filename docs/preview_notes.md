@@ -3,23 +3,24 @@
 This is publication copy for review, not an announcement that a release is available. Update
 the validation status before publishing these notes.
 
-ReflexState gives Pi a working memory you can inspect and replay. It carries your current
-goal, changed files, test results, and blockers into the agent's context, with state changes
-linked to their source events. Inspect `/state`, trace updates with `/state history`, and
-replay recorded state changes without model calls or running tools again.
+ReflexState brings the explicit execution state idea from Google's
+[SKILL.state](https://arxiv.org/abs/2608.26263) to Pi, with
+[TypeSafe Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) making semantic
+state decisions and deterministic code applying updates. The main LLM handles reasoning
+and actions; Jev and code maintain the execution state independently.
 
 ## Try the preview
 
-After this version has been published, with Pi installed:
+After this version has been published, with Pi installed and `TYPESAFE_API_KEY` set:
 
 ```sh
 pi install npm:reflex-state@next
-REFLEX_STATE_DISABLE_JEV=1 pi
+pi
 ```
 
-Ask Pi to fix a small failing test, then inspect `/state` before and after the fix. The preview
-works without TypeSafe credentials. Jev is optional and adds semantic decisions to deterministic
-state extraction.
+Ask Pi to fix a small failing test, then inspect `/state` before and after the fix. Use
+`/state debug` to inspect Jev's decisions and `/state history` to trace state updates.
+For a baseline without Jev or TypeSafe credentials, start with `REFLEX_STATE_DISABLE_JEV=1 pi`.
 
 Node.js 22.19 or later is required. Pi 0.83.0 is the host version used by the offline integration
 and package smoke tests. See the [README](../README.md) for local installation, configuration,
@@ -27,6 +28,7 @@ export, and replay commands, or [日本語の README](../README_ja.md).
 
 ## Included in this preview
 
+- Jev decisions for blockers, relevance, and task completion, applied through deterministic code.
 - Typed state derived from Pi events, with bounded source evidence and no generated summaries.
 - Branch-aware session restoration, state inspection, and configurable context projection.
 - Export and replay commands; recorded decisions reproduce the saved state pipeline exactly.

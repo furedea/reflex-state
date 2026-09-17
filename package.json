@@ -1,7 +1,7 @@
 {
   "name": "reflex-state",
   "version": "0.1.0-alpha.1",
-  "description": "Working memory for Pi coding agents: keep goals, checks, and blockers in context, with state you can inspect and replay.",
+  "description": "SKILL.state + Jev for Pi: execution state maintained by typed decisions and code, separate from the reasoning LLM.",
   "keywords": [
     "agent-memory",
     "agent-state",
@@ -9,10 +9,13 @@
     "coding-agent",
     "context-engineering",
     "context-management",
+    "jev",
     "pi-coding-agent",
     "pi-extension",
     "pi-package",
-    "replay"
+    "replay",
+    "skill-state",
+    "typesafe-ai"
   ],
   "homepage": "https://github.com/furedea/reflex-state#readme",
   "bugs": {
