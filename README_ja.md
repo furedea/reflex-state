@@ -208,6 +208,3 @@ Pi のスモークテストは，モデルへのネットワーク通信を無�
 [元の草案](https://github.com/furedea/reflex-state/blob/main/docs/spec/reflex_state_v0.1_spec_gpt6_pro.md) は履歴資料として保存しています．
 [Phase 0 の調査結果](https://github.com/furedea/reflex-state/blob/main/docs/spec/phase0_findings.md) に互換性の確認根拠と未実施の実通信チェックを，
 [ADR-0002](https://github.com/furedea/reflex-state/blob/main/docs/adr/0002_compose_adapters_at_entry_points.md) にアダプターの組み立て方針を記載しています．
-
-メンテナー向けの [リリース手順](https://github.com/furedea/reflex-state/blob/main/docs/releasing.md) に，初回公開の設定，来歴証明の検証，
-失敗時の再実行，`next` から `latest` への移行を記載しています．

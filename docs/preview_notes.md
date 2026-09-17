@@ -1,7 +1,7 @@
 # ReflexState v0.1.0-alpha.1 — draft release notes
 
-This is publication copy for review, not an announcement that a release is available. Complete
-the [release preparation](releasing.md) and update the validation status before publishing it.
+This is publication copy for review, not an announcement that a release is available. Update
+the validation status before publishing these notes.
 
 ReflexState adds execution state to Pi coding sessions: the current goal, changed files,
 verification results, and blockers. Inspect them with `/state`, review transitions with

@@ -195,6 +195,3 @@ The [reviewed specification](https://github.com/furedea/reflex-state/blob/main/d
 The [original draft](https://github.com/furedea/reflex-state/blob/main/docs/spec/reflex_state_v0.1_spec_gpt6_pro.md) is archival.
 [Phase 0 findings](https://github.com/furedea/reflex-state/blob/main/docs/spec/phase0_findings.md) record compatibility evidence and outstanding
 live checks; [ADR-0002](https://github.com/furedea/reflex-state/blob/main/docs/adr/0002_compose_adapters_at_entry_points.md) explains composition.
-
-Maintainers: see the [release guide](https://github.com/furedea/reflex-state/blob/main/docs/releasing.md) for first-publication setup, provenance
-verification, recovery, and promotion from `next` to `latest`.
