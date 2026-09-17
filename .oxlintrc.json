@@ -15,6 +15,24 @@
   },
   "overrides": [
     {
+      "files": ["src/core/**/*.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              "@earendil-works/*",
+              "@typesafe-ai/*",
+              "**/pi/**",
+              "**/typesafe/**",
+              "**/replay/**",
+              "**/composition.js"
+            ]
+          }
+        ]
+      }
+    },
+    {
       "files": ["**/*.test.ts", "**/*.spec.ts"],
       "globals": {
         "afterAll": "readonly",

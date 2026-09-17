@@ -1,0 +1,11 @@
+{
+  "entry": [
+    "src/index.ts",
+    "src/pi/index.ts",
+    "src/replay_cli.ts",
+    "src/export_trace_cli.ts",
+    ".pi/extensions/*.ts",
+    "scripts/*.mjs"
+  ],
+  "project": ["src/**/*.ts", ".pi/extensions/*.ts"]
+}

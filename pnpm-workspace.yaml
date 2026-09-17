@@ -3,6 +3,12 @@ packages:
 
 catalogs: {}
 
+overrides:
+  # Pi 0.83.0 pins an affected version; 8.9.0 fixes GHSA-4cwx-7wf7-3272.
+  "@earendil-works/pi-coding-agent@0.83.0>undici": 8.9.0
+  # Exclude the affected Vite 8 range from Vitest's peer resolution.
+  "vite@>=8.0.0 <8.0.16": 8.0.16
+
 auditConfig:
   ignoreCves: []
 
@@ -10,5 +16,7 @@ auditConfig:
 # Value is in minutes: 7 days × 24 h × 60 min = 10080
 minimumReleaseAge: 10080
 minimumReleaseAgeExclude:
+  # v0.1 specification requires the newly published SDK; keep the exception version-specific.
+  - "@typesafe-ai/sdk@0.6.0"
   # Renovate security update: vitest@4.1.11
   - vitest@4.1.11
