@@ -1,21 +1,68 @@
 {
-  "name": "template-typescript",
-  "version": "0.1.0",
-  "private": true,
+  "name": "reflex-state",
+  "version": "0.1.0-alpha.1",
+  "description": "Track goals, tests, and blockers in Pi, with context projection and replay",
+  "keywords": [
+    "agent-state",
+    "context-management",
+    "pi-coding-agent",
+    "pi-extension",
+    "pi-package",
+    "replay",
+    "typescript"
+  ],
+  "homepage": "https://github.com/furedea/reflex-state#readme",
+  "bugs": {
+    "url": "https://github.com/furedea/reflex-state/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/furedea/reflex-state.git"
+  },
+  "bin": {
+    "reflex-state-export": "./dist/export_trace_cli.js",
+    "reflex-state-replay": "./dist/replay_cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README_ja.md",
+    "LICENSE"
+  ],
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
+  },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "package:check": "node scripts/check_package.mjs",
+    "replay": "pnpm --silent run build && node dist/replay_cli.js",
+    "export-trace": "pnpm --silent run build && node dist/export_trace_cli.js",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint .",
     "lint:fix": "oxlint --fix .",
     "typecheck": "oxlint --type-aware --type-check .",
     "test": "vitest run",
+    "test:release": "node --test scripts/release_policy.test.mjs",
     "test:watch": "vitest",
     "knip": "knip",
     "knip:production": "knip --production",
-    "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run knip"
+    "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run test:release && pnpm run knip"
+  },
+  "dependencies": {
+    "@typesafe-ai/sdk": "0.6.0"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.83.0",
     "@types/node": "24.13.3",
     "knip": "6.4.1",
     "oxfmt": "0.45.0",
@@ -24,5 +71,21 @@
     "typescript": "6.0.3",
     "vitest": "4.1.11"
   },
-  "packageManager": "pnpm@10.33.0"
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "pi": {
+    "extensions": [
+      "./dist/pi/index.js"
+    ]
+  }
 }

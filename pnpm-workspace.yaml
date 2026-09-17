@@ -10,5 +10,7 @@ auditConfig:
 # Value is in minutes: 7 days × 24 h × 60 min = 10080
 minimumReleaseAge: 10080
 minimumReleaseAgeExclude:
+  # v0.1 specification requires the newly published SDK; keep the exception version-specific.
+  - "@typesafe-ai/sdk@0.6.0"
   # Renovate security update: vitest@4.1.11
   - vitest@4.1.11

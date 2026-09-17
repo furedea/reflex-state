@@ -15,3 +15,6 @@ node_modules/
 .pnpm-store/
 coverage/
 dist/
+.release/
+replay-output/
+trace-output/
