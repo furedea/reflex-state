@@ -46,10 +46,88 @@ function result(id: string): Message {
 }
 const context = () => ({ state: initialState(), evidence: new Map(), config: defaultConfig() });
 
+function enabledContext(mode: "append" | "current-run") {
+  const base = context();
+  return {
+    ...base,
+    config: {
+      ...base.config,
+      projection: { ...base.config.projection, enabled: true, mode },
+    },
+  };
+}
+
+test("projection is disabled by default and append retains every message", () => {
+  const messages = [user("goal"), assistant([], "stop"), user("next")];
+  expect(projectContext(messages, context()).messages).toBe(messages);
+  const projected = projectContext(messages, enabledContext("append"));
+  expect(projected.messages).toHaveLength(messages.length);
+  expect(projected.messages[0]).toEqual(messages[0]);
+  expect(JSON.stringify(messages)).not.toContain("<reflex-state>");
+  expect(JSON.stringify(projected.messages)).toContain("<reflex-state>");
+  expect(projected.measurement.messagesOmitted).toBe(0);
+});
+
+test("current-run retains the complete previous and current runs", () => {
+  const messages = [
+    user("old"),
+    assistant([], "stop"),
+    user("proposal"),
+    assistant([], "stop"),
+    user("implement proposal"),
+  ];
+  const projected = projectContext(messages, enabledContext("current-run"));
+  expect(projected.messages.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
+  expect(projected.messages[0]).toMatchObject({ content: "proposal" });
+  expect(projected.measurement.messagesOmitted).toBe(2);
+  expect(JSON.stringify(projected.messages)).toContain('\\"messages_omitted\\": 2');
+});
+
+test("current-run falls back when an omitted message is opaque", () => {
+  const messages = [
+    user("old"),
+    assistant([], "stop"),
+    { role: "custom", customType: "opaque", content: "keep", display: true, timestamp: 1 },
+    user("middle"),
+    assistant([], "stop"),
+    user("current"),
+  ] as Message[];
+  const projected = projectContext(messages, enabledContext("current-run"));
+  expect(projected.messages).toBe(messages);
+  expect(projected.measurement.fallback).toBe("unsafe_boundary");
+});
+
+test("current-run falls back when messages follow the current run boundary", () => {
+  const messages = [
+    user("old"),
+    assistant([], "stop"),
+    user("middle"),
+    assistant([], "stop"),
+    user("current"),
+    { role: "custom", customType: "unknown", content: "keep", timestamp: 1 },
+  ] as Message[];
+  const projected = projectContext(messages, enabledContext("current-run"));
+  expect(projected.messages).toBe(messages);
+  expect(projected.measurement.fallback).toBe("unsupported_placement");
+});
+
+test("current-run falls back when an omitted run has an incomplete exchange", () => {
+  const messages = [
+    user("old incomplete"),
+    assistant(["missing-result"]),
+    user("middle"),
+    assistant([], "stop"),
+    user("current"),
+  ];
+  const projected = projectContext(messages, enabledContext("current-run"));
+  expect(projected.messages).toBe(messages);
+  expect(projected.measurement.fallback).toBe("unsafe_boundary");
+});
+
 test("projection preserves full context when compaction removed the latest recorded goal", () => {
   const prompt: AgentEvent = { ...callFixture(), type: "user_prompt", text: "latest goal" };
   const input = {
-    ...context(),
+    ...enabledContext("append"),
     state: { ...initialState(), goal: prompt.id },
     evidence: new Map<EventId, AgentEvent>([[prompt.id, prompt]]),
   };
@@ -72,8 +150,8 @@ test("projection retains the complete current run including multi-tool groups an
   ];
   const messages = [...previous, ...run];
   const before = JSON.stringify(messages);
-  const projected = projectContext(messages, context());
-  expect(projected.messages.slice(0, -1)).toEqual(run.slice(0, -1));
+  const projected = projectContext(messages, enabledContext("current-run"));
+  expect(projected.messages.slice(0, -1)).toEqual(messages.slice(0, -1));
   expect(projected.messages.at(-1)).toMatchObject({
     role: "toolResult",
     toolCallId: "c",
@@ -82,14 +160,18 @@ test("projection retains the complete current run including multi-tool groups an
       { type: "text", text: expect.stringContaining("<reflex-state>") },
     ],
   });
-  expect(projected.measurement.messagesAfter).toBe(run.length);
+  expect(projected.measurement.messagesAfter).toBe(messages.length);
   expect(JSON.stringify(messages)).toBe(before);
 });
 
 test.each(["stop", "aborted"] as const)("a %s run ends before the next user prompt", (reason) => {
-  const projected = projectContext([user("old"), assistant([], reason), user("new")], context());
-  expect(projected.messages).toHaveLength(1);
-  expect(projected.messages[0]).toMatchObject({
+  const projected = projectContext(
+    [user("old"), assistant([], reason), user("new")],
+    enabledContext("current-run"),
+  );
+  expect(projected.messages).toHaveLength(3);
+  expect(projected.messages[0]).toMatchObject({ role: "user", content: "old" });
+  expect(projected.messages[2]).toMatchObject({
     role: "user",
     content: [
       { type: "text", text: "new" },
@@ -102,7 +184,7 @@ test("disabled, compacting, and incomplete exchanges preserve the original conte
   const messages = [user("keep"), assistant(["a", "b"]), result("a")];
   expect(projectContext(messages, context()).messages).toBe(messages);
   const valid = [user("keep")];
-  const input = context();
+  const input = enabledContext("append");
   input.config = { ...input.config, projection: { ...input.config.projection, enabled: false } };
   expect(projectContext(valid, input).messages).toBe(valid);
   expect(projectContext(valid, { ...context(), compacting: true }).messages).toBe(valid);
@@ -116,7 +198,7 @@ test("opaque messages remain in place and run-start placement preserves the late
     assistant(["a"]),
     result("a"),
   ];
-  const input = context();
+  const input = enabledContext("append");
   input.config = {
     ...input.config,
     projection: { ...input.config.projection, placement: "run-start" },

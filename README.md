@@ -1,27 +1,35 @@
 # ReflexState
 
-**SKILL.state × Jev for Pi.**
+**Your agent reasons. ReflexState keeps track.**
 
 English | [日本語](README_ja.md)
 
-ReflexState adapts the explicit execution state idea from Google's
-[SKILL.state](https://arxiv.org/abs/2608.26263) to
-[Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent).
-[TypeSafe Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) and deterministic
-code maintain that state independently of the main reasoning LLM.
+ReflexState gives [Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)
+coding agents a dedicated execution-state layer.
+It tracks what changed, which checks are still current, and what remains
+blocked—independently of the main reasoning LLM.
 
-- **The main model reasons and acts.** It receives the current run and structured state:
-  the goal, changed files, verification results, and active blockers.
-- **Jev makes semantic decisions.** Typed answers determine whether an error is a blocker,
-  whether new evidence resolves it, what remains relevant, and whether the task is complete.
-- **Code extracts facts and applies updates.** File changes and command results come from
-  execution events. Gated Jev decisions update state through deterministic code.
+**[TypeSafe Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) makes typed
+semantic decisions. Code extracts facts and applies updates.**
+Inspect the state as your agent works, or explicitly add it to the model's context.
 
-The aim is to make repeated state maintenance cheaper and faster while preserving agent
-performance. This alpha provides the runtime and measurements to test that hypothesis.
-State inspection and recorded replay make those updates traceable and reproducible.
+Built around the execution-state idea from Google's
+[SKILL.state](https://arxiv.org/abs/2608.26263), ReflexState explores a different division
+of labor: keep reasoning and coding with the main model, and maintain execution state with
+Jev and deterministic code.
 
-**Alpha preview:** [Try it locally](#run-locally) with a TypeSafe API key for Jev.
+## Why ReflexState?
+
+- **Separate reasoning from state maintenance.** Maintain structured execution state without
+  asking the main model to generate state summaries. Jev handles bounded semantic questions;
+  code controls how answers change the state.
+- **Track what is still true.** Distinguish earlier test success from current verification.
+  Keep unresolved blockers even when their details do not fit in the displayed context.
+- **Inspect the evidence. Replay the updates.** Trace state changes to execution events and
+  recorded decisions. Replay recorded state transitions without calling Jev again.
+
+**Alpha preview.** Context injection is opt-in. Append mode adds state without removing
+conversation history. End-to-end cost and performance gains have not yet been established.
 See [verification and limitations](#verification-and-limitations) for current coverage.
 
 ## Install the preview
@@ -82,13 +90,15 @@ branch after its latest reset. IDs remain monotonic across resets and branch swi
 The reducer is shared by live execution and replay; core imports no Pi or TypeSafe code.
 
 The SKILL.state paper supplies the latest observation at each step. ReflexState adapts this
-to Pi by retaining the complete current run alongside its execution state.
+to Pi by keeping execution state alongside the conversation.
 
-Projection keeps the complete current run, including steers and matched tool exchanges, then
-appends a bounded `<reflex-state>` text block to its newest user or tool-result message. The
-block includes state, recent requests, and verbatim failure evidence. Projection changes the
-outgoing context only; it never rewrites or deletes the Pi session log. Incomplete exchanges,
-missing goal text, compaction, or an insufficient block budget preserve the original context.
+Projection is disabled by default. `append` adds a bounded `<reflex-state>` block while keeping
+every original message. Experimental `current-run` keeps the current run and the immediately
+preceding ended run, including steers and matched tool exchanges, but may omit older ordinary
+conversation. Neither mode removes messages from inside a run. Projection changes the outgoing
+context only; it never rewrites or deletes the Pi session log. Incomplete exchanges, unknown
+messages, missing goal text, compaction, or an insufficient block budget preserve the original
+context.
 
 ## Configuration and controls
 
@@ -102,10 +112,26 @@ Example project config:
 
 ```json
 {
-  "projection": { "placement": "last-message" },
+  "projection": {
+    "enabled": true,
+    "mode": "append",
+    "placement": "last-message"
+  },
+  "limits": { "maxProjectedBlockers": 8 },
   "verificationCommands": { "test": ["^make check$"] }
 }
 ```
+
+To try the experimental history selection explicitly:
+
+```json
+{
+  "projection": { "enabled": true, "mode": "current-run" }
+}
+```
+
+`limits.maxActiveBlockers` is accepted as a deprecated alias with a warning. It no longer
+limits the unresolved blocker record; `maxProjectedBlockers` limits display only.
 
 Additional command regexes extend built-in test/build/lint detection. Unknown keys warn;
 invalid types, thresholds, limits, regexes, or credential fields reject the file and restore
@@ -122,6 +148,7 @@ defaults. Full defaults live in [core/config.ts](https://github.com/furedea/refl
 | `/state jev on\|off`         | Toggle semantic decisions for the current runtime                               |
 | `REFLEX_STATE_DISABLE=1`     | Disable state recording and projection                                          |
 | `REFLEX_STATE_DISABLE_JEV=1` | Start with deterministic updates only                                           |
+| `REFLEX_STATE_PROJECTION=1`  | Enable the configured projection mode                                           |
 | `REFLEX_STATE_PROJECTION=0`  | Start with original Pi context                                                  |
 
 Default Jev limits are a 3-second SDK timeout, zero retries, and a 4-second outer deadline
@@ -132,10 +159,12 @@ questions and never control activity directly.
 
 ## What is sent to TypeSafe
 
-When Jev is enabled, a required decision sends bounded user request text, the current typed
-state, file paths, relevant bash/edit/write result excerpts, and bounded final assistant text
-when deciding completion. The JSON input has a 24,000-byte ceiling. Read/grep/find/ls results
-produce zero Jev calls and their output text is excluded from other requests.
+When Jev is enabled, a bounded request plan selects each question together with the evidence it
+needs. Inputs contain bounded user request text, the current typed state, file paths, relevant
+bash/edit/write evidence, and bounded final assistant text when deciding completion. The JSON
+input has a 24,000-byte ceiling; a question whose evidence cannot fit is omitted with a local
+reason. Read/grep/find/ls results produce zero Jev calls and their output text is excluded from
+other requests.
 
 Common credential patterns, bearer credentials, private-key blocks and environment assignments
 are redacted before sending. This is pattern-based filtering, not a guarantee that arbitrary
@@ -163,8 +192,9 @@ pnpm replay trace-output/events.jsonl --updater recorded --out replay-recorded
 
 Export follows the last stored leaf, or `--leaf <entry-id>`. Existing ReflexState transitions
 provide their original events and decisions after the latest reset; sessions without them are
-normalized from Pi message entries. Export writes `events.jsonl`, `transitions.jsonl`, and
-`trace_meta.json`, leaving the source file unchanged.
+normalized from Pi message entries. A legacy state is marked as legacy and is never presented as
+a v2 recording. Export writes `events.jsonl`, `transitions.jsonl`, and `trace_meta.json`, leaving
+the source file unchanged.
 
 Replay writes `final_state.json`, `transitions.jsonl`, `metrics.json`, and `summary.txt`.
 `noop` is deterministic; `jev` makes live semantic requests. `recorded` reads the neighboring
@@ -194,13 +224,19 @@ disabled. Both explicit loading and trusted `.pi/extensions` discovery are exerc
 
 Current limitations:
 
-- Earlier runs are omitted from projected context. Only retained state and bounded excerpts
-  carry their information forward; this may lose useful context and does not establish token
-  savings or improved task success.
-- Bash-driven file changes are not tracked. Only successful Pi edit/write results and explicit
-  `file_change` events update modified files.
-- Verification detection is heuristic, not a shell parser. Compound commands report the overall
-  outcome for one kind with test > build > lint precedence, without proving every segment ran.
+- `append` retains history but does not reduce context size. `current-run` can omit runs older
+  than the immediately preceding ended run; it is experimental and does not establish token
+  savings or improved task success. Both modes preserve messages within a run.
+- Bash is treated as a possible workspace change. Verification results become stale after
+  edits, writes, file-change events, bash, resume, or branch switching; the project does not
+  automatically rerun checks.
+- Verification detection is conservative and heuristic, not a shell parser. Compound commands,
+  truncated commands, and incomplete old events are unknown and cannot clear a blocker.
+- A passed result describes that command's observed result and target, not every assertion or all
+  checks in a project. Different commands and working directories remain different checks.
+- Legacy v1 state is not automatically migrated. Stop state updates and projection, then use
+  the confirmed `/state reset` to begin a v2 state interval. Recorded replay of legacy state is
+  rejected; use the original implementation for strict legacy replay.
 - Thresholds are heuristics without calibration. Live Jev outputs can vary; only recorded
   decisions provide exact semantic replay.
 - State blocks and working sets are bounded. There is no recall tool, within-run pruning,
@@ -211,5 +247,9 @@ Current limitations:
   through Anthropic, OpenAI-compatible, and Google APIs have not been verified here. If a
   provider rejects the appended tool-result block, set `projection.placement` to `run-start`
   or disable projection. Run-start placement may reduce prompt-cache reuse.
+
+[State safety contract](docs/state_safety_contract.md) defines the v2 state, freshness, blocker,
+projection, budget, and legacy rules. [Validation notes](docs/state_safety_validation.md) map those
+rules to regression tests and offline verification.
 
 [ADR-0001](https://github.com/furedea/reflex-state/blob/main/docs/adr/0001_compose_adapters_at_entry_points.md) explains composition.

@@ -9,7 +9,15 @@ export function mergeConfig(base: ReflexStateConfig, input: unknown) {
   try {
     if (containsCredential(input))
       throw new InvalidConfigError("Credentials are not allowed in configuration files");
-    const config = mergeValue(base, input, { path: "config", warnings }) as ReflexStateConfig;
+    const normalized = normalizeAliases(input, warnings);
+    const merged = mergeValue(base, normalized, { path: "config", warnings }) as ReflexStateConfig;
+    const config = {
+      ...merged,
+      limits: {
+        ...merged.limits,
+        maxActiveBlockers: merged.limits.maxProjectedBlockers,
+      },
+    };
     validateConfig(config);
     return { config, warnings, valid: true };
   } catch (error) {
@@ -70,7 +78,7 @@ function validateConfig(config: ReflexStateConfig): void {
     throw new InvalidConfigError("Invalid retry count");
   if (!config.jev.model.trim()) throw new InvalidConfigError("Jev model must not be empty");
   if (
-    config.projection.mode !== "current-run" ||
+    !["append", "current-run"].includes(config.projection.mode) ||
     !["last-message", "run-start"].includes(config.projection.placement)
   )
     throw new InvalidConfigError("Unsupported projection configuration");
@@ -85,6 +93,18 @@ function validateConfig(config: ReflexStateConfig): void {
       }
     }
   }
+}
+
+function normalizeAliases(input: unknown, warnings: string[]): unknown {
+  if (!isRecord(input) || !isRecord(input.limits)) return input;
+  const limits = input.limits;
+  if (!Object.hasOwn(limits, "maxActiveBlockers")) return input;
+  warnings.push("limits.maxActiveBlockers is deprecated; use limits.maxProjectedBlockers");
+  const nextLimits = { ...limits };
+  if (!Object.hasOwn(limits, "maxProjectedBlockers"))
+    nextLimits.maxProjectedBlockers = limits.maxActiveBlockers;
+  delete nextLimits.maxActiveBlockers;
+  return { ...input, limits: nextLimits };
 }
 
 function containsCredential(value: unknown): boolean {

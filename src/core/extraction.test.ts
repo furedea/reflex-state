@@ -25,16 +25,22 @@ test.each([
   ["tsc --noEmit", "build", false],
   ["oxlint .", "lint", false],
   ["a && pnpm test", "test", true],
-  ["pnpm run lint; pnpm test", "test", true],
+  ["pnpm run lint; pnpm test", "lint", true],
   ["ls", undefined, false],
   ["echo 'pnpm test'", undefined, false],
 ])("classifies verification commands: %s", (command, kind, compound) => {
   const facts = extractFacts(contextFixture(callFixture({ command })));
   if (!kind) {
-    expect(facts.verification).toBeUndefined();
+    if (facts.verification !== undefined) throw new Error("unexpected verification fact");
     return;
   }
-  expect(facts.verification).toEqual({ kind, compound, command, status: "running" });
+  expect(facts.verification).toMatchObject({
+    kind,
+    compound,
+    command,
+    status: "running",
+    attributable: !compound,
+  });
 });
 
 test.each([

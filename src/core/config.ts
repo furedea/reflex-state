@@ -18,7 +18,9 @@ export interface ReflexStateConfig {
   };
   readonly limits: {
     readonly maxWorkingSetEvents: number;
+    /** @deprecated Use maxProjectedBlockers. */
     readonly maxActiveBlockers: number;
+    readonly maxProjectedBlockers: number;
     readonly maxExcerptHeadChars: number;
     readonly maxExcerptTailChars: number;
     readonly maxPromptChars: number;
@@ -27,7 +29,7 @@ export interface ReflexStateConfig {
   };
   readonly projection: {
     readonly enabled: boolean;
-    readonly mode: "current-run";
+    readonly mode: "append" | "current-run";
     readonly placement: "last-message" | "run-start";
   };
   readonly shadowQuestions: readonly "phase"[];
@@ -49,13 +51,14 @@ export function defaultConfig(): ReflexStateConfig {
     limits: {
       maxWorkingSetEvents: 16,
       maxActiveBlockers: 8,
+      maxProjectedBlockers: 8,
       maxExcerptHeadChars: 1200,
       maxExcerptTailChars: 600,
       maxPromptChars: 2000,
       maxRecentUserPrompts: 3,
       maxStateBlockChars: 6000,
     },
-    projection: { enabled: true, mode: "current-run", placement: "last-message" },
+    projection: { enabled: false, mode: "append", placement: "last-message" },
     shadowQuestions: ["phase"],
     verificationCommands: { test: [], build: [], lint: [] },
   };

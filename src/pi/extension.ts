@@ -19,6 +19,11 @@ export function registerExtension(pi: ExtensionAPI, createUpdater: UpdaterFactor
       });
       for (const warning of warnings) ctx.ui.notify(warning, "warning");
       runtime = new SessionRuntime({ pi, ctx, config, createUpdater });
+      const reason =
+        typeof _event === "object" && _event !== null && "newLeafId" in _event
+          ? "branch_switch"
+          : "resume";
+      await runtime.record(runtime.normalizer.resume(reason), ctx);
       runtime.widget(ctx);
     });
   };
@@ -105,7 +110,8 @@ async function guarded(ctx: ExtensionContext, operation: () => Promise<void>): P
     await operation();
   } catch (error) {
     ctx.ui.notify(
-      "ReflexState could not update: " + (error instanceof Error ? error.name : "unknown error"),
+      "ReflexState could not update: " +
+        (error instanceof Error ? error.name + ": " + error.message : "unknown error"),
       "warning",
     );
   }

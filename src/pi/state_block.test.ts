@@ -40,3 +40,32 @@ test("state blocks expose bounded verbatim requests and failure evidence without
     }),
   ).toBeUndefined();
 });
+
+test("working-set errors are projected with their recorded content even without a blocker", () => {
+  const result = resultFixture({ excerpt: excerptFixture("TypeError: cannot read property x") });
+  const state = { ...initialState(), workingSet: [result.id] };
+  const block = stateBlock({
+    state,
+    evidence: new Map<EventId, AgentEvent>([[result.id, result]]),
+    config: defaultConfig(),
+    projectionMode: "append",
+  });
+  expect(block).toContain("TypeError: cannot read property x");
+  expect(block).toContain('"working_set"');
+});
+
+test("state block reports omitted blockers and unavailable evidence", () => {
+  const blockers = Array.from({ length: 9 }, (_, index) => ({
+    eventId: ("E" + (index + 1)) as EventId,
+    origin: "tool_error" as const,
+    category: "unknown" as const,
+  }));
+  const block = stateBlock({
+    state: { ...initialState(), activeBlockers: blockers },
+    evidence: new Map(),
+    config: defaultConfig(),
+  });
+  expect(block).toContain('"unresolved_total": 9');
+  expect(block).toContain('"omitted_count": 1');
+  expect(block).toContain("evidence_unavailable");
+});

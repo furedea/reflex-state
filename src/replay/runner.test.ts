@@ -60,3 +60,24 @@ test("recorded replay rejects changed events even if their IDs match", async () 
     }),
   ).rejects.toThrow("Recorded event differs");
 });
+
+test("recorded replay preserves resume invalidation of verification freshness", async () => {
+  const events: AgentEvent[] = [
+    callFixture(),
+    resultFixture(),
+    { ...callFixture(), id: "E0003", type: "session_resume", reason: "resume" },
+  ];
+  const original = await replay(events, {
+    cwd: "/workspace",
+    config: defaultConfig(),
+    updater: new NoopStateUpdater(),
+  });
+  const recorded = await replay(events, {
+    cwd: "/different",
+    config: defaultConfig(),
+    updater: new RecordedDecisionsUpdater(original.transitions),
+    recording: original.transitions,
+  });
+  expect(recorded.state).toEqual(original.state);
+  expect(recorded.state.verification.test.freshness).toBe("stale");
+});

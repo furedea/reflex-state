@@ -48,6 +48,7 @@ test("successful results only ask to resolve tool-origin blockers", () => {
       { eventId: "E0099", origin: "tool_error", category: "network" },
     ],
   };
+  context.evidence.set("E0099", resultFixture({ id: "E0099" }));
   expect(Object.keys(buildQuestions({ ...context, facts: extractFacts(context) })).sort()).toEqual([
     "phase_shadow",
     "resolves_E0099",
@@ -71,6 +72,8 @@ test("run end asks task completion and capacity pressure asks at most four oldes
     ...context.state,
     workingSet: Array.from({ length: 16 }, (_, i) => ("E" + i) as EventId),
   };
+  for (const id of context.state.workingSet)
+    context.evidence.set(id, resultFixture({ id, isError: true }));
   expect(
     Object.keys(buildQuestions({ ...context, facts: extractFacts(context) })).filter((key) =>
       key.startsWith("relevant_"),

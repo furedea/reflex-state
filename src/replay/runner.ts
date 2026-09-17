@@ -21,7 +21,10 @@ export async function replay(events: readonly AgentEvent[], options: ReplayOptio
   const transitions: StateTransitionRecord[] = [];
   for (const event of events) {
     const record = recording.get(event.id);
-    if (record) await engine.configure(record.config, options.updater, record.cwd);
+    if (record) {
+      if (record.after.version !== 2) throw new Error("Unsupported legacy recorded replay");
+      await engine.configure(record.config, options.updater, record.cwd);
+    }
     transitions.push(await engine.process(event));
   }
   return { state: engine.state, transitions, metrics: metrics.snapshot() };

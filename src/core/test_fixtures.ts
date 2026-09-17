@@ -10,19 +10,22 @@ import type {
 
 function stateFixture(): HotState {
   return {
-    version: 1,
+    version: 2,
     goal: null,
     phase: "unknown",
     taskStatus: "unknown",
     modifiedFiles: [],
     relevantFiles: [],
     verification: {
-      build: { status: "not_run" },
-      test: { status: "not_run" },
-      lint: { status: "not_run" },
+      build: { status: "not_run", freshness: "unknown" },
+      test: { status: "not_run", freshness: "unknown" },
+      lint: { status: "not_run", freshness: "unknown" },
     },
     activeBlockers: [],
     workingSet: [],
+    observationGeneration: 0,
+    pendingChanges: [],
+    stateHealth: "valid",
     cursor: { lastEventId: null, eventCount: 0, turnIndex: 0 },
     lastUpdatedAt: "1970-01-01T00:00:00.000Z",
   };

@@ -43,3 +43,17 @@ test("unknown keys warn while known settings are retained", () => {
   expect(result.warnings).toHaveLength(1);
   expect(result.config.jev.enabled).toBe(false);
 });
+
+test("projection defaults off and the legacy blocker key aliases the projection limit", () => {
+  const base = defaultConfig();
+  expect(base.projection).toMatchObject({ enabled: false, mode: "append" });
+  const legacy = mergeConfig(base, { limits: { maxActiveBlockers: 3 } });
+  expect(legacy.valid).toBe(true);
+  expect(legacy.config.limits.maxProjectedBlockers).toBe(3);
+  expect(legacy.config.limits.maxActiveBlockers).toBe(3);
+  expect(legacy.warnings.join(" ")).toContain("deprecated");
+  const both = mergeConfig(base, {
+    limits: { maxActiveBlockers: 3, maxProjectedBlockers: 5 },
+  });
+  expect(both.config.limits.maxProjectedBlockers).toBe(5);
+});
