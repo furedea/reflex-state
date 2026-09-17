@@ -223,4 +223,4 @@ Pi のスモークテストは，モデルへのネットワーク通信を無�
   プロバイダーが追加したツール結果ブロックを拒否する場合は，`projection.placement` を `run-start` にするか，
   投影を無効にしてください．`run-start` はプロンプトキャッシュの再利用を減らす可能性があります．
 
-[ADR-0002](https://github.com/furedea/reflex-state/blob/main/docs/adr/0002_compose_adapters_at_entry_points.md) にアダプターの組み立て方針を記載しています．
+[ADR-0001](https://github.com/furedea/reflex-state/blob/main/docs/adr/0001_compose_adapters_at_entry_points.md) にアダプターの組み立て方針を記載しています．

@@ -1,4 +1,4 @@
-# ADR-0002: Compose adapters at entry points
+# ADR-0001: Compose adapters at entry points
 
 - Status: Accepted
 - Date: 2026-09-17

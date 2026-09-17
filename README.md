@@ -212,4 +212,4 @@ Current limitations:
   provider rejects the appended tool-result block, set `projection.placement` to `run-start`
   or disable projection. Run-start placement may reduce prompt-cache reuse.
 
-[ADR-0002](https://github.com/furedea/reflex-state/blob/main/docs/adr/0002_compose_adapters_at_entry_points.md) explains composition.
+[ADR-0001](https://github.com/furedea/reflex-state/blob/main/docs/adr/0001_compose_adapters_at_entry_points.md) explains composition.
