@@ -58,7 +58,7 @@
     "lint:fix": "oxlint --fix .",
     "typecheck": "oxlint --type-aware --type-check .",
     "test": "vitest run",
-    "test:release": "node --test scripts/release_policy.test.mjs",
+    "test:release": "node --test scripts/*.test.mjs",
     "test:watch": "vitest",
     "knip": "knip",
     "knip:production": "knip --production",

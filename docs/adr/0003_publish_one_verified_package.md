@@ -1,6 +1,6 @@
 # ADR-0003: Publish one verified package
 
-- Status: Accepted
+- Status: Superseded
 - Date: 2026-09-17
 
 In the context of distributing ReflexState as a Pi extension and Node.js commands, facing the

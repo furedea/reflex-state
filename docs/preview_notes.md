@@ -32,8 +32,9 @@ export, and replay commands, or [日本語の README](../README_ja.md).
 - Typed state derived from Pi events, with bounded source evidence and no generated summaries.
 - Branch-aware session restoration, state inspection, and configurable context projection.
 - Export and replay commands; recorded decisions reproduce the saved state pipeline exactly.
-- One tested npm tarball used for npm and GitHub distribution, with checksums and build provenance
-  produced by the release workflow.
+- One tested npm tarball used for npm and GitHub distribution, with a checksum and GitHub artifact
+  attestation. The first npm publication is manual; subsequent versions use OIDC and also include
+  npm provenance.
 
 ## Validation and limits
 

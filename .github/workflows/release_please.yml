@@ -133,13 +133,14 @@ jobs:
           # Replacement is allowed only while the release is still a draft.
           gh release upload "$TAG_NAME" "$TARBALL" .release/checksums.txt .release/provenance.json --clobber
 
-      - name: Publish the same tarball to npm with provenance
+      - name: Publish with OIDC or await the first manual publication
+        id: publish
         env:
           TARBALL: ${{ steps.pack.outputs.tarball }}
-          NPM_BOOTSTRAP_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
         run: node scripts/publish_package.mjs "$TARBALL"
 
       - name: Publish completed GitHub release
+        if: steps.publish.outputs.published == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

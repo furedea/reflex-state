@@ -62,10 +62,8 @@ await test("publication resumes only when the registry contains the exact tested
   assert.throws(() => publicationNeeded(503, {}, "sha512-expected"), /registry/iu);
 });
 
-await test("bootstrap authentication is allowed only for a brand-new npm package", () => {
-  assert.throws(() => publicationMode(404, false), /bootstrap/iu);
-  assert.equal(publicationMode(404, true), "bootstrap");
-  assert.equal(publicationMode(200, true), "oidc");
-  assert.equal(publicationMode(200, false), "oidc");
-  assert.throws(() => publicationMode(503, true), /registry/iu);
+await test("a new npm package waits for manual publication without a CI credential", () => {
+  assert.equal(publicationMode(404), "manual");
+  assert.equal(publicationMode(200), "oidc");
+  assert.throws(() => publicationMode(503), /registry/iu);
 });

@@ -31,12 +31,8 @@ export function publicationNeeded(status, metadata, integrity) {
   return false;
 }
 
-export function publicationMode(packageStatus, hasBootstrapCredential) {
+export function publicationMode(packageStatus) {
   if (packageStatus === 200) return "oidc";
   assert.equal(packageStatus, 404, "npm registry lookup failed; publication was not attempted");
-  assert(
-    hasBootstrapCredential,
-    "First publication requires the temporary npm bootstrap credential",
-  );
-  return "bootstrap";
+  return "manual";
 }
