@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { ReflexStateConfig } from "../core/config.js";
 import { StateEngine } from "../core/engine.js";
 import { Metrics } from "../core/metrics.js";
+import { blockerView } from "../core/state_view.js";
 import type { AgentEvent, HotState } from "../core/types.js";
 import type { StateUpdater } from "../core/updater.js";
 import { PiEventNormalizer } from "./normalization.js";
@@ -40,6 +41,10 @@ export class SessionRuntime {
     this.engine = restored.engine;
     this.normalizer = restored.normalizer;
     this.historyRecords = restored.transitions;
+    this.projectionSafe = !restored.legacy && restored.engine.state.stateHealth === "valid";
+    if (restored.legacy) options.ctx.ui.notify("legacy_state_requires_reset", "warning");
+    else if (restored.engine.state.stateHealth !== "valid")
+      options.ctx.ui.notify("invalid_state_requires_reset", "warning");
   }
 
   get config(): ReflexStateConfig {
@@ -58,7 +63,7 @@ export class SessionRuntime {
   }
 
   async record(event: AgentEvent, ctx: ExtensionContext): Promise<void> {
-    if (!this.config.enabled) return;
+    if (!this.config.enabled || !this.projectionSafe) return;
     try {
       await this.engine.process(event, ctx.signal);
     } catch (error) {
@@ -69,7 +74,10 @@ export class SessionRuntime {
   }
 
   async toggle(target: "projection" | "jev", enabled: boolean): Promise<void> {
-    const config = { ...this.config, [target]: { ...this.config[target], enabled } };
+    const config = {
+      ...this.config,
+      [target]: { ...this.config[target], enabled },
+    } as ReflexStateConfig;
     const updater =
       target === "jev"
         ? this.options.createUpdater(config, (message) =>
@@ -89,7 +97,7 @@ export class SessionRuntime {
     this.engine = restored.engine;
     this.normalizer = restored.normalizer;
     this.historyRecords = restored.transitions;
-    this.projectionSafe = true;
+    this.projectionSafe = !restored.legacy && restored.engine.state.stateHealth === "valid";
   }
 
   widget(ctx: ExtensionContext): void {
@@ -102,13 +110,19 @@ export class SessionRuntime {
     const counts = projection
       ? " | ctx " + projection.messagesBefore + "→" + projection.messagesAfter + " msgs"
       : "";
+    const test = this.state.verification.test;
+    const testStatus =
+      test.status + (test.freshness && test.freshness !== "current" ? "/" + test.freshness : "");
+    const blockers = blockerView(this.state, this.config);
     ctx.ui.setWidget("reflex-state", [
       "ReflexState " +
         (this.config.enabled ? this.state.phase : "disabled") +
         " | tests " +
-        this.state.verification.test.status +
+        testStatus +
         " | blockers " +
-        this.state.activeBlockers.length +
+        blockers.shownCount +
+        "/" +
+        blockers.unresolvedTotal +
         " | Jev " +
         this.health.status +
         latency +
@@ -131,7 +145,7 @@ export class SessionRuntime {
         if (!hasMeta) {
           pi.appendEntry("reflex-state.meta", {
             specVersion: "0.1",
-            stateVersion: 1,
+            stateVersion: 2,
             config: this.config,
             piVersion: "0.83.0",
           });
@@ -144,9 +158,10 @@ export class SessionRuntime {
     });
     const normalizer = new PiEventNormalizer({
       config: this.config,
+      cwd: ctx.cwd,
       eventCount: highestEventOrdinal(ctx.sessionManager.getEntries()),
       turnIndex: restored.state.cursor.turnIndex,
     });
-    return { engine, normalizer, transitions: restored.transitions };
+    return { engine, normalizer, transitions: restored.transitions, legacy: restored.legacy };
   }
 }

@@ -84,10 +84,21 @@ export class Metrics {
       projection: {
         calls: this.projections.length,
         last: this.lastProjection,
+        modes: counts(this.projections.flatMap((entry) => (entry.mode ? [entry.mode] : []))),
         meanMessagesBefore: mean(this.projections.map((entry) => entry.messagesBefore)),
         meanMessagesAfter: mean(this.projections.map((entry) => entry.messagesAfter)),
+        meanMessagesOmitted: mean(
+          this.projections.flatMap((entry) =>
+            entry.messagesOmitted === undefined ? [] : [entry.messagesOmitted],
+          ),
+        ),
         meanCharsBefore: mean(this.projections.map((entry) => entry.charsBefore)),
         meanCharsAfter: mean(this.projections.map((entry) => entry.charsAfter)),
+        meanStateBlockChars: mean(
+          this.projections.flatMap((entry) =>
+            entry.stateBlockChars === undefined ? [] : [entry.stateBlockChars],
+          ),
+        ),
         fallbacks: counts(
           this.projections.flatMap((entry) => (entry.fallback ? [entry.fallback] : [])),
         ),

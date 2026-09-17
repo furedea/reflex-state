@@ -28,7 +28,7 @@ test("hot evidence stays bounded and uncertain relevance cannot evict a newer it
   expect(state.workingSet).toHaveLength(16);
 });
 
-test("a ninth blocker evicts the oldest with an observable change record", () => {
+test("a ninth blocker remains in the canonical unresolved set", () => {
   let state = initialState();
   let changes: readonly string[] = [];
   for (let index = 1; index <= 9; index++) {
@@ -43,9 +43,9 @@ test("a ninth blocker evicts the oldest with an observable change record", () =>
     state = result.state;
     changes = result.changes;
   }
-  expect(state.activeBlockers).toHaveLength(8);
-  expect(state.activeBlockers.some((blocker) => blocker.eventId === "E1")).toBe(false);
-  expect(changes.some((change) => change.includes("evict") && change.includes("E1"))).toBe(true);
+  expect(state.activeBlockers).toHaveLength(9);
+  expect(state.activeBlockers.some((blocker) => blocker.eventId === "E1")).toBe(true);
+  expect(changes.some((change) => change.includes("activeBlockers"))).toBe(true);
 });
 
 test("file collections are bounded, unique, and modifications are admitted as evidence", () => {
@@ -91,6 +91,7 @@ test.each(["applied", "uncertain", "skipped", "error"] as const)(
       ...initialState(),
       activeBlockers: [{ eventId: "E0001", origin: "tool_error", category: "network" }],
     };
+    evidence.set("E0001", callFixture());
     const resolved = transition(blocked, resultFixture(), {
       ...emptyDecisions(),
       resolvedBlockers: [{ eventId: "E0001", decision: { value: true, gate } }],
@@ -174,9 +175,14 @@ test("verification failure blocks the task until the same verification later pas
     resultFixture({ isError: true, excerpt: excerptFixture("Command exited with code 1") }),
   ).state;
   expect(failed.verification.test).toMatchObject({ status: "failed", evidence: "E0002" });
-  expect(failed.activeBlockers).toEqual([
-    { eventId: "E0002", origin: "verification", kind: "test", category: "unknown" },
-  ]);
+  expect(failed.activeBlockers).toHaveLength(1);
+  expect(failed.activeBlockers[0]).toMatchObject({
+    eventId: "E0002",
+    origin: "verification",
+    kind: "test",
+    category: "unknown",
+    checkKey: expect.any(String),
+  });
   expect(failed.taskStatus).toBe("blocked");
   expect(failed.phase).toBe("debugging");
   expect(failed.workingSet).toContain("E0002");
@@ -188,3 +194,90 @@ test("verification failure blocks the task until the same verification later pas
   expect(initial.verification.test.status).toBe("not_run");
   expect(failed.activeBlockers).toHaveLength(1);
 });
+
+test("verification freshness becomes stale after a possible workspace change", () => {
+  let state = initialState();
+  const call = callFixture({ command: "pnpm test" });
+  state = transition(state, { ...call, cwd: "/workspace" }).state;
+  state = transition(
+    state,
+    resultFixture({
+      isError: false,
+      excerpt: excerptFixture("passed"),
+      toolCallId: call.toolCallId,
+    }),
+  ).state;
+  expect(state.verification.test).toMatchObject({ status: "passed", freshness: "current" });
+  state = transition(state, {
+    ...callFixture({ path: "src/main.ts" }),
+    id: "E0003" as EventId,
+    type: "file_change",
+    paths: ["src/main.ts"],
+  }).state;
+  expect(state.verification.test).toMatchObject({ status: "passed", freshness: "stale" });
+});
+
+test("verification blockers require the same current check key to resolve", () => {
+  let state = initialState();
+  const call = { ...callFixture({ command: "pytest tests/integration" }), cwd: "/workspace" };
+  state = transition(state, call).state;
+  state = transition(
+    state,
+    resultFixture({ isError: true, excerpt: excerptFixture("Command exited with code 1") }),
+  ).state;
+  expect(state.activeBlockers).toHaveLength(1);
+  const otherCall = {
+    ...callFixture({ command: "pytest tests/unit" }),
+    id: "E0003" as EventId,
+    cwd: "/workspace",
+  };
+  state = transition(state, otherCall).state;
+  state = transition(state, resultFixture({ id: "E0004" })).state;
+  expect(state.activeBlockers).toHaveLength(1);
+  const sameCall = {
+    ...callFixture({ command: "pytest tests/integration" }),
+    id: "E0005" as EventId,
+    cwd: "/workspace",
+  };
+  state = transition(state, sameCall).state;
+  state = transition(state, resultFixture({ id: "E0006" })).state;
+  expect(state.activeBlockers).toHaveLength(0);
+});
+
+test("a possible edit between verification call and result leaves the result stale", () => {
+  let state = initialState();
+  const verificationCall = { ...callFixture({ command: "pnpm test" }), cwd: "/workspace" };
+  state = transition(state, verificationCall).state;
+  const editCall = {
+    ...callFixture({ path: "src/main.ts", content: "changed" }),
+    id: "E0002" as EventId,
+    toolCallId: "call-edit",
+    toolName: "edit",
+  };
+  state = transition(state, editCall).state;
+  state = transition(
+    state,
+    resultFixture({ id: "E0003", toolCallId: "call-edit", toolName: "edit" }),
+  ).state;
+  state = transition(state, resultFixture({ id: "E0004" })).state;
+  expect(state.verification.test).toMatchObject({ status: "passed", freshness: "stale" });
+  expect(state.observationGeneration).toBeGreaterThan(0);
+});
+
+test.each(["aborted", "error", "length"] as const)(
+  "an %s agent end never completes from a true semantic decision",
+  (stopReason) => {
+    const event: AgentEvent = {
+      ...callFixture(),
+      type: "agent_end",
+      finalText: excerptFixture("done"),
+      stopReason,
+    };
+    const state = transition(initialState(), event, {
+      ...emptyDecisions(),
+      taskComplete: { value: true, gate: "applied" },
+    }).state;
+    expect(state.taskStatus).toBe("in_progress");
+    expect(state.phase).not.toBe("done");
+  },
+);

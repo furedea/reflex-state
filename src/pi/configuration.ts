@@ -46,7 +46,12 @@ export async function loadConfig(options: ConfigOptions) {
     },
     projection: {
       ...config.projection,
-      enabled: env.REFLEX_STATE_PROJECTION === "0" ? false : config.projection.enabled,
+      enabled:
+        env.REFLEX_STATE_PROJECTION === "1"
+          ? true
+          : env.REFLEX_STATE_PROJECTION === "0"
+            ? false
+            : config.projection.enabled,
     },
   };
   return { config, warnings };

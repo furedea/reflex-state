@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 import { decisionEntries } from "../core/metrics.js";
+import { blockerView, workingSetView } from "../core/state_view.js";
 import type { SessionRuntime } from "./runtime.js";
 
 const suggestions = [
@@ -47,18 +48,24 @@ async function handleCommand(
     return;
   }
   if (args === "stats") {
+    const blockers = blockerView(session.state, session.config);
+    const workingSet = workingSetView(session.state, session.config.limits.maxWorkingSetEvents);
     ctx.ui.notify(
       JSON.stringify(
         {
           ...session.metrics.snapshot(),
           health: session.health,
           workingSet: {
-            count: session.state.workingSet.length,
+            count: workingSet.total,
+            shown: workingSet.shownCount,
+            omitted: workingSet.omittedCount,
             cap: session.config.limits.maxWorkingSetEvents,
           },
           blockers: {
-            count: session.state.activeBlockers.length,
-            cap: session.config.limits.maxActiveBlockers,
+            count: blockers.unresolvedTotal,
+            shown: blockers.shownCount,
+            omitted: blockers.omittedCount,
+            cap: session.config.limits.maxProjectedBlockers,
           },
         },
         missingMetric,
@@ -133,6 +140,8 @@ async function handleCommand(
 
 function renderState(session: SessionRuntime): string {
   const state = session.state;
+  const blockers = blockerView(state, session.config);
+  const workingSet = workingSetView(state, session.config.limits.maxWorkingSetEvents);
   return [
     "goal: " + (state.goal ?? "none"),
     "phase: " + state.phase,
@@ -140,8 +149,19 @@ function renderState(session: SessionRuntime): string {
     "modified_files: " + JSON.stringify(state.modifiedFiles),
     "relevant_files: " + JSON.stringify(state.relevantFiles),
     "verification: " + JSON.stringify(state.verification),
-    "active_blockers: " + JSON.stringify(state.activeBlockers),
-    "working_set: " + JSON.stringify(state.workingSet),
+    "active_blockers: " +
+      JSON.stringify({
+        unresolved_total: blockers.unresolvedTotal,
+        shown: blockers.blockers,
+        omitted: blockers.omittedCount,
+      }),
+    "working_set: " +
+      JSON.stringify({
+        total: workingSet.total,
+        shown: workingSet.events,
+        omitted: workingSet.omittedCount,
+      }),
+    ...(state.stateHealth && state.stateHealth !== "valid" ? [state.stateHealth] : []),
   ].join("\n");
 }
 

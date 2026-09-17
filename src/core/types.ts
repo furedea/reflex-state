@@ -12,6 +12,7 @@ export type AgentPhase =
 export type TaskStatus = "in_progress" | "blocked" | "completed" | "unknown";
 export type VerificationKind = "build" | "test" | "lint";
 export type VerificationStatus = "not_run" | "running" | "passed" | "failed" | "unknown";
+export type VerificationFreshness = "current" | "stale" | "unknown";
 export type BlockerCategory =
   | "implementation"
   | "environment"
@@ -52,6 +53,8 @@ export interface ToolCallEvent extends BaseEvent {
   readonly toolCallId: string;
   readonly toolName: string;
   readonly input: Readonly<Record<string, unknown>>;
+  readonly commandTruncated?: boolean;
+  readonly cwd?: string;
 }
 
 export interface ToolResultEvent extends BaseEvent {
@@ -73,29 +76,42 @@ export interface FileChangeEvent extends BaseEvent {
   readonly paths: readonly string[];
 }
 
+export interface SessionResumeEvent extends BaseEvent {
+  readonly type: "session_resume";
+  readonly reason: "resume" | "branch_switch";
+}
+
 export type AgentEvent =
   | UserPromptEvent
   | ToolCallEvent
   | ToolResultEvent
   | AgentEndEvent
-  | FileChangeEvent;
+  | FileChangeEvent
+  | SessionResumeEvent;
 
 export interface VerificationState {
   readonly status: VerificationStatus;
+  readonly freshness?: VerificationFreshness;
   readonly evidence?: EventId;
   readonly command?: string;
+  readonly cwd?: string;
+  readonly checkKey?: string;
+  readonly observedGeneration?: number;
+  readonly startedEvent?: EventId;
+  readonly attributable?: boolean;
+  readonly unknownReason?: string;
 }
 
 export type Blocker = {
   readonly eventId: EventId;
   readonly category: BlockerCategory;
 } & (
-  | { readonly origin: "verification"; readonly kind: VerificationKind }
+  | { readonly origin: "verification"; readonly kind: VerificationKind; readonly checkKey?: string }
   | { readonly origin: "tool_error"; readonly kind?: never }
 );
 
 export interface HotState {
-  readonly version: 1;
+  readonly version: 2;
   readonly goal: EventId | null;
   readonly phase: AgentPhase;
   readonly taskStatus: TaskStatus;
@@ -104,6 +120,9 @@ export interface HotState {
   readonly verification: Readonly<Record<VerificationKind, VerificationState>>;
   readonly activeBlockers: readonly Blocker[];
   readonly workingSet: readonly EventId[];
+  readonly observationGeneration?: number;
+  readonly pendingChanges?: readonly EventId[];
+  readonly stateHealth?: "valid" | "legacy_state_requires_reset" | "invalid";
   readonly cursor: {
     readonly lastEventId: EventId | null;
     readonly eventCount: number;
@@ -112,16 +131,33 @@ export interface HotState {
   readonly lastUpdatedAt: string;
 }
 
+export interface VerificationFact {
+  readonly kind: VerificationKind;
+  readonly status: VerificationStatus;
+  readonly command: string;
+  readonly cwd: string;
+  readonly compound: boolean;
+  readonly attributable: boolean;
+  readonly checkKey?: string;
+  readonly unknownReason?: string;
+  readonly startedEvent?: EventId;
+  readonly observedGeneration?: number;
+  readonly freshness?: VerificationFreshness;
+}
+
+export interface MutationFact {
+  readonly operationId?: EventId;
+  readonly possible: boolean;
+  readonly completed: boolean;
+  readonly paths: readonly string[];
+}
+
 export interface DeterministicFacts {
   readonly fileChanges: readonly string[];
   readonly filesRead: readonly string[];
   readonly exitCode?: number;
-  readonly verification?: {
-    readonly kind: VerificationKind;
-    readonly status: VerificationStatus;
-    readonly command: string;
-    readonly compound: boolean;
-  };
+  readonly verification?: VerificationFact;
+  readonly mutation?: MutationFact;
   readonly phaseProposal: AgentPhase | null;
   readonly deterministicallyResolved: readonly EventId[];
   readonly supersededInWorkingSet: readonly EventId[];
@@ -163,10 +199,13 @@ export interface SemanticDecisions {
 }
 
 export interface ProjectionMeasurement {
+  readonly mode?: "disabled" | "append" | "current-run";
   readonly messagesBefore: number;
   readonly messagesAfter: number;
+  readonly messagesOmitted?: number;
   readonly charsBefore: number;
   readonly charsAfter: number;
+  readonly stateBlockChars?: number;
   readonly fallback?: string;
 }
 

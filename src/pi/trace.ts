@@ -24,13 +24,16 @@ export function exportSession(
   );
   const header = entries.find((entry) => entry.type === "session");
   return {
-    events: hasRecords
-      ? restored.transitions.map((record) => record.event)
-      : deriveEvents(branch, options.config),
+    events:
+      hasRecords && !restored.legacy
+        ? restored.transitions.map((record) => record.event)
+        : deriveEvents(branch, options.config),
     transitions: restored.transitions,
     cwd: typeof header?.cwd === "string" ? header.cwd : ".",
     config: restored.transitions[0]?.config ?? options.config,
     leaf: branch.at(-1)?.id ?? null,
+    formatVersion: restored.legacy ? 1 : 2,
+    legacy: restored.legacy,
   };
 }
 

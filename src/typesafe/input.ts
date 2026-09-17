@@ -1,5 +1,6 @@
 import type { AgentEvent, Excerpt } from "../core/types.js";
 import type { StateUpdateContext } from "../core/updater.js";
+import { buildRequestPlan } from "./request_plan.js";
 
 export function redact(text: string): string {
   return text
@@ -23,22 +24,19 @@ export function buildInput(context: StateUpdateContext): string {
   }
 }
 
-function inputObject(
-  { state, event, facts, evidence, config }: StateUpdateContext,
-  excerptLimit: number,
-) {
+function inputObject(context: StateUpdateContext, excerptLimit: number) {
+  const { state, event, facts, evidence, config } = context;
+  const plan = buildRequestPlan(context);
+  const sources = new Map(evidence);
+  sources.set(event.id, event);
   const goal = state.goal ? evidence.get(state.goal) : undefined;
-  const ids = new Set([
-    ...state.activeBlockers.map((blocker) => blocker.eventId),
-    ...state.workingSet,
-  ]);
-  const related = [...ids].flatMap((id) => {
-    const source = evidence.get(id);
+  const related = plan.evidenceIds.flatMap((id) => {
+    const source = sources.get(id);
     return source && !isReadResult(source) ? [[id, inputEvent(source, excerptLimit)]] : [];
   });
   const call =
     event.type === "tool_result"
-      ? [...evidence.values()].find(
+      ? [...sources.values()].find(
           (source) => source.type === "tool_call" && source.toolCallId === event.toolCallId,
         )
       : undefined;
@@ -50,6 +48,14 @@ function inputObject(
       verification:
         "Observed overall command outcome; compound commands do not prove every segment ran.",
     },
+    request_plan: {
+      questions: plan.items.map((item) => ({
+        id: item.id,
+        kind: item.kind,
+        evidence: item.requiredEvidence,
+      })),
+      skipped: plan.skipped,
+    },
     goal:
       goal?.type === "user_prompt"
         ? { id: goal.id, text: redact(goal.text).slice(0, config.limits.maxPromptChars) }
@@ -58,7 +64,11 @@ function inputObject(
       phase: state.phase,
       taskStatus: state.taskStatus,
       verification: state.verification,
-      activeBlockers: state.activeBlockers,
+      activeBlockers: {
+        unresolvedTotal: state.activeBlockers.length,
+        shown: state.activeBlockers.slice(-config.limits.maxProjectedBlockers),
+        omitted: Math.max(0, state.activeBlockers.length - config.limits.maxProjectedBlockers),
+      },
       modifiedFiles: state.modifiedFiles,
     },
     latest_event: {
@@ -95,6 +105,8 @@ function inputEvent(event: AgentEvent, excerptLimit: number) {
   if (event.type === "user_prompt")
     return { id: event.id, type: event.type, text: redact(event.text).slice(0, excerptLimit) };
   if (event.type === "file_change") return { id: event.id, type: event.type, paths: event.paths };
+  if (event.type === "session_resume")
+    return { id: event.id, type: event.type, reason: event.reason };
   return { id: event.id, type: event.type, toolName: event.toolName };
 }
 

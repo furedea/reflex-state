@@ -39,6 +39,28 @@ test("Pi results retain stable joins and bounded text while ignoring images", ()
   expect(result.timestamp).toBe("1970-01-01T00:00:01.000Z");
 });
 
+test("normalization records command truncation and session resume as events", () => {
+  const config = defaultConfig();
+  const normalizer = new PiEventNormalizer({
+    eventCount: 0,
+    turnIndex: 0,
+    config: {
+      ...config,
+      limits: { ...config.limits, maxExcerptHeadChars: 3, maxExcerptTailChars: 0 },
+    },
+    cwd: "/workspace",
+  });
+  const call = normalizer.call({
+    type: "tool_call",
+    toolCallId: "call-1",
+    toolName: "bash",
+    input: { command: "pytest tests/unit" },
+  });
+  expect(call.commandTruncated).toBe(true);
+  expect(call.cwd).toBe("/workspace");
+  expect(normalizer.resume("branch_switch").reason).toBe("branch_switch");
+});
+
 test("each delivered user message advances the goal turn and preserves bounded verbatim text", () => {
   const normalizer = new PiEventNormalizer({
     eventCount: 0,

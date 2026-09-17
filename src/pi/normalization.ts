@@ -19,6 +19,7 @@ interface NormalizerOptions {
   readonly turnIndex: number;
   readonly config: ReflexStateConfig;
   readonly now?: () => number;
+  readonly cwd?: string;
 }
 
 export class PiEventNormalizer {
@@ -40,16 +41,19 @@ export class PiEventNormalizer {
   }
 
   call(event: PiToolCallEvent): ToolCallEvent {
+    const maxChars =
+      this.options.config.limits.maxExcerptHeadChars +
+      this.options.config.limits.maxExcerptTailChars;
+    const input = event.input as Readonly<Record<string, unknown>>;
+    const command = typeof input.command === "string" ? input.command : undefined;
     return {
       ...this.base({ kind: "tool_call", toolCallId: event.toolCallId, timestamp: this.now() }),
       type: "tool_call",
       toolCallId: event.toolCallId,
       toolName: event.toolName,
-      input: boundedInput(
-        event.input,
-        this.options.config.limits.maxExcerptHeadChars +
-          this.options.config.limits.maxExcerptTailChars,
-      ),
+      input: boundedInput(event.input, maxChars),
+      ...(command !== undefined && command.length > maxChars ? { commandTruncated: true } : {}),
+      ...(this.options.cwd ? { cwd: this.options.cwd } : {}),
     };
   }
 
@@ -75,6 +79,14 @@ export class PiEventNormalizer {
         this.options.config.limits,
       ),
       stopReason: stopReason === "toolUse" || stopReason === "pending" ? "aborted" : stopReason,
+    };
+  }
+
+  resume(reason: "resume" | "branch_switch" = "resume") {
+    return {
+      ...this.base({ kind: "assistant_message", timestamp: this.now() }),
+      type: "session_resume" as const,
+      reason,
     };
   }
 

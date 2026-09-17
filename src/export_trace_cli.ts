@@ -35,8 +35,17 @@ async function main(): Promise<void> {
       "events.jsonl": jsonLines(result.events),
       "transitions.jsonl": jsonLines(result.transitions),
       "trace_meta.json":
-        JSON.stringify({ cwd: result.cwd, config: result.config, leaf: result.leaf }, null, 2) +
-        "\n",
+        JSON.stringify(
+          {
+            cwd: result.cwd,
+            config: result.config,
+            leaf: result.leaf,
+            formatVersion: result.formatVersion,
+            legacy: result.legacy,
+          },
+          null,
+          2,
+        ) + "\n",
     },
     [input],
   );
