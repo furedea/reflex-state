@@ -18,3 +18,4 @@ dist/
 .release/
 replay-output/
 trace-output/
+.local/

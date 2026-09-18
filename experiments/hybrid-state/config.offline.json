@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "evaluation": "trace_audit",
+  "provider": {
+    "mode": "fake",
+    "jevModel": "fake-jev",
+    "actorModel": "fake-actor",
+    "repairModel": "fake-repair",
+    "maxRequests": 128,
+    "timeoutMs": 3000
+  },
+  "budgets": {
+    "memoryBytes": 8192,
+    "factsBytes": 4096,
+    "latestObservationBytes": 8192,
+    "requestBytes": 24000,
+    "maxQuestions": 8,
+    "maxRepairCalls": 1,
+    "maxActions": 8
+  },
+  "modes": ["history", "llm", "rules", "jev"],
+  "seed": 17,
+  "recordContextText": false,
+  "candidateMaxBytes": 4096,
+  "taskRoot": "experiments/hybrid-state/tasks"
+}
