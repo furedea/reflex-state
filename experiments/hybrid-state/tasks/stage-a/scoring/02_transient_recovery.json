@@ -4,34 +4,57 @@
     {
       "testId": "calc-check",
       "kind": "script",
-      "script": "const mod = await import(\"./src/calc.js\");\nconst result = mod.add(3, 4);\nconst ok = result === 7;\nconsole.log(\"oracle-result: \" + JSON.stringify({ passed: ok, detail: `add(3,4)=${result}` }));"
+      "script": "const mod = await loadModule(\"./src/calc.js\");\nconst cases = [[3, 4, 7], [0, 0, 0], [-2, 5, 3], [100, 250, 350], [-7, -3, -10]];\nconst failures = [];\nfor (const [a, b, expected] of cases) {\n  let got;\n  try { got = mod.add(a, b); } catch (error) { got = \"threw: \" + error; }\n  if (got !== expected) failures.push(`add(${a},${b}) expected ${expected}, got ${got}`);\n}\nconsole.log(\"oracle-result: \" + JSON.stringify({ passed: failures.length === 0, detail: failures.length ? failures.join(\"; \") : \"all addition cases pass\" }));"
+    },
+    {
+      "testId": "syntax-check",
+      "kind": "script",
+      "script": "const mod = await loadModule(\"./src/calc.js\");\nconst ok = typeof mod.add === \"function\";\nconsole.log(\"oracle-result: \" + JSON.stringify({ passed: ok, detail: ok ? \"module loads and exports add\" : \"add export missing\" }));"
     }
   ],
   "checkpoints": [
     {
-      "id": "failure-remembered",
+      "id": "decoy-pass-visible",
       "at": 4,
-      "appliesWhen": "failure_observed",
       "required": [
         {
-          "id": "transient-failure",
-          "description": "The failed calc-check observation is still visible in the evolving context before the retry.",
-          "anyOf": [["calc-check", "failed"]],
-          "markers": ["calc-check"],
-          "sections": ["memory", "history"]
+          "id": "syntax-check-passed",
+          "kind": "verification",
+          "description": "The unrelated syntax-check pass is present in the evolving context.",
+          "testId": "syntax-check",
+          "status": "passed",
+          "fresh": true,
+          "markers": ["syntax-check"],
+          "sections": ["facts", "latest_observation", "history"]
         }
       ]
     },
     {
-      "id": "recovery-verified",
-      "at": "final",
+      "id": "recovered-check-retained",
+      "at": 6,
       "required": [
         {
-          "id": "fresh-pass",
-          "description": "The final input reflects a fresh passing verification, not a stale or absent one.",
-          "anyOf": [["\"status\":\"passed\"", "observedGeneration"], ["calc-check: passed"]],
+          "id": "calc-check-recovered",
+          "kind": "verification",
+          "description": "The calc-check itself passed on its latest execution; a different check's success does not count.",
+          "testId": "calc-check",
+          "status": "passed",
+          "fresh": true,
           "markers": ["calc-check"],
-          "sections": ["facts", "history"]
+          "sections": ["facts", "latest_observation", "history"]
+        },
+        {
+          "id": "transient-failure",
+          "kind": "verbatim",
+          "description": "The earlier calc-check failure remains recorded so a fresh failure cannot masquerade as never having happened.",
+          "anyOf": [["calc-check", "fail"]],
+          "inverted": ["calc-check passed first try", "never failed"],
+          "scope": {
+            "memoryKinds": ["attempts", "findings"],
+            "roles": ["tool_result", "assistant"]
+          },
+          "markers": ["calc-check"],
+          "sections": ["memory", "latest_observation", "history"]
         }
       ]
     }

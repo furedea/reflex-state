@@ -8,7 +8,13 @@ import { dirname, join } from "node:path";
 
 import type { HotState } from "../../core/types.js";
 import { normalizeCwd, verificationCheckKey } from "../../core/verification.js";
-import type { ActorAction, HybridTask, TaskScoring } from "./types.js";
+import type {
+  ActorAction,
+  ExperimentCheckFact,
+  FactsView,
+  HybridTask,
+  TaskScoring,
+} from "./types.js";
 
 const EXPERIMENT_CWD = "/experiment";
 const EXPERIMENT_TEST_COMMAND = "experiment test";
@@ -23,6 +29,8 @@ interface VerificationObservation {
   readonly seq: number;
   /** Evidence id tying this verification to the tool call that produced it. */
   readonly evidenceId?: string;
+  /** Task-constraint verdicts reported by the oracle for this check. */
+  readonly constraints?: Readonly<Record<string, boolean>>;
 }
 
 interface ExecutionResult {
@@ -36,6 +44,8 @@ interface OracleRunResult {
   readonly testId: string;
   readonly status: "passed" | "failed" | "not_run";
   readonly output?: string;
+  /** Task-constraint verdicts reported by the oracle. */
+  readonly constraints?: Readonly<Record<string, boolean>>;
 }
 
 interface EnvironmentOptions {
@@ -95,7 +105,7 @@ export class TaskEnvironment {
           return { text: "invalid write", passed: false, violation: "invalid_action" };
         this.workspace.set(action.path, action.content);
         this.generation++;
-        return { text: `write ok: ${action.path}`, passed: true };
+        return { text: `write ok: ${action.path} (gen=${this.generation})`, passed: true };
       }
       case "edit": {
         if (action.path === undefined || action.old === undefined || action.new === undefined)
@@ -109,7 +119,7 @@ export class TaskEnvironment {
           content.slice(0, index) + action.new + content.slice(index + action.old.length),
         );
         this.generation++;
-        return { text: `edit ok: ${action.path}`, passed: true };
+        return { text: `edit ok: ${action.path} (gen=${this.generation})`, passed: true };
       }
       case "test":
         return this.executeTest(action, evidenceId);
@@ -131,7 +141,11 @@ export class TaskEnvironment {
     const checkKey = verificationCheckKey("test", EXPERIMENT_CWD, command);
     const generation = this.generation;
     const seq = this.seq++;
-    const record = (status: "passed" | "failed", text: string) => {
+    const record = (
+      status: "passed" | "failed",
+      text: string,
+      constraints?: Readonly<Record<string, boolean>>,
+    ) => {
       this.checks.set(checkKey, {
         testId,
         status,
@@ -151,6 +165,7 @@ export class TaskEnvironment {
           generation,
           seq,
           ...(evidenceId ? { evidenceId } : {}),
+          ...(constraints ? { constraints } : {}),
         },
       };
     };
@@ -160,6 +175,7 @@ export class TaskEnvironment {
       return record(
         status,
         `test ${testId}: ${status} check=${checkKey} gen=${generation} seq=${seq}${evidenceId ? ` evidence=${evidenceId}` : ""}${run.output ? `\n${run.output}` : ""}`,
+        run.constraints,
       );
     }
     // A task with a scoring file never falls back to the task's expectedFiles;
@@ -195,7 +211,12 @@ export class TaskEnvironment {
       const oracle = this.scoring?.oracles?.find((candidate) => candidate.testId === testId);
       if (oracle?.kind === "script" && oracle.script) {
         const run = await runScriptOracle(this.workspace, oracle.script, this.options);
-        results.push({ testId, status: run.passed ? "passed" : "failed", output: run.output });
+        results.push({
+          testId,
+          status: run.passed ? "passed" : "failed",
+          output: run.output,
+          ...(run.constraints ? { constraints: run.constraints } : {}),
+        });
       } else if (oracle?.kind === "expected_files") {
         const expected = this.scoring?.expectedFiles ?? {};
         const ok = Object.entries(expected).every(
@@ -213,7 +234,7 @@ export class TaskEnvironment {
   }
 
   verificationFacts(): {
-    readonly verification: HotState["verification"];
+    readonly verification: FactsView["verification"];
     readonly blockers: readonly HotState["activeBlockers"][number][];
   } {
     let latest:
@@ -226,6 +247,7 @@ export class TaskEnvironment {
           readonly seq: number;
         }
       | undefined;
+    const latestPerTest = new Map<string, { generation: number; seq: number; checkKey: string }>();
     const blockers: HotState["activeBlockers"][number][] = [];
     for (const [checkKey, check] of this.checks) {
       if (
@@ -234,6 +256,17 @@ export class TaskEnvironment {
         (check.generation === latest.generation && check.seq > latest.seq)
       )
         latest = { ...check, checkKey };
+      const prior = latestPerTest.get(check.testId);
+      if (
+        !prior ||
+        check.generation > prior.generation ||
+        (check.generation === prior.generation && check.seq > prior.seq)
+      )
+        latestPerTest.set(check.testId, {
+          generation: check.generation,
+          seq: check.seq,
+          checkKey,
+        });
       if (check.status === "failed")
         blockers.push({
           eventId: `env-${check.testId}` as HotState["activeBlockers"][number]["eventId"],
@@ -243,7 +276,22 @@ export class TaskEnvironment {
           category: "test",
         });
     }
-    const verification: HotState["verification"] = {
+    // Per-test facts let scoring compare each declared test's latest result;
+    // a different check's success can never masquerade as this test's.
+    const tests: Record<string, ExperimentCheckFact> = {};
+    for (const [checkKey, check] of this.checks) {
+      const latestForTest = latestPerTest.get(check.testId);
+      if (!latestForTest || latestForTest.checkKey !== checkKey) continue;
+      tests[check.testId] = {
+        testId: check.testId,
+        status: check.status,
+        freshness: check.generation === this.generation ? "current" : "stale",
+        command: check.command,
+        checkKey,
+        observedGeneration: check.generation,
+      };
+    }
+    const verification: FactsView["verification"] = {
       build: { status: "not_run", freshness: "unknown" },
       lint: { status: "not_run", freshness: "unknown" },
       test: latest
@@ -257,6 +305,7 @@ export class TaskEnvironment {
             attributable: true,
           }
         : { status: "not_run", freshness: "unknown" },
+      tests,
     };
     return { verification, blockers };
   }
@@ -279,11 +328,13 @@ export function safePath(path: string): boolean {
 interface OracleVerdict {
   readonly passed: boolean;
   readonly detail?: string;
+  readonly constraints?: Readonly<Record<string, boolean>>;
 }
 
 /** The oracle result protocol: the last `oracle-result:` line must be a JSON
- * object with a boolean `passed`. A clean exit or a "passed" print without the
- * verdict line is not evidence of success. */
+ * object with a boolean `passed`; it may also carry a `constraints` map of
+ * per-constraint boolean verdicts. A clean exit or a "passed" print without
+ * the verdict line is not evidence of success. */
 function parseOracleResult(stdout: string): OracleVerdict | null {
   const line = stdout
     .trim()
@@ -298,10 +349,22 @@ function parseOracleResult(stdout: string): OracleVerdict | null {
       typeof value === "object" &&
       typeof (value as Record<string, unknown>).passed === "boolean"
     ) {
-      const detail = (value as Record<string, unknown>).detail;
+      const record = value as Record<string, unknown>;
+      const constraints =
+        record.constraints && typeof record.constraints === "object"
+          ? Object.fromEntries(
+              Object.entries(record.constraints as Record<string, unknown>).filter(
+                ([, verdict]) => typeof verdict === "boolean",
+              ),
+            )
+          : undefined;
+      const detail = record.detail;
       return {
-        passed: (value as { passed: boolean }).passed,
+        passed: record.passed as boolean,
         ...(typeof detail === "string" && detail ? { detail } : {}),
+        ...(constraints && Object.keys(constraints).length
+          ? { constraints: constraints as Record<string, boolean> }
+          : {}),
       };
     }
   } catch {
@@ -309,6 +372,26 @@ function parseOracleResult(stdout: string): OracleVerdict | null {
   }
   return null;
 }
+
+/** Trusted prelude prepended to every script oracle. `loadModule` evaluates a
+ * workspace module as untrusted code inside a fresh vm context: it has no
+ * process, no import machinery, and a console that cannot reach stdout, so the
+ * `oracle-result:` verdict can only be produced by the trusted script. */
+const TRUSTED_PRELUDE = `import { readFileSync as __oracleReadFileSync } from "node:fs";
+import vm from "node:vm";
+async function loadModule(path) {
+  const source = __oracleReadFileSync(path, "utf8");
+  const logs = [];
+  const sink = new Proxy({}, { get: () => (...args) => void logs.push(args.map(String).join(" ")) });
+  const context = vm.createContext({ console: sink });
+  const mod = new vm.SourceTextModule(source, { context, identifier: String(path) });
+  await mod.link(() => {
+    throw new Error("candidate imports are not allowed");
+  });
+  await mod.evaluate();
+  return mod.namespace;
+}
+`;
 
 interface ResolvedLauncher {
   /** Absolute, symlink-resolved sandbox launcher. */
@@ -421,7 +504,11 @@ async function runScriptOracle(
   workspace: ReadonlyMap<string, string>,
   script: string,
   options: EnvironmentOptions,
-): Promise<{ readonly passed: boolean; readonly output: string }> {
+): Promise<{
+  readonly passed: boolean;
+  readonly output: string;
+  readonly constraints?: Readonly<Record<string, boolean>>;
+}> {
   const directory = await mkdtemp(join(tmpdir(), "hybrid-oracle-"));
   try {
     for (const [path, content] of workspace) {
@@ -435,6 +522,7 @@ async function runScriptOracle(
     }
     const timeoutMs = options.oracleTimeoutMs ?? DEFAULT_TIMEOUT_MS;
     const limit = options.oracleOutputLimit ?? DEFAULT_OUTPUT_LIMIT;
+    const body = `${TRUSTED_PRELUDE}\n${script}`;
     let command: string;
     let argv: string[];
     if (options.isolated) {
@@ -446,13 +534,14 @@ async function runScriptOracle(
         "-p",
         sandboxProfile(realpathSync(directory), launcher.node),
         launcher.node,
+        "--experimental-vm-modules",
         "--input-type=module",
         "--eval",
-        script,
+        body,
       ];
     } else {
       command = process.execPath;
-      argv = ["--input-type=module", "--eval", script];
+      argv = ["--experimental-vm-modules", "--input-type=module", "--eval", body];
     }
     // The child environment is replaced, not merged: only the runtime directory
     // and the workspace TMPDIR are provided, so parent secrets are not inherited.
@@ -474,7 +563,11 @@ async function runScriptOracle(
         passed: false,
         output: `invalid_result_protocol: ${run.error ? `${run.error.message} ` : ""}${output}`,
       };
-    return { passed: verdict.passed, output: verdict.detail ?? output };
+    return {
+      passed: verdict.passed,
+      output: verdict.detail ?? output,
+      ...(verdict.constraints ? { constraints: verdict.constraints } : {}),
+    };
   } finally {
     await rm(directory, { recursive: true, force: true }).catch(() => undefined);
   }

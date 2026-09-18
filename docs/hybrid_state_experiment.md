@@ -85,22 +85,61 @@ Each allowed test id resolves through a declared oracle (script or expected file
 observations feed the Facts view with a check key and generation. Script oracles must print a
 final `oracle-result:` line whose JSON carries a boolean `passed` field; a clean exit or matching
 text is not a pass. Each verification carries the evidence id of the action that produced it and
-a generation plus sequence number so stale checks never outrank newer ones. This is an experiment
-boundary, not a general-purpose sandbox.
+a generation plus sequence number so stale checks never outrank newer ones, and the Facts view
+reports the latest result per declared test id so one check's success cannot stand in for
+another's. This is an experiment boundary, not a general-purpose sandbox.
+
+Script oracles evaluate candidate workspace code through a trusted `loadModule` prelude: the
+candidate file is read as text and evaluated inside a fresh `vm.SourceTextModule` context with no
+`process`, no import machinery, and a captured console, so only the trusted script can emit the
+verdict line — candidate code cannot forge `oracle-result:`, terminate the run early, or import
+modules. Oracles that compare behavior (not file bytes) call the candidate's exports across
+several inputs and decide pass/fail on the trusted side.
+
+## Scoring
+
+Checkpoint requirements are typed instead of free-text matching:
+
+- `verbatim` retains only when the canonical phrases appear together inside one
+  provenance-eligible item (a memory item of a declared kind or trust, a history or observation
+  line of a declared role) that does not itself carry an inverting phrase; a canonical text found
+  only under the wrong provenance fails, and a recognizable paraphrase stays
+  `needs_semantic_review` rather than passing.
+- `exact_value` requires the declared token with identifier/numeric boundaries, so `9377` never
+  matches inside `19377`.
+- `verification` compares the structured latest check for the declared test id — status and
+  freshness in the state-first Facts view, generation and sequence ordering in the history
+  transcript — so a stale pass or a different check's success does not count.
+
+Task constraints are scored independently of action policy: oracles may attach a `constraints`
+map of boolean verdicts to their result, verdicts are sticky-false across the trial, and
+`constraintPassed` is `null` when a task declares none. A policy violation (for example a path
+escape) fails wiring without changing `constraintPassed`, and a broken task constraint fails
+`constraintPassed` without needing any policy violation.
 
 ## Live execution
 
 Live execution requires a live configuration and an explicit `--live` flag; the flag is rejected
 for non-live configs and required for live ones. Provider and model ids, request and action
 limits, and timeouts must be present and are validated before any call is made. A live provider
-that is needed but unconfigured fails preflight instead of being silently skipped. When
-`provider.executionIsolation` is `required`, the run aborts unless a sandbox mechanism is
-available and its boundary is verified. On macOS the mechanism is a deny-default `sandbox-exec`
-seatbelt profile around a resolved absolute node binary; the preflight probes workspace writes,
-outside reads, symlink escapes, environment non-inheritance, network denial, and timeout
-enforcement, and reports each failed check. Live runs do not accept `--session` inputs.
-Authentication uses the existing Pi and TypeSafe credential paths; keys are not written to
-configuration or output. Live execution is intentionally not part of the default checks.
+that is needed but unconfigured fails preflight instead of being silently skipped.
+
+Live runs are limited to the approved Stage A fixture set: `taskRoot` must be the manifest's
+directory (`experiments/hybrid-state/tasks/stage-a`) and every task and scoring file is compared
+against the checked-in sha256 manifest `experiments/hybrid-state/stage-a.approved.json`; a
+tampered, missing, or extra file fails preflight. Every closed-loop task must have a scoring
+entry and every allowed test a declared oracle — there is no silent expectedFiles fallback when a
+comparison run is being scored.
+
+Isolation is required whenever `provider.executionIsolation` is `required` and whenever a
+closed-loop run uses a non-fake provider — a `recorded` provider still replays generated code
+into the task environment, so it does not skip the boundary check either. On macOS the mechanism
+is a deny-default `sandbox-exec` seatbelt profile around a resolved absolute node binary; the
+preflight probes workspace writes, outside reads, symlink escapes, environment non-inheritance,
+network denial, and timeout enforcement, and reports each failed check. Live runs do not accept
+`--session` inputs. Authentication uses the existing Pi and TypeSafe credential paths; keys are
+not written to configuration or output. Live execution is intentionally not part of the default
+checks.
 
 ## What this prototype does not claim
 

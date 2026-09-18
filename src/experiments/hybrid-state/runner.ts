@@ -300,6 +300,7 @@ export async function runAudit(options: {
         cancelled: false,
         ...(endReason === "completed" ? {} : { error: endReason }),
         policyViolations: [],
+        constraints: {},
         testResults: {},
         actorTests: [],
         sentTexts: [],
@@ -422,6 +423,16 @@ interface TrialPlan {
   readonly iteration: number;
 }
 
+/** Oracle scripts execute workspace code, so isolation is required whenever a
+ * config asks for it or when a closed_loop run uses a non-fake provider
+ * (recorded responses still replay generated code into the environment). */
+export function requiresIsolation(config: HybridConfig): boolean {
+  return (
+    config.provider.executionIsolation === "required" ||
+    (config.evaluation === "closed_loop" && config.provider.mode !== "fake")
+  );
+}
+
 /** Deterministic trial order derived from config.seed. */
 function seededOrder<T>(items: readonly T[], seed: number): T[] {
   const result = [...items];
@@ -487,6 +498,7 @@ function unfinishedTrial(
     cancelled: false,
     error: reason,
     policyViolations: [],
+    constraints: {},
     testResults: {},
     actorTests: [],
     sentTexts: [],
@@ -509,7 +521,7 @@ async function runTrial(
 ): Promise<TrialScore> {
   const { task, mode, trialId, iteration, scoring } = plan;
   const env = new TaskEnvironment(task, scoring, {
-    isolated: config.provider.executionIsolation === "required",
+    isolated: requiresIsolation(config),
   });
   const normalizer = new PiEventNormalizer({
     eventCount: 0,
@@ -538,6 +550,11 @@ async function runTrial(
   let completed = false;
   let error: string | undefined;
   const policyViolations: string[] = [];
+  const constraintVerdicts = new Map<string, boolean>();
+  const mergeConstraints = (verdicts?: Readonly<Record<string, boolean>>) => {
+    for (const [key, verdict] of Object.entries(verdicts ?? {}))
+      constraintVerdicts.set(key, (constraintVerdicts.get(key) ?? true) && verdict);
+  };
   const actorTests: { testId: string; step: number; passed: boolean }[] = [];
   const sentTexts: string[] = [];
   const readKeys = new Set<string>();
@@ -781,12 +798,14 @@ async function runTrial(
       isError: !execution.passed,
       truncated: false,
     });
-    if (execution.verification)
+    if (execution.verification) {
       actorTests.push({
         testId: execution.verification.testId,
         step,
         passed: execution.passed,
       });
+      mergeConstraints(execution.verification.constraints);
+    }
     if (response.action.tool === "finish") {
       completed = true;
       break;
@@ -805,7 +824,10 @@ async function runTrial(
   if (!completed && !error) error = "action_budget_exhausted";
   const testResults: Record<string, "passed" | "failed" | "not_run"> = {};
   if (completed)
-    for (const result of await env.evaluateFinal()) testResults[result.testId] = result.status;
+    for (const result of await env.evaluateFinal()) {
+      testResults[result.testId] = result.status;
+      mergeConstraints(result.constraints);
+    }
   else for (const testId of task.allowedTests) testResults[testId] = "not_run";
   const finishedAt = new Date().toISOString();
   return scoreTrial({
@@ -819,6 +841,7 @@ async function runTrial(
     cancelled: false,
     ...(error ? { error } : {}),
     policyViolations,
+    constraints: Object.fromEntries(constraintVerdicts),
     testResults,
     actorTests,
     sentTexts,

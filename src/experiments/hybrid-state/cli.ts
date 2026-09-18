@@ -17,6 +17,7 @@ import {
 } from "./providers.js";
 import {
   PersistenceError,
+  requiresIsolation,
   runAudit,
   runClosedLoop,
   type ExperimentRun,
@@ -122,8 +123,8 @@ async function execute(command: "audit" | "run", values: CliOptions): Promise<vo
   const config = await loadHybridConfig(values.config, command, values.live);
   // Preflight completes before the output directory is reserved or any record
   // is written, so a rejected run leaves no partial result.
-  enforceLivePolicy(config, values);
-  if (config.provider.mode === "live") {
+  await enforceLivePolicy(config, values);
+  if (command === "run" && requiresIsolation(config)) {
     const isolation = await checkIsolation();
     if (!isolation.available)
       throw new Error(
@@ -137,6 +138,18 @@ async function execute(command: "audit" | "run", values: CliOptions): Promise<vo
         }`,
       );
   }
+  // Task and scoring validation belongs to preflight: a rejected run must not
+  // reserve or leave a partial result directory.
+  const prepared =
+    command === "run"
+      ? await (async () => {
+          const taskRoot = config.taskRoot ?? "experiments/hybrid-state/tasks";
+          const tasks = await loadTasks(taskRoot);
+          const scoring = await loadScoring(taskRoot, tasks);
+          validateScoredTasks(tasks, scoring);
+          return { taskRoot, tasks, scoring };
+        })()
+      : undefined;
   const writer = await ResultWriter.reserve(values.out);
   const runId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   let manifest: ExperimentManifest | undefined;
@@ -158,11 +171,8 @@ async function execute(command: "audit" | "run", values: CliOptions): Promise<vo
         recorder: recorderFor(writer),
       });
       await finalize(writer, manifest, result);
-    } else {
-      const taskRoot = config.taskRoot ?? "experiments/hybrid-state/tasks";
-      const tasks = await loadTasks(taskRoot);
-      const scoring = await loadScoring(taskRoot, tasks);
-      validateScoredTasks(tasks, scoring);
+    } else if (prepared) {
+      const { tasks, scoring } = prepared;
       const providers = await providerSet(config, values, tasks);
       manifest = startManifest(config, runId, "closed_loop", taskInputHash(tasks));
       await writer.writeManifest(manifest);
@@ -303,11 +313,63 @@ export async function loadHybridConfig(
 }
 
 const APPROVED_TASK_ROOT = resolve("experiments");
+const STAGE_A_MANIFEST = resolve("experiments/hybrid-state/stage-a.approved.json");
+
+interface ApprovedManifest {
+  readonly taskRoot: string;
+  readonly files: Readonly<Record<string, string>>;
+}
+
+async function loadApprovedManifest(path: string): Promise<ApprovedManifest> {
+  const value: unknown = JSON.parse(await readFile(path, "utf8"));
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error(`Invalid approved task manifest: ${path}`);
+  const record = value as Record<string, unknown>;
+  if (typeof record.taskRoot !== "string" || !record.taskRoot.trim())
+    throw new Error(`Invalid taskRoot in ${path}`);
+  const files = record.files;
+  if (!files || typeof files !== "object" || Array.isArray(files) || !Object.keys(files).length)
+    throw new Error(`Invalid files in ${path}`);
+  for (const [name, hash] of Object.entries(files as Record<string, unknown>))
+    if (typeof hash !== "string" || !hash.trim() || name.includes("..") || name.startsWith("/"))
+      throw new Error(`Invalid files entry ${name} in ${path}`);
+  return { taskRoot: record.taskRoot, files: files as Record<string, string> };
+}
+
+/** Live runs may only execute the approved Stage A fixture set: the task root
+ * must be the manifest's directory and every task/scoring file must hash-match
+ * the checked-in manifest, with no extra or missing files. The manifest path
+ * is injectable so the hash comparison itself is testable. */
+export async function verifyApprovedTasks(
+  taskRoot: string,
+  manifestPath: string = STAGE_A_MANIFEST,
+): Promise<void> {
+  const manifest = await loadApprovedManifest(manifestPath);
+  const root = resolve(taskRoot);
+  if (root !== resolve(manifest.taskRoot))
+    throw new Error(`Live execution is limited to the approved task set at ${manifest.taskRoot}`);
+  for (const [name, expected] of Object.entries(manifest.files)) {
+    const content = await readFile(join(root, name), "utf8").catch(() => {
+      throw new Error(`Approved task file missing: ${name}`);
+    });
+    const actual = createHash("sha256").update(content).digest("hex");
+    if (actual !== expected)
+      throw new Error(`Task file ${name} does not match the approved content hash`);
+  }
+  const present = new Set<string>();
+  for (const entry of await readdir(root)) if (entry.endsWith(".json")) present.add(entry);
+  const scoringDir = join(root, "scoring");
+  for (const entry of await readdir(scoringDir).catch(() => [] as string[]))
+    if (entry.endsWith(".json")) present.add(`scoring/${entry}`);
+  const extras = [...present].filter((name) => !(name in manifest.files));
+  if (extras.length) throw new Error(`Unapproved files in task root: ${extras.sort().join(", ")}`);
+}
 
 /** Live runs are restricted to the Stage A closed-loop shape: history/llm
- * modes only, checked-in task fixtures, required isolation, and no session,
- * case, or recorded inputs that could smuggle unapproved content. */
-export function enforceLivePolicy(config: HybridConfig, values: CliOptions): void {
+ * modes only, the approved checked-in task fixtures verified by content hash,
+ * required isolation, and no session, case, or recorded inputs that could
+ * smuggle unapproved content. */
+export async function enforceLivePolicy(config: HybridConfig, values: CliOptions): Promise<void> {
   if (config.provider.mode !== "live") return;
   if (values.live !== true) throw new Error("provider.mode=live requires --live");
   if (typeof values.session === "string")
@@ -330,16 +392,17 @@ export function enforceLivePolicy(config: HybridConfig, values: CliOptions): voi
   const taskRoot = resolve(config.taskRoot ?? "experiments/hybrid-state/tasks");
   if (!taskRoot.startsWith(`${APPROVED_TASK_ROOT}/`))
     throw new Error("Live execution requires checked-in task fixtures under experiments/");
+  await verifyApprovedTasks(taskRoot);
 }
 
-/** When a scoring directory is present, every task must be independently
- * scored: each allowed test needs an oracle; a missing file or empty oracle
- * list is a preflight error, not a silent expectedFiles fallback. */
+/** Closed-loop comparisons require independent scoring for every task: each
+ * task must have a scoring entry and each allowed test an explicit oracle; a
+ * missing scoring set is a preflight error, not a silent expectedFiles
+ * fallback. */
 export function validateScoredTasks(
   tasks: readonly HybridTask[],
   scoring: ReadonlyMap<string, TaskScoring>,
 ): void {
-  if (!scoring.size) return;
   for (const task of tasks) {
     const scored = scoring.get(task.id);
     if (!scored) throw new Error(`task ${task.id} has no scoring file in the scoring directory`);

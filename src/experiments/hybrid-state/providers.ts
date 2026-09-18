@@ -283,7 +283,11 @@ function fakePatch(request: ActorRequest): PatchOperation[] {
         text: last.text,
         sourceIds: [last.sourceId],
         trust: trustForRole(role),
-        origin: "extracted",
+        // The fallback patch replays the latest observation as-is; a generated
+        // origin keeps it valid even when the message never produced a
+        // citable candidate (an extracted origin would demand exact-text
+        // provenance the fake cannot prove).
+        origin: "generated",
       },
     ];
   } catch {

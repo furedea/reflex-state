@@ -1,10 +1,10 @@
 {
   "id": "transient-recovery",
-  "instruction": "Fix src/calc.js so add(a, b) returns the sum. Run the check and recover if it fails.",
+  "instruction": "Fix src/calc.js so add(a, b) returns the sum. Run the calc check and recover if it fails; the syntax check is a separate smoke check.",
   "files": {
     "src/calc.js": "export function add(a, b) {\n  return a - b;\n}\n"
   },
-  "allowedTests": ["calc-check"],
+  "allowedTests": ["calc-check", "syntax-check"],
   "steps": [
     {
       "observation": "Inspecting the implementation.",
@@ -21,8 +21,9 @@
       "result": "write"
     },
     { "action": { "tool": "test", "command": "calc-check" }, "result": "test" },
+    { "action": { "tool": "test", "command": "syntax-check" }, "result": "test" },
     {
-      "observation": "The check failed; correcting the off-by-one error.",
+      "observation": "The calc-check failed; correcting the off-by-one error.",
       "action": {
         "tool": "write",
         "path": "src/calc.js",

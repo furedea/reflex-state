@@ -4,33 +4,34 @@
     {
       "testId": "port-check",
       "kind": "script",
-      "script": "const mod = await import(\"./src/server.js\");\nconst ok = mod.port === 9377;\nconsole.log(\"oracle-result: \" + JSON.stringify({ passed: ok, detail: `port=${mod.port}` }));"
+      "script": "const mod = await loadModule(\"./src/server.js\");\nconst ok = mod.server.port === 8080;\nconsole.log(\"oracle-result: \" + JSON.stringify({ passed: ok, detail: ok ? \"fallback port selected\" : `expected port 8080 (primary occupied), got ${mod.server.port}` }));"
     }
   ],
   "checkpoints": [
     {
-      "id": "derived-value-retained",
-      "at": 3,
+      "id": "ports-retained",
+      "at": 4,
       "required": [
         {
-          "id": "port-value",
-          "description": "The PORT value discovered from the observation is retained in the evolving context before the check.",
-          "anyOf": [["9377"]],
-          "markers": ["PORT"],
-          "sections": ["memory", "history"]
-        }
-      ]
-    },
-    {
-      "id": "verification-fresh",
-      "at": "final",
-      "required": [
+          "id": "fallback-port-value",
+          "kind": "exact_value",
+          "description": "The fallback port 8080 is retained as an exact value; a different digit string does not count.",
+          "value": "8080",
+          "markers": ["port", "8080"],
+          "sections": ["memory", "latest_observation", "history"]
+        },
         {
-          "id": "fresh-pass",
-          "description": "The final input reflects a fresh passing verification, not a stale or absent one.",
-          "anyOf": [["\"status\":\"passed\"", "observedGeneration"], ["port-check: passed"]],
-          "markers": ["port-check"],
-          "sections": ["facts", "history"]
+          "id": "selection-condition",
+          "kind": "verbatim",
+          "description": "The conditional rule (primary unless occupied, otherwise fallback) is retained verbatim from a trusted source.",
+          "anyOf": [
+            ["unless", "occupied"],
+            ["occupied", "FALLBACK_PORT"]
+          ],
+          "inverted": ["always use PRIMARY_PORT", "ignore occupancy", "despite the policy"],
+          "scope": { "memoryKinds": ["findings", "constraints"], "roles": ["user", "tool_result"] },
+          "markers": ["occupied"],
+          "sections": ["memory", "latest_observation", "history"]
         }
       ]
     }

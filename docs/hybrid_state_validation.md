@@ -22,6 +22,24 @@ Earlier claims that fake results demonstrated information retention, state-first
 Jev value, or provider correctness are withdrawn; the fake conditions are wiring evidence only.
 Existing result files were not modified.
 
+The follow-up review found that scoring itself still passed wrong answers: checkpoint matching
+was substring-only, oracle verdicts could be forged by candidate code, and task constraints were
+conflated with action policy. Checkpoint requirements are now typed (`verbatim` with provenance
+and inversion checks, `exact_value` with token boundaries, `verification` compared structurally
+against per-test facts or generation/sequence-ordered history), and ambiguous paraphrases stay
+`needs_semantic_review` instead of passing. Script oracles now evaluate candidate workspace code
+inside a `vm.SourceTextModule` context (no `process`, no imports, captured console) through a
+trusted `loadModule` prelude, so only the trusted script can emit the `oracle-result:` verdict,
+and behavior oracles compare multiple inputs rather than one. Task-constraint verdicts travel
+through the oracle result (`constraints` map) and are scored independently of policy violations
+(`constraintPassed`, `null` when undeclared). The Stage A tasks were revised to cover what the
+comparison requires: the protected-constraint task hides the constraint inside a mid-run
+observation, the transient-recovery task adds an independent second check so a different test's
+success cannot masquerade, and the observation-derived task requires conditional selection
+between two candidate ports. Live gating now verifies the approved task set by content hash
+(`stage-a.approved.json`), requires scoring for every closed-loop task, and requires isolation
+for every non-fake closed-loop provider including `recorded`.
+
 ## Acceptance evidence
 
 Acceptance tests live in `src/experiments/hybrid-state/acceptance.test.ts` and run under vitest.
@@ -43,28 +61,37 @@ Acceptance tests live in `src/experiments/hybrid-state/acceptance.test.ts` and r
 | F1  | the input-dependent fake detects providers that ignore the sent input                        |
 
 Regression tests live in `update.test.ts`, `task_environment.test.ts`, `stage_a.test.ts`,
-`projection.test.ts`, `runner.test.ts`, and `trace.test.ts`. They cover protected-constraint
-updates, actually-applied operation counts, oracle result protocol (`oracle-result:` JSON with a
-boolean `passed`), verification evidence ids with generation/sequence freshness, the deny-default
-isolation boundary probes (workspace write, outside read, symlink escape, environment
-non-inheritance, network denial, timeout), over-budget actor patches, skipped trials, recorder
-failure classification, and the full Stage A loop of three tasks across both modes.
+`evaluation.test.ts`, `projection.test.ts`, `runner.test.ts`, and `trace.test.ts`. They cover
+protected-constraint updates, actually-applied operation counts, oracle result protocol
+(`oracle-result:` JSON with a boolean `passed`), verification evidence ids with
+generation/sequence freshness, the deny-default isolation boundary probes (workspace write,
+outside read, symlink escape, environment non-inheritance, network denial, timeout), over-budget
+actor patches, skipped trials, recorder failure classification, and the full Stage A loop of
+three tasks across both modes.
+
+The negative-side cases are covered as well: a stale pass, a different test's pass, a value
+embedded in a longer digit string, an inverted canonical phrase, canonical text under wrong
+provenance, and an unverifiable paraphrase are all rejected or left unevaluated by the checkpoint
+scorers; a constant-returning implementation, a missing export, a forged `oracle-result:` line
+printed by candidate code, a `process.exit` inside the candidate, and a candidate `import` all
+fail the oracle; an unapproved task root, a tampered or missing task file, an extra file, a
+missing scoring entry, and a `recorded` provider without isolation are all rejected.
 
 ## Executed commands and results
 
-| Evidence                | Command                                                                                                                                         | Result                                                                                                                                                                            |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| TypeScript build        | `pnpm run build`                                                                                                                                | passed (`tsc -p tsconfig.build.json`)                                                                                                                                             |
-| Hybrid-state tests      | `pnpm exec vitest run src/experiments/hybrid-state`                                                                                             | 7 files, 53 tests passed                                                                                                                                                          |
-| Full repository gate    | `pnpm check`                                                                                                                                    | passed: oxfmt, oxlint, type-aware check, 189 vitest tests passed + 1 skipped, 14 release tests passed, knip clean                                                                 |
-| Package verification    | `pnpm run package:check`                                                                                                                        | passed: extension packaging plus export/replay commands                                                                                                                           |
-| Trace audit (wiring)    | `node dist/experiments/hybrid-state/cli.js audit --config experiments/hybrid-state/config.offline.json --out .local/hybrid-state/audit-v2`      | run `run-mu6p260g-x6mt86`; 4 modes wiring passed; efficacy not_evaluated                                                                                                          |
-| Stage A closed loop     | `node dist/experiments/hybrid-state/cli.js run --config experiments/hybrid-state/config.stage-a.offline.json --out .local/hybrid-state/stage-a` | run `run-mu76ox58-kfguxv`; 3 tasks × 2 modes = 6 trials, all wiring passed and all oracle tests passed; efficacy not_evaluated; 30 actor calls recorded (no Jev, no update calls) |
-| Existing result display | `node dist/experiments/hybrid-state/cli.js report --input .local/hybrid-state/stage-a`                                                          | existing result displayed; report rendered from `summary.json` without a new run                                                                                                  |
-| Live preflight          | `node dist/experiments/hybrid-state/cli.js run --config experiments/hybrid-state/config.live.example.json --out ...`                            | rejected: `provider.mode=live requires --live` (exit 1), no output directory created                                                                                              |
-| Live flag misuse        | `node dist/experiments/hybrid-state/cli.js run --live --config experiments/hybrid-state/config.offline.json --out ...`                          | rejected: `--live is only valid with provider.mode=live` (exit 1)                                                                                                                 |
-| Product replay          | `node dist/replay_cli.js <exported events.jsonl> --updater noop`                                                                                | exported trace replayed; state produced without errors                                                                                                                            |
-| Pi extension smoke      | inside `pnpm run test` (`src/pi/smoke.test.ts`)                                                                                                 | extension loads and persists branch-correct state through the real Pi runner                                                                                                      |
+| Evidence                | Command                                                                                                                                    | Result                                                                                                                                                                            |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript build        | `pnpm run build`                                                                                                                           | passed (`tsc -p tsconfig.build.json`)                                                                                                                                             |
+| Hybrid-state tests      | `pnpm exec vitest run src/experiments/hybrid-state`                                                                                        | 8 files, 84 tests passed                                                                                                                                                          |
+| Full repository gate    | `pnpm check`                                                                                                                               | passed: oxfmt, oxlint, type-aware check, 220 vitest tests passed + 1 skipped, 14 release tests passed, knip clean                                                                 |
+| Package verification    | `pnpm run package:check`                                                                                                                   | passed: extension packaging plus export/replay commands                                                                                                                           |
+| Trace audit (wiring)    | `node dist/experiments/hybrid-state/cli.js audit --config experiments/hybrid-state/config.offline.json --out .local/hybrid-state/audit-v2` | run `run-mu6p260g-x6mt86`; 4 modes wiring passed; efficacy not_evaluated                                                                                                          |
+| Stage A closed loop     | `pnpm experiment:hybrid -- run --config experiments/hybrid-state/config.stage-a.offline.json --out .local/hybrid-state/stage-a`            | run `run-mu79rgve-w9tgfc`; 3 tasks × 2 modes = 6 trials, all wiring passed and all oracle tests passed; efficacy not_evaluated; 38 actor calls recorded (no Jev, no update calls) |
+| Existing result display | `node dist/experiments/hybrid-state/cli.js report --input .local/hybrid-state/stage-a`                                                     | existing result displayed; report rendered from `summary.json` without a new run                                                                                                  |
+| Live preflight          | `node dist/experiments/hybrid-state/cli.js run --config experiments/hybrid-state/config.live.example.json --out ...`                       | rejected: `provider.mode=live requires --live` (exit 1), no output directory created                                                                                              |
+| Live flag misuse        | `node dist/experiments/hybrid-state/cli.js run --live --config experiments/hybrid-state/config.offline.json --out ...`                     | rejected: `--live is only valid with provider.mode=live` (exit 1)                                                                                                                 |
+| Product replay          | `node dist/replay_cli.js <exported events.jsonl> --updater noop`                                                                           | exported trace replayed; state produced without errors                                                                                                                            |
+| Pi extension smoke      | inside `pnpm run test` (`src/pi/smoke.test.ts`)                                                                                            | extension loads and persists branch-correct state through the real Pi runner                                                                                                      |
 
 The Stage A output directory `.local/hybrid-state/stage-a/` contains `manifest.json`,
 `updates.jsonl`, `calls.jsonl`, `contexts.jsonl`, `summary.json`, and `report.md`. No persistence
@@ -80,8 +107,10 @@ statistical non-inferiority, or state-first superiority is supported by this evi
 Before a live Stage A run, the remaining requirements are: a live configuration with real model
 IDs (`config.live.example.json` shape), credentials resolvable through the existing Pi/TypeSafe
 paths, the `--live` flag, and a decision about how live efficacy will be scored, since live output
-is only `descriptive_only` today. The isolation mechanism itself is verified on macOS: the
-deny-default `sandbox-exec` profile passed the boundary probes (workspace write allowed, outside
+is only `descriptive_only` today. The approved task set is already enforced: the checked-in
+sha256 manifest `experiments/hybrid-state/stage-a.approved.json` pins every task and scoring
+file, scoring is mandatory for closed-loop tasks, and the isolation mechanism is verified on
+macOS through the deny-default `sandbox-exec` profile probes (workspace write allowed, outside
 read denied, symlink escape denied, inherited environment removed, network denied, timeout
-enforced), so `live_ready` now depends on approved task/config/auth preflight rather than host
-capability.
+enforced). `live_ready` therefore depends on live credentials and the run preflight rather than
+on additional code.

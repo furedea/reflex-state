@@ -106,6 +106,9 @@ export interface TrialOutcome {
   readonly cancelled: boolean;
   readonly error?: string;
   readonly policyViolations: readonly string[];
+  /** Oracle-reported task-constraint verdicts; a false is sticky across the
+   * trial and is scored independently of action-policy violations. */
+  readonly constraints: Readonly<Record<string, boolean>>;
   readonly testResults: Readonly<Record<string, "passed" | "failed" | "not_run">>;
   readonly actorTests: readonly {
     readonly testId: string;
@@ -179,7 +182,10 @@ export function scoreTrial(outcome: TrialOutcome): TrialScore {
     wallMs: Math.max(0, Date.parse(outcome.finishedAt) - Date.parse(outcome.startedAt)),
     completed: outcome.completed,
     testPassed,
-    constraintPassed: outcome.policyViolations.length === 0,
+    constraintPassed: Object.keys(outcome.constraints).length
+      ? Object.values(outcome.constraints).every(Boolean)
+      : null,
+    constraints: outcome.constraints,
     tests: outcome.testResults,
     actorTests: outcome.actorTests,
     checkpoints: scoreCheckpoints(outcome),
@@ -206,43 +212,199 @@ function scoreCheckpoints(outcome: TrialOutcome): readonly CheckpointResult[] {
 }
 
 /**
- * Verbatim retention check on the input actually sent at the checkpoint step.
- * It distinguishes: retained / missing / inverted / condition_dropped /
- * needs_semantic_review. It never judges paraphrases by word overlap alone.
+ * Checkpoint evaluation on the input actually sent at the checkpoint step.
+ * Typed information (latest verification, values) is compared structurally;
+ * prose is retained only inside a provenance-eligible item that carries the
+ * canonical text without inverting it. Paraphrases that cannot be verified
+ * stay needs_semantic_review. It never judges by substring overlap alone.
  */
 function evaluateRequirement(item: CheckpointRequirement, sentText: string): CheckpointItemResult {
-  const text = sectionsText(sentText, item.sections);
-  const residue = (item.inverted ?? []).reduce(
-    (current, pattern) => current.split(pattern).join(""),
-    text,
-  );
-  const canonicalPresent = (source: string) =>
-    item.anyOf.some((group) => group.every((phrase) => source.includes(phrase)));
-  if (canonicalPresent(residue)) {
-    if (item.condition !== undefined && !text.includes(item.condition))
+  if (item.kind === "verification") return evaluateVerification(item, sentText);
+  if (item.kind === "exact_value") return evaluateExactValue(item, sentText);
+  return evaluateVerbatim(item, sentText);
+}
+
+interface SentItem {
+  readonly section: string;
+  readonly text: string;
+  readonly role?: string;
+  readonly memoryKind?: string;
+  readonly trust?: string;
+}
+
+/** Itemize the sent input into provenance-bearing units: memory items,
+ * observation items, history lines, the instruction, and the facts blob. */
+function extractItems(sentText: string, sections?: readonly string[]): SentItem[] {
+  const parsed = parseSentJson(sentText);
+  if (!parsed) return [{ section: "raw", text: sentText }];
+  const take = (name: string) => !sections?.length || sections.includes(name);
+  const items: SentItem[] = [];
+  if (take("instruction") && typeof parsed.instruction === "string")
+    items.push({ section: "instruction", role: "user", text: parsed.instruction });
+  if (take("memory") && parsed.memory && typeof parsed.memory === "object") {
+    const memory = parsed.memory as { items?: unknown };
+    if (Array.isArray(memory.items))
+      for (const entry of memory.items) {
+        const record = entry as Record<string, unknown>;
+        if (typeof record?.text === "string")
+          items.push({
+            section: "memory",
+            text: record.text,
+            ...(typeof record.kind === "string" ? { memoryKind: record.kind } : {}),
+            ...(typeof record.trust === "string" ? { trust: record.trust } : {}),
+          });
+      }
+  }
+  if (
+    take("latest_observation") &&
+    parsed.latest_observation &&
+    typeof parsed.latest_observation === "object"
+  ) {
+    const group = parsed.latest_observation as { items?: unknown };
+    if (Array.isArray(group.items))
+      for (const entry of group.items) {
+        const record = entry as Record<string, unknown>;
+        if (typeof record?.text === "string")
+          items.push({
+            section: "latest_observation",
+            text: record.text,
+            ...(typeof record.role === "string" ? { role: record.role } : {}),
+          });
+      }
+  }
+  if (take("history") && typeof parsed.history === "string") {
+    // History items are messages, not lines: a multi-line tool result keeps
+    // the role of the line that opened it, so provenance survives embedded
+    // newlines inside the message text.
+    let current = -1;
+    for (const line of parsed.history.split("\n")) {
+      const match = /^\[([^\]]+)\] (.*)$/s.exec(line);
+      if (match?.[1] !== undefined && match[2] !== undefined) {
+        const meta = match[1].split(/\s+/);
+        items.push({
+          section: "history",
+          ...(meta[1] !== undefined ? { role: meta[1] } : {}),
+          text: match[2],
+        });
+        current = items.length - 1;
+      } else if (current >= 0) {
+        const item = items[current]!;
+        items[current] = { ...item, text: `${item.text}\n${line}` };
+      } else if (line.trim()) {
+        items.push({ section: "history", text: line });
+      }
+    }
+  }
+  if (take("facts") && parsed.facts !== undefined)
+    items.push({ section: "facts", text: JSON.stringify(parsed.facts) });
+  return items;
+}
+
+function parseSentJson(sentText: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(sentText);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/** Verbatim retention: the canonical text must appear inside one item whose
+ * provenance matches the scope and which does not itself invert the meaning. */
+function evaluateVerbatim(item: CheckpointRequirement, sentText: string): CheckpointItemResult {
+  const items = extractItems(sentText, item.sections);
+  const inverted = item.inverted ?? [];
+  const scope = item.scope;
+  const eligible = (entry: SentItem) =>
+    !scope ||
+    (entry.memoryKind !== undefined && (scope.memoryKinds ?? []).includes(entry.memoryKind)) ||
+    (entry.trust !== undefined && (scope.trusts ?? []).includes(entry.trust)) ||
+    (entry.role !== undefined && (scope.roles ?? []).includes(entry.role));
+  const canonical = (text: string) =>
+    (item.anyOf ?? []).some((group) => group.every((phrase) => text.includes(phrase)));
+  const clean = (entry: SentItem) => !inverted.some((pattern) => entry.text.includes(pattern));
+  const hit = items.find((entry) => eligible(entry) && clean(entry) && canonical(entry.text));
+  if (hit) {
+    if (item.condition !== undefined && !hit.text.includes(item.condition))
       return { id: item.id, retained: false, reason: "condition_dropped" };
     return { id: item.id, retained: true };
   }
-  if (canonicalPresent(text)) return { id: item.id, retained: false, reason: "inverted" };
-  if ((item.markers ?? []).some((marker) => text.includes(marker)))
+  if (items.some((entry) => eligible(entry) && canonical(entry.text)))
+    return { id: item.id, retained: false, reason: "inverted" };
+  if (items.some((entry) => canonical(entry.text)))
+    return { id: item.id, retained: false, reason: "wrong_provenance" };
+  if ((item.markers ?? []).some((marker) => items.some((entry) => entry.text.includes(marker))))
     return { id: item.id, retained: null, reason: "needs_semantic_review" };
   return { id: item.id, retained: false, reason: "missing" };
 }
 
-/** Extract the named JSON sections from a sent userText; falls back to the raw
- * text when it is not JSON. */
-function sectionsText(sentText: string, sections: readonly string[] | undefined): string {
-  if (!sections?.length) return sentText;
-  try {
-    const parsed: unknown = JSON.parse(sentText);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return sentText;
-    const record = parsed as Record<string, unknown>;
-    return sections
-      .map((section) => (section in record ? JSON.stringify(record[section]) : ""))
-      .join("\n");
-  } catch {
-    return sentText;
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Exact typed value: the token must appear with identifier/numeric
+ * boundaries, so 9377 never matches inside 19377 or 93770. */
+function evaluateExactValue(item: CheckpointRequirement, sentText: string): CheckpointItemResult {
+  const boundary = new RegExp(
+    `(?<![0-9A-Za-z_.-])${escapeRegExp(item.value ?? "")}(?![0-9A-Za-z_.-])`,
+  );
+  const items = extractItems(sentText, item.sections);
+  if (items.some((entry) => boundary.test(entry.text))) return { id: item.id, retained: true };
+  if ((item.markers ?? []).some((marker) => items.some((entry) => entry.text.includes(marker))))
+    return { id: item.id, retained: null, reason: "needs_semantic_review" };
+  return { id: item.id, retained: false, reason: "missing" };
+}
+
+const EXPERIMENT_TEST_PREFIX = "experiment test ";
+
+/** Structured verification: the latest check for the declared test id must
+ * carry the required status and freshness. In state-first inputs the facts
+ * section is compared field by field; in history inputs the per-test records
+ * are compared by generation and sequence. */
+function evaluateVerification(item: CheckpointRequirement, sentText: string): CheckpointItemResult {
+  const testId = item.testId ?? "";
+  const want = item.status ?? "passed";
+  const fresh = item.fresh ?? true;
+  const parsed = parseSentJson(sentText);
+  if (parsed && parsed.facts !== undefined) {
+    const facts = parsed.facts as {
+      verification?: {
+        test?: Record<string, unknown>;
+        tests?: Record<string, Record<string, unknown>>;
+      };
+    };
+    const verification = facts?.verification;
+    // Per-test facts take precedence; the single test slot only reflects the
+    // globally latest check and cannot speak for other test ids.
+    const test = verification?.tests ? verification.tests[testId] : verification?.test;
+    if (!test || test.status === "not_run")
+      return { id: item.id, retained: false, reason: "missing" };
+    if (test.command !== `${EXPERIMENT_TEST_PREFIX}${testId}`)
+      return { id: item.id, retained: false, reason: "wrong_test" };
+    if (test.status !== want) return { id: item.id, retained: false, reason: "wrong_status" };
+    if (fresh && test.freshness !== "current")
+      return { id: item.id, retained: false, reason: "stale" };
+    return { id: item.id, retained: true };
   }
+  const history = parsed && typeof parsed.history === "string" ? parsed.history : sentText;
+  const testLine = new RegExp(
+    `test ${escapeRegExp(testId)}: (passed|failed) check=\\S+ gen=(\\d+) seq=(\\d+)`,
+  );
+  let latest: { readonly status: string; readonly gen: number; readonly seq: number } | undefined;
+  let maxGen = -1;
+  for (const line of history.split("\n")) {
+    for (const match of line.matchAll(/gen=(\d+)/g)) maxGen = Math.max(maxGen, Number(match[1]));
+    const match = testLine.exec(line);
+    const gen = Number(match?.[2]);
+    const seq = Number(match?.[3]);
+    if (match?.[1] && (!latest || gen > latest.gen || (gen === latest.gen && seq > latest.seq)))
+      latest = { status: match[1], gen, seq };
+  }
+  if (!latest) return { id: item.id, retained: false, reason: "missing" };
+  if (latest.status !== want) return { id: item.id, retained: false, reason: "wrong_status" };
+  if (fresh && latest.gen < maxGen) return { id: item.id, retained: false, reason: "stale" };
+  return { id: item.id, retained: true };
 }
 
 const USAGE_FIELDS = [

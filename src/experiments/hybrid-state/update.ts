@@ -36,7 +36,7 @@ export function factsFromState(
   state: HotState,
   config: ReflexStateConfig,
   env?: {
-    readonly verification: HotState["verification"];
+    readonly verification: FactsView["verification"];
     readonly blockers: readonly HotState["activeBlockers"][number][];
   },
 ): FactsView {

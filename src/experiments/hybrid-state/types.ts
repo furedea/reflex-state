@@ -119,12 +119,26 @@ export interface MemoryItem {
 
 export type WorkMemory = Readonly<Record<MemoryKind, readonly MemoryItem[]>>;
 
+/** Experiment-only verification fact for one declared test id, derived from
+ * the task environment's per-check ledger. Multiple tests can each be
+ * evaluated without one evicting the other. */
+export interface ExperimentCheckFact {
+  readonly testId: string;
+  readonly status: "passed" | "failed";
+  readonly freshness: "current" | "stale" | "unknown";
+  readonly command: string;
+  readonly checkKey: string;
+  readonly observedGeneration: number;
+}
+
 export interface FactsView {
   readonly version: 2;
   readonly phase: HotState["phase"];
   readonly taskStatus: HotState["taskStatus"];
   readonly observationGeneration: number;
-  readonly verification: HotState["verification"];
+  readonly verification: HotState["verification"] & {
+    readonly tests?: Readonly<Record<string, ExperimentCheckFact>>;
+  };
   readonly unresolvedTotal: number;
   readonly blockers: readonly HotState["activeBlockers"][number][];
   readonly blockersOmitted: number;
@@ -398,15 +412,45 @@ export interface HybridTask {
   readonly steps?: readonly TaskStep[];
 }
 
+/** Requirement families: verbatim matches original text only inside items with
+ * accepted provenance; exact_value compares a typed token with boundaries;
+ * verification compares the structured latest check for a specific test id. */
+export type RequirementKind = "verbatim" | "exact_value" | "verification";
+
+export interface RequirementScope {
+  /** Memory item kinds allowed to carry the requirement (state-first inputs). */
+  readonly memoryKinds?: readonly string[];
+  /** Memory trusts allowed to carry the requirement. */
+  readonly trusts?: readonly string[];
+  /** Message roles allowed to carry the requirement (history lines, observation
+   * items, the instruction). */
+  readonly roles?: readonly string[];
+}
+
 export interface CheckpointRequirement {
   readonly id: string;
   readonly description?: string;
-  /** Acceptable verbatim forms; any group whose strings all appear retains the item. */
-  readonly anyOf: readonly (readonly string[])[];
-  /** Verbatim forms that invert the required meaning; their presence voids retention. */
+  /** Requirement family; defaults to verbatim. */
+  readonly kind: RequirementKind;
+  /** verbatim: acceptable verbatim forms; any group whose strings all appear in
+   * one clean provenance-eligible item retains the requirement. */
+  readonly anyOf?: readonly (readonly string[])[];
+  /** verbatim: forms that invert the required meaning; an item containing any of
+   * them is disqualified even when it also carries the canonical text. */
   readonly inverted?: readonly string[];
-  /** Required accompanying phrase (e.g., a condition); its absence means condition_dropped. */
+  /** verbatim: required accompanying phrase inside the same item. */
   readonly condition?: string;
+  /** verbatim: provenance filter; an item must match at least one clause. */
+  readonly scope?: RequirementScope;
+  /** exact_value: the token compared with numeric/name boundaries, never as a
+   * substring (9377 does not match inside 19377). */
+  readonly value?: string;
+  /** verification: the test id whose latest check is compared. */
+  readonly testId?: string;
+  /** verification: required status (default "passed"). */
+  readonly status?: "passed" | "failed";
+  /** verification: require the check to be current (default true). */
+  readonly fresh?: boolean;
   /** Distinctive substrings: present without canonical text marks an unverifiable paraphrase. */
   readonly markers?: readonly string[];
   /** userText JSON sections to search; defaults to all sections. */
@@ -460,7 +504,11 @@ export interface TrialScore {
   readonly wallMs: number;
   readonly completed: boolean;
   readonly testPassed: boolean;
-  readonly constraintPassed: boolean;
+  /** Independent task-constraint score from oracle-reported verdicts; null when
+   * the task declared no constraints. Never derived from policy violations. */
+  readonly constraintPassed: boolean | null;
+  /** Per-constraint verdicts reported by oracles across the trial. */
+  readonly constraints: Readonly<Record<string, boolean>>;
   readonly tests: Readonly<Record<string, "passed" | "failed" | "not_run">>;
   readonly actorTests: readonly {
     readonly testId: string;
@@ -797,17 +845,9 @@ export function parseTaskScoring(value: unknown, file: string): TaskScoring {
       if (typeof entry.id !== "string" || !entry.id.trim())
         throw new Error(`Invalid required item id in ${file}`);
       const id = entry.id;
-      if (
-        !Array.isArray(entry.anyOf) ||
-        !entry.anyOf.length ||
-        !entry.anyOf.every(
-          (group) =>
-            Array.isArray(group) &&
-            group.length > 0 &&
-            group.every((phrase) => typeof phrase === "string" && phrase.trim()),
-        )
-      )
-        throw new Error(`Invalid anyOf for required item ${id} in ${file}`);
+      const kind = entry.kind === undefined ? "verbatim" : entry.kind;
+      if (kind !== "verbatim" && kind !== "exact_value" && kind !== "verification")
+        throw new Error(`Invalid kind for required item ${id} in ${file}`);
       const strings = (key: string) => {
         const value = entry[key];
         if (value === undefined) return undefined;
@@ -818,14 +858,63 @@ export function parseTaskScoring(value: unknown, file: string): TaskScoring {
           throw new Error(`Invalid ${key} for required item ${id} in ${file}`);
         return [...(value as string[])];
       };
+      const anyOf =
+        entry.anyOf === undefined
+          ? undefined
+          : (() => {
+              if (
+                !Array.isArray(entry.anyOf) ||
+                !entry.anyOf.length ||
+                !entry.anyOf.every(
+                  (group) =>
+                    Array.isArray(group) &&
+                    group.length > 0 &&
+                    group.every((phrase) => typeof phrase === "string" && phrase.trim()),
+                )
+              )
+                throw new Error(`Invalid anyOf for required item ${id} in ${file}`);
+              return (entry.anyOf as string[][]).map((group) => [...group]);
+            })();
+      if (kind === "verbatim" && !anyOf)
+        throw new Error(`verbatim required item ${id} in ${file} needs anyOf`);
+      if (kind === "exact_value" && (typeof entry.value !== "string" || !entry.value.trim()))
+        throw new Error(`exact_value required item ${id} in ${file} needs a value`);
+      if (kind === "verification" && (typeof entry.testId !== "string" || !entry.testId.trim()))
+        throw new Error(`verification required item ${id} in ${file} needs a testId`);
       if (entry.condition !== undefined && typeof entry.condition !== "string")
         throw new Error(`Invalid condition for required item ${id} in ${file}`);
+      if (entry.status !== undefined && entry.status !== "passed" && entry.status !== "failed")
+        throw new Error(`Invalid status for required item ${id} in ${file}`);
+      if (entry.fresh !== undefined && typeof entry.fresh !== "boolean")
+        throw new Error(`Invalid fresh for required item ${id} in ${file}`);
+      const scope = (() => {
+        if (entry.scope === undefined) return undefined;
+        const record = object(entry.scope, `scope of ${id} in ${file}`);
+        const clause = (key: string) => {
+          const value = record[key];
+          if (value === undefined) return undefined;
+          if (!Array.isArray(value) || !value.every((v) => typeof v === "string" && v.trim()))
+            throw new Error(`Invalid scope.${key} for required item ${id} in ${file}`);
+          return [...(value as string[])];
+        };
+        return {
+          ...(clause("memoryKinds") ? { memoryKinds: clause("memoryKinds")! } : {}),
+          ...(clause("trusts") ? { trusts: clause("trusts")! } : {}),
+          ...(clause("roles") ? { roles: clause("roles")! } : {}),
+        };
+      })();
       return {
         id,
         ...(typeof entry.description === "string" ? { description: entry.description } : {}),
-        anyOf: entry.anyOf.map((group) => [...(group as string[])]),
+        kind: kind as RequirementKind,
+        ...(anyOf ? { anyOf } : {}),
         ...(strings("inverted") ? { inverted: strings("inverted")! } : {}),
         ...(typeof entry.condition === "string" ? { condition: entry.condition } : {}),
+        ...(scope ? { scope } : {}),
+        ...(typeof entry.value === "string" ? { value: entry.value } : {}),
+        ...(typeof entry.testId === "string" ? { testId: entry.testId } : {}),
+        ...(entry.status !== undefined ? { status: entry.status as "passed" | "failed" } : {}),
+        ...(entry.fresh !== undefined ? { fresh: entry.fresh as boolean } : {}),
         ...(strings("markers") ? { markers: strings("markers")! } : {}),
         ...(strings("sections") ? { sections: strings("sections")! } : {}),
       };

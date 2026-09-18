@@ -1,8 +1,18 @@
+import { mkdtemp, cp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
-import { loadScoring, loadTasks } from "./cli.js";
+import {
+  enforceLivePolicy,
+  loadScoring,
+  loadTasks,
+  validateScoredTasks,
+  verifyApprovedTasks,
+} from "./cli.js";
 import { FakeActorProvider, FakeJevProvider, FakeRepairProvider } from "./providers.js";
-import { PersistenceError, runClosedLoop } from "./runner.js";
+import { PersistenceError, requiresIsolation, runClosedLoop } from "./runner.js";
 import type { HybridConfig, HybridTask } from "./types.js";
 
 const STAGE_A_ROOT = "experiments/hybrid-state/tasks/stage-a";
@@ -113,6 +123,8 @@ describe("Stage A closed loop", () => {
       expect(checkpoint, trial.trialId).toBeDefined();
       const item = checkpoint?.items.find((item) => item.id === "no-key-change");
       expect(item?.retained, `${trial.mode} ${item?.reason ?? ""}`).toBe(true);
+      expect(trial.constraints["api-key-unchanged"]).toBe(true);
+      expect(trial.constraintPassed).toBe(true);
     }
   }, 60_000);
 
@@ -121,31 +133,170 @@ describe("Stage A closed loop", () => {
     const trials = run.summary.scores.filter((score) => score.taskId === "transient-recovery");
     expect(trials).toHaveLength(2);
     for (const trial of trials) {
-      const actorTests = trial.actorTests.filter((test) => test.testId === "calc-check");
-      expect(actorTests.map((test) => test.passed)).toEqual([false, true]);
-      const checkpoint = trial.checkpoints.find(
-        (checkpoint) => checkpoint.checkpointId === "failure-remembered",
+      const calc = trial.actorTests.filter((test) => test.testId === "calc-check");
+      expect(calc.map((test) => test.passed)).toEqual([false, true]);
+      const syntax = trial.actorTests.filter((test) => test.testId === "syntax-check");
+      expect(syntax.map((test) => test.passed)).toEqual([true]);
+      const decoy = trial.checkpoints
+        .find((checkpoint) => checkpoint.checkpointId === "decoy-pass-visible")
+        ?.items.find((item) => item.id === "syntax-check-passed");
+      expect(decoy?.retained, `${trial.mode} ${decoy?.reason ?? ""}`).toBe(true);
+      const recovered = trial.checkpoints.find(
+        (checkpoint) => checkpoint.checkpointId === "recovered-check-retained",
       );
-      const item = checkpoint?.items.find((item) => item.id === "transient-failure");
-      expect(item?.retained, `${trial.mode} ${item?.reason ?? ""}`).toBe(true);
+      const verification = recovered?.items.find((item) => item.id === "calc-check-recovered");
+      expect(verification?.retained, `${trial.mode} ${verification?.reason ?? ""}`).toBe(true);
+      const failure = recovered?.items.find((item) => item.id === "transient-failure");
+      expect(failure?.retained, `${trial.mode} ${failure?.reason ?? ""}`).toBe(true);
     }
   }, 60_000);
 
-  it("retains the observation-derived value and records fresh verification", async () => {
+  it("retains the conditional port selection in both modes", async () => {
     const { run } = await stageARun();
     const trials = run.summary.scores.filter((score) => score.taskId === "observation-derived");
     expect(trials).toHaveLength(2);
     for (const trial of trials) {
-      const derived = trial.checkpoints
-        .find((checkpoint) => checkpoint.checkpointId === "derived-value-retained")
-        ?.items.find((item) => item.id === "port-value");
-      expect(derived?.retained, `${trial.mode} ${derived?.reason ?? ""}`).toBe(true);
-      const fresh = trial.checkpoints
-        .find((checkpoint) => checkpoint.checkpointId === "verification-fresh")
-        ?.items.find((item) => item.id === "fresh-pass");
-      expect(fresh?.retained, `${trial.mode} ${fresh?.reason ?? ""}`).toBe(true);
+      const checkpoint = trial.checkpoints.find((entry) => entry.checkpointId === "ports-retained");
+      const value = checkpoint?.items.find((item) => item.id === "fallback-port-value");
+      expect(value?.retained, `${trial.mode} ${value?.reason ?? ""}`).toBe(true);
+      const condition = checkpoint?.items.find((item) => item.id === "selection-condition");
+      expect(condition?.retained, `${trial.mode} ${condition?.reason ?? ""}`).toBe(true);
+      expect(trial.tests["port-check"]).toBe("passed");
     }
   }, 60_000);
+});
+
+describe("live gating", () => {
+  const liveConfig = (overrides: Partial<HybridConfig> = {}): HybridConfig =>
+    config({
+      provider: {
+        mode: "live",
+        actorModel: "anthropic/test-model",
+        maxRequests: 64,
+        trialMaxRequests: 32,
+        timeoutMs: 30000,
+        executionIsolation: "required",
+      },
+      ...overrides,
+    });
+
+  it("accepts the checked-in approved task set by content hash", async () => {
+    await expect(verifyApprovedTasks(STAGE_A_ROOT)).resolves.toBeUndefined();
+  });
+
+  it("rejects a task root that is not the approved directory", async () => {
+    await expect(verifyApprovedTasks("experiments/hybrid-state/tasks")).rejects.toThrow(
+      /approved task set/,
+    );
+  });
+
+  it("rejects tampered, missing, and extra task files by content hash", async () => {
+    const { createHash } = await import("node:crypto");
+    const { readFile, readdir } = await import("node:fs/promises");
+    const dir = await mkdtemp(join(tmpdir(), "stage-a-tampered-"));
+    try {
+      const root = join(dir, "tasks");
+      await cp(STAGE_A_ROOT, root, { recursive: true });
+      const files: Record<string, string> = {};
+      const hash = async (name: string) =>
+        createHash("sha256")
+          .update(await readFile(join(root, name), "utf8"))
+          .digest("hex");
+      for (const entry of await readdir(root))
+        if (entry.endsWith(".json")) files[entry] = await hash(entry);
+      for (const entry of await readdir(join(root, "scoring")))
+        if (entry.endsWith(".json")) files[`scoring/${entry}`] = await hash(`scoring/${entry}`);
+      const manifestPath = join(dir, "manifest.json");
+      const writeManifest = async (filesMap: Record<string, string>) =>
+        writeFile(manifestPath, JSON.stringify({ taskRoot: root, files: filesMap }));
+      await writeManifest(files);
+      await expect(verifyApprovedTasks(root, manifestPath)).resolves.toBeUndefined();
+
+      await writeFile(
+        join(root, "01_protected_constraint.json"),
+        JSON.stringify({ id: "tampered", instruction: "x", files: {}, allowedTests: [] }),
+      );
+      await expect(verifyApprovedTasks(root, manifestPath)).rejects.toThrow(
+        /does not match the approved content hash/,
+      );
+
+      await cp(STAGE_A_ROOT, root, { recursive: true });
+      await writeFile(join(root, "scoring", "extra.json"), "{}");
+      await expect(verifyApprovedTasks(root, manifestPath)).rejects.toThrow(/Unapproved files/);
+
+      await rm(join(root, "scoring", "extra.json"));
+      await rm(join(root, "03_observation_derived.json"));
+      await expect(verifyApprovedTasks(root, manifestPath)).rejects.toThrow(
+        /Approved task file missing/,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces the approved set inside the live policy", async () => {
+    const values = { live: true, out: ".local/x" };
+    await expect(enforceLivePolicy(liveConfig(), values)).resolves.toBeUndefined();
+    const moved = liveConfig({ taskRoot: "experiments/hybrid-state/tasks" });
+    await expect(enforceLivePolicy(moved, values)).rejects.toThrow();
+  });
+
+  it("requires live flag, Stage A modes, isolation, and an actor model", async () => {
+    const values = { live: true, out: ".local/x" };
+    await expect(enforceLivePolicy(liveConfig(), { ...values, live: false })).rejects.toThrow(
+      /--live/,
+    );
+    await expect(
+      enforceLivePolicy(liveConfig({ modes: ["history", "jev"] }), values),
+    ).rejects.toThrow(/Stage A modes/);
+    await expect(
+      enforceLivePolicy(
+        liveConfig({
+          provider: {
+            mode: "live",
+            actorModel: "m",
+            maxRequests: 1,
+            trialMaxRequests: 1,
+            timeoutMs: 1,
+          },
+        }),
+        values,
+      ),
+    ).rejects.toThrow(/executionIsolation/);
+    await expect(
+      enforceLivePolicy(
+        liveConfig({
+          provider: {
+            mode: "live",
+            maxRequests: 1,
+            trialMaxRequests: 1,
+            timeoutMs: 1,
+            executionIsolation: "required",
+          },
+        }),
+        values,
+      ),
+    ).rejects.toThrow(/actorModel/);
+  });
+
+  it("requires isolation for any non-fake closed-loop provider, including recorded", () => {
+    expect(requiresIsolation(config({ provider: { mode: "recorded" } as never }))).toBe(true);
+    expect(requiresIsolation(config())).toBe(false);
+    expect(
+      requiresIsolation(
+        config({ provider: { mode: "fake", executionIsolation: "required" } as never }),
+      ),
+    ).toBe(true);
+  });
+
+  it("makes scoring mandatory for closed-loop comparisons", async () => {
+    const tasks = await loadTasks(STAGE_A_ROOT);
+    expect(() => validateScoredTasks(tasks, new Map())).toThrow(/no scoring file/);
+    const scoring = await loadScoring(STAGE_A_ROOT, tasks);
+    expect(() => validateScoredTasks(tasks, scoring)).not.toThrow();
+    const missing = tasks.map((task) => ({ ...task, allowedTests: [...task.allowedTests, "x"] }));
+    expect(() => validateScoredTasks(missing, scoring)).toThrow(/no oracle registered/);
+  });
 });
 
 describe("runner contract", () => {
