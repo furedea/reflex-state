@@ -6,19 +6,24 @@ import { defaultConfig } from "../../core/config.js";
 import { StateEngine } from "../../core/engine.js";
 import { NoopStateUpdater } from "../../core/updater.js";
 import { PiEventNormalizer } from "../../pi/normalization.js";
-import { evaluateAudit, summarize } from "./evaluation.js";
-import { buildProjection } from "./projection.js";
+import { evaluateAudit, scoreTrial, summarize, type LabelsFile } from "./evaluation.js";
+import { buildProjection, type ProjectedInput } from "./projection.js";
 import { buildActorRequest } from "./prompts.js";
 import {
   FakeActorProvider,
   FakeJevProvider,
   FakeRepairProvider,
+  FakeUpdateProvider,
+  requestHash,
+  sentRequestBody,
   type ActorProvider,
+  type CallOptions,
   type JevProvider,
   type ProviderSet,
   type RepairProvider,
 } from "./providers.js";
-import { generateCandidates } from "./trace.js";
+import { TaskEnvironment } from "./task_environment.js";
+import { eventsForMessages, generateCandidates, latestGroup } from "./trace.js";
 import type {
   ActorAction,
   CallRecord,
@@ -27,186 +32,398 @@ import type {
   ExperimentManifest,
   ExperimentMode,
   ExperimentSummary,
+  GenerativeUpdateRequest,
   HybridConfig,
   HybridTask,
-  InputBundle,
-  RunScore,
+  JevRequest,
+  ObservationGroup,
+  PatchOperation,
+  RepairRequest,
+  SkippedTrial,
+  TaskScoring,
   TraceData,
   TraceMessage,
+  TrialScore,
+  UpdateRecord,
   UpdateResult,
   WorkMemory,
 } from "./types.js";
 import { emptyMemory, HYBRID_SCHEMA_VERSION, PROMPT_VERSION } from "./types.js";
-import { applyOperations, factsFromState, initialFacts, updateMemory } from "./update.js";
+import {
+  applyContext,
+  applyOperations,
+  factsFromState,
+  memoryItems,
+  updateMemory,
+  type ApplyContext,
+} from "./update.js";
 
 const execFile = promisify(execFileCallback);
 
 export interface ExperimentRun {
   readonly manifest: ExperimentManifest;
-  readonly updates: readonly Record<string, unknown>[];
+  readonly updates: readonly UpdateRecord[];
   readonly calls: readonly CallRecord[];
   readonly contexts: readonly ContextRecord[];
   readonly summary: ExperimentSummary;
 }
 
+export interface RunRecorder {
+  call(record: CallRecord): void;
+  context(record: ContextRecord): void;
+  update(record: UpdateRecord): void;
+}
+
+export interface RunContext {
+  readonly runId: string;
+  readonly calls: CallRecord[];
+  readonly contexts: ContextRecord[];
+  readonly updates: UpdateRecord[];
+  readonly uniqueCandidates: Map<ExperimentMode, Set<string>>;
+  readonly decisionCounts: Map<ExperimentMode, number>;
+  readonly appliedCounts: Map<ExperimentMode, { extractive: number; generated: number }>;
+  readonly budget: RequestBudget;
+  readonly trialSent: Map<string, number>;
+  readonly recorder?: RunRecorder;
+}
+
+export interface RequestBudget {
+  sent: number;
+  readonly limit: number;
+}
+
+class BudgetExhausted extends Error {
+  constructor() {
+    super("not_run_global_budget");
+  }
+}
+
+function newRunContext(runId: string, config: HybridConfig, recorder?: RunRecorder): RunContext {
+  return {
+    runId,
+    calls: [],
+    contexts: [],
+    updates: [],
+    uniqueCandidates: new Map(),
+    decisionCounts: new Map(),
+    appliedCounts: new Map(),
+    budget: { sent: 0, limit: config.provider.maxRequests },
+    trialSent: new Map(),
+    ...(recorder ? { recorder } : {}),
+  };
+}
+
+function pushCall(ctx: RunContext, record: CallRecord): void {
+  ctx.calls.push(record);
+  ctx.recorder?.call(record);
+}
+
+function pushContext(ctx: RunContext, record: ContextRecord): void {
+  ctx.contexts.push(record);
+  ctx.recorder?.context(record);
+}
+
+function pushUpdate(ctx: RunContext, record: UpdateRecord): void {
+  ctx.updates.push(record);
+  ctx.recorder?.update(record);
+}
+
 export async function runAudit(options: {
   readonly config: HybridConfig;
   readonly trace: TraceData;
-  readonly labels?: readonly import("./types.js").AuditLabel[];
+  readonly labels?: LabelsFile;
   readonly providers?: ProviderSet;
+  readonly runId?: string;
+  readonly recorder?: RunRecorder;
 }): Promise<ExperimentRun> {
+  const runId = options.runId ?? newRunId();
   const providers = options.providers ?? fakeProviders([]);
-  const calls: CallRecord[] = [];
-  const contexts: ContextRecord[] = [];
-  const updates: Record<string, unknown>[] = [];
-  const allCandidates = generateCandidates(options.trace.messages, {
-    maxBytes: options.config.candidateMaxBytes,
-  });
+  const ctx = newRunContext(runId, options.config, options.recorder);
+  const labels = options.labels?.labels ?? [];
+  const labelsUsable = options.labels?.sourceHash === options.trace.sourceHash;
+  if (options.labels && !labelsUsable)
+    pushUpdate(
+      ctx,
+      auditRecord(ctx, "audit_summary", -1, "-", {
+        warning: "labels_source_hash_mismatch",
+        expected: options.trace.sourceHash,
+        actual: options.labels.sourceHash,
+      }),
+    );
   const selected: Record<ExperimentMode, string[]> = {
     history: [],
     llm: [],
     rules: [],
     jev: [],
   };
-  for (const mode of options.config.modes) {
-    let memory = emptyMemory();
-    for (let index = 0; index < options.trace.messages.length; index++) {
-      const observations = options.trace.messages.slice(0, index + 1);
-      const latest = options.trace.messages.slice(Math.max(0, index - 1), index + 1);
-      const candidates = allCandidates.filter((candidate) => candidate.observedAt <= index);
-      const input = {
-        instruction: "Trace audit input",
-        mode,
-        state: new StateEngine({
-          cwd: "/experiment",
-          config: defaultConfig(),
-          updater: new NoopStateUpdater(),
-        }).state,
-        facts: initialFacts(),
-        memory,
-        candidates,
-        observations,
-        latest,
-        step: index,
-        now: index,
-      } as const;
-      const projection = buildProjection({
-        ...input,
-        history: observations,
-        budgets: options.config.budgets,
-      });
-      contexts.push(contextRecord(options.config, projection, mode, index));
-      const result = await updateWithProviders(input, providers, options.config, calls);
-      memory = result.memory;
-      selected[mode].push(
-        ...result.decisions
-          .filter((decision) => decision.disposition === "selected")
-          .map((decision) => decision.candidateId),
-      );
-      updates.push({
-        mode,
-        step: index,
-        candidates,
-        decisions: result.decisions,
-        memory,
-        repairReasons: result.repairReasons,
-        unavailable: result.unavailable,
-      });
-    }
-  }
-  const summary = summarize(
-    "trace_audit",
-    options.config.modes,
-    [],
-    calls,
-    contexts,
-    generatedCount(updates),
-    selectedCount(updates),
-  );
-  const manifest = await createManifest(options.config, options.trace.sourceHash, "trace_audit");
-  const audit = evaluateAudit(allCandidates, options.labels ?? [], selected);
-  updates.push({
-    labels: options.labels ?? [],
-    selected,
-    agreement: audit.agreement,
-    evaluation_kind: "trace_audit",
+  const scores: TrialScore[] = [];
+  const history: TraceMessage[] = [];
+  const normalizer = new PiEventNormalizer({
+    eventCount: 0,
+    turnIndex: 0,
+    config: defaultConfig(),
+    cwd: "/experiment",
   });
-  return { manifest, updates, calls, contexts, summary };
+  for (const mode of options.config.modes) {
+    if (ctx.budget.sent >= ctx.budget.limit) break;
+    let memory = emptyMemory();
+    const groups = auditGroups(options.trace.messages);
+    const engine = new StateEngine({
+      cwd: "/experiment",
+      config: defaultConfig(),
+      updater: new NoopStateUpdater(),
+    });
+    try {
+      for (let step = 0; step < groups.length; step++) {
+        const group = groups[step]!;
+        for (const event of eventsForMessages(group.messages, normalizer))
+          await engine.process(event);
+        history.push(...group.messages);
+        const facts = factsFromState(engine.state, defaultConfig());
+        const candidates = generateCandidates(group.messages, {
+          maxBytes: options.config.candidateMaxBytes,
+          observedAt: step,
+        });
+        rememberCandidates(ctx, mode, candidates);
+        const projected = buildProjection({
+          mode,
+          instruction: auditInstruction(options.trace),
+          facts,
+          memory,
+          latest: group.messages,
+          history,
+          allowedTests: [],
+          budgets: options.config.budgets,
+        });
+        recordContext(ctx, {
+          trialId: `audit-${mode}`,
+          taskId: "audit",
+          mode,
+          step,
+          projected,
+          config: options.config,
+        });
+        const input = {
+          instruction: auditInstruction(options.trace),
+          mode,
+          state: engine.state,
+          facts,
+          memory,
+          candidates,
+          observations: group.messages,
+          latest: group.messages,
+          step,
+          now: step,
+        } as const;
+        const result = await auditStep(ctx, input, providers, options.config, mode, step);
+        memory = result.memory;
+        selected[mode].push(
+          ...result.decisions
+            .filter((decision) => decision.disposition === "selected")
+            .map((decision) => decision.candidateId),
+        );
+        countDecisions(ctx, mode, result.decisions.length);
+        countApplied(ctx, mode, result.applied);
+        pushUpdate(
+          ctx,
+          auditRecord(ctx, "audit_step", step, mode, {
+            candidates: candidates.map((candidate) => candidate.id),
+            decisions: result.decisions,
+            applied: result.applied,
+            held: result.held.map((candidate) => candidate.id),
+            repairReasons: result.repairReasons,
+            memoryItems: memoryItems(memory).length,
+            ...(result.unavailable ? { unavailable: result.unavailable } : {}),
+          }),
+        );
+      }
+    } catch (error) {
+      if (!(error instanceof BudgetExhausted)) throw error;
+    }
+    scores.push(
+      scoreTrial({
+        trialId: `audit-${mode}`,
+        taskId: "audit",
+        mode,
+        iteration: 0,
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        completed: true,
+        cancelled: false,
+        policyViolations: [],
+        testResults: {},
+        actorTests: [],
+        sentTexts: [],
+        checkpoints: [],
+        failureObserved: false,
+        rereads: 0,
+        retries: 0,
+        appliedExtractive: ctx.appliedCounts.get(mode)?.extractive ?? 0,
+        appliedGenerated: ctx.appliedCounts.get(mode)?.generated ?? 0,
+        activeMemoryItems: memoryItems(memory).length,
+        providerMode: options.config.provider.mode,
+      }),
+    );
+  }
+  const allCandidates = generateCandidates(options.trace.messages, {
+    maxBytes: options.config.candidateMaxBytes,
+  });
+  const audit = labelsUsable ? evaluateAudit(allCandidates, labels, selected) : undefined;
+  pushUpdate(
+    ctx,
+    auditRecord(ctx, "audit_summary", -1, "-", {
+      labelsUsable,
+      labelCount: labels.length,
+      selected,
+      agreement: audit?.agreement ?? null,
+      evaluated: audit?.total ?? 0,
+      coverage: audit?.coverage ?? 0,
+    }),
+  );
+  const summary = summarize({
+    runId,
+    evaluation: "trace_audit",
+    provider: options.config.provider.mode,
+    modes: options.config.modes,
+    scores,
+    skipped: [],
+    calls: ctx.calls,
+    contexts: ctx.contexts,
+    uniqueCandidates: ctx.uniqueCandidates,
+    decisionCounts: ctx.decisionCounts,
+    appliedCounts: ctx.appliedCounts,
+    limitations: labelsUsable ? [] : ["audit labels were not evaluated (source hash mismatch)"],
+  });
+  const manifest = await createManifest(
+    options.config,
+    options.trace.sourceHash,
+    "trace_audit",
+    runId,
+  );
+  return { manifest, updates: ctx.updates, calls: ctx.calls, contexts: ctx.contexts, summary };
 }
 
 export async function runClosedLoop(options: {
   readonly config: HybridConfig;
   readonly tasks: readonly HybridTask[];
+  readonly scoring?: ReadonlyMap<string, TaskScoring>;
   readonly providers?: ProviderSet;
+  readonly runId?: string;
+  readonly recorder?: RunRecorder;
 }): Promise<ExperimentRun> {
+  const runId = options.runId ?? newRunId();
   const providers = options.providers ?? fakeProviders(options.tasks);
-  const calls: CallRecord[] = [];
-  const contexts: ContextRecord[] = [];
-  const updates: Record<string, unknown>[] = [];
-  const scores: RunScore[] = [];
-  for (const mode of options.config.modes) {
-    for (const task of options.tasks) {
-      const score = await runTask(mode, task, options.config, providers, calls, contexts, updates);
-      scores.push(score);
+  const ctx = newRunContext(runId, options.config, options.recorder);
+  const scores: TrialScore[] = [];
+  const skipped: SkippedTrial[] = [];
+  const trials = planTrials(options.config, options.tasks, options.scoring);
+  for (const plan of trials) {
+    if (ctx.budget.sent >= ctx.budget.limit) {
+      skipped.push({
+        trialId: plan.trialId,
+        taskId: plan.task.id,
+        mode: plan.mode,
+        iteration: plan.iteration,
+        reason: "not_run_global_budget",
+      });
+      continue;
     }
+    const score = await runTrial(plan, options.config, providers, ctx).catch(
+      (error): TrialScore => {
+        if (error instanceof BudgetExhausted)
+          return unfinishedTrial(plan, "request_limit", options.config.provider.mode);
+        throw error;
+      },
+    );
+    scores.push(score);
   }
-  const summary = summarize(
-    "closed_loop",
-    options.config.modes,
+  const summary = summarize({
+    runId,
+    evaluation: "closed_loop",
+    provider: options.config.provider.mode,
+    modes: options.config.modes,
     scores,
-    calls,
-    contexts,
-    generatedCount(updates),
-    selectedCount(updates),
-  );
+    skipped,
+    calls: ctx.calls,
+    contexts: ctx.contexts,
+    uniqueCandidates: ctx.uniqueCandidates,
+    decisionCounts: ctx.decisionCounts,
+    appliedCounts: ctx.appliedCounts,
+  });
   const inputHash = options.tasks.map((task) => JSON.stringify(task)).join("\n");
-  const manifest = await createManifest(options.config, inputHash, "closed_loop");
-  return { manifest, updates, calls, contexts, summary };
+  const manifest = await createManifest(options.config, inputHash, "closed_loop", runId);
+  return { manifest, updates: ctx.updates, calls: ctx.calls, contexts: ctx.contexts, summary };
 }
 
-function fakeProviders(tasks: readonly HybridTask[]): ProviderSet {
-  return {
-    jev: new FakeJevProvider(),
-    repair: new FakeRepairProvider(),
-    actor: new FakeActorProvider(tasks),
-  };
+interface TrialPlan {
+  readonly trialId: string;
+  readonly task: HybridTask;
+  readonly scoring?: TaskScoring;
+  readonly mode: ExperimentMode;
+  readonly iteration: number;
 }
 
-async function updateWithProviders(
-  input: Parameters<typeof updateMemory>[0],
-  providers: ProviderSet,
+function planTrials(
   config: HybridConfig,
-  calls: CallRecord[],
-): Promise<UpdateResult> {
-  const jev = instrumentJev(providers.jev, input.mode, config, calls);
-  const repair = instrumentRepair(providers.repair, input.mode, config, calls);
-  return updateMemory(input, {
-    jev,
-    repair,
-    ...(config.provider.jevModel ? { jevModel: config.provider.jevModel } : {}),
-    ...((config.provider.repairModel ?? config.provider.actorModel)
-      ? { repairModel: config.provider.repairModel ?? config.provider.actorModel }
-      : {}),
-    maxQuestions: config.budgets.maxQuestions,
-    maxRepairCalls: config.budgets.maxRepairCalls,
-    memoryBytes: config.budgets.memoryBytes,
-    requestBytes: config.budgets.requestBytes,
+  tasks: readonly HybridTask[],
+  scoring?: ReadonlyMap<string, TaskScoring>,
+): TrialPlan[] {
+  const trials: TrialPlan[] = [];
+  for (let iteration = 0; iteration < config.iterations; iteration++)
+    for (const task of tasks) {
+      const taskScoring = scoring?.get(task.id);
+      for (const mode of config.modes)
+        trials.push({
+          trialId: `iter${iteration}-${task.id}-${mode}`,
+          task,
+          ...(taskScoring ? { scoring: taskScoring } : {}),
+          mode,
+          iteration,
+        });
+    }
+  return trials;
+}
+
+function unfinishedTrial(
+  plan: TrialPlan,
+  reason: string,
+  providerMode: HybridConfig["provider"]["mode"],
+): TrialScore {
+  return scoreTrial({
+    trialId: plan.trialId,
+    taskId: plan.task.id,
+    mode: plan.mode,
+    iteration: plan.iteration,
+    startedAt: new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
+    completed: false,
+    cancelled: false,
+    error: reason,
+    policyViolations: [],
+    testResults: {},
+    actorTests: [],
+    sentTexts: [],
+    checkpoints: [],
+    failureObserved: false,
+    rereads: 0,
+    retries: 0,
+    appliedExtractive: 0,
+    appliedGenerated: 0,
+    activeMemoryItems: 0,
+    providerMode,
   });
 }
 
-async function runTask(
-  mode: ExperimentMode,
-  task: HybridTask,
+async function runTrial(
+  plan: TrialPlan,
   config: HybridConfig,
   providers: ProviderSet,
-  calls: CallRecord[],
-  contexts: ContextRecord[],
-  updates: Record<string, unknown>[],
-): Promise<RunScore> {
-  let memory = emptyMemory();
-  let facts = initialFacts();
-  const history: TraceMessage[] = [];
-  const workspace = new Map(Object.entries(task.files));
+  ctx: RunContext,
+): Promise<TrialScore> {
+  const { task, mode, trialId, iteration, scoring } = plan;
+  const env = new TaskEnvironment(task, scoring, {
+    isolated: config.provider.executionIsolation === "required",
+  });
   const normalizer = new PiEventNormalizer({
     eventCount: 0,
     turnIndex: 0,
@@ -220,332 +437,507 @@ async function runTask(
   });
   const initialPrompt = normalizer.prompt(task.instruction);
   await engine.process(initialPrompt);
-  history.push({
-    id: initialPrompt.id,
-    role: "user",
-    text: task.instruction,
-    sequence: 0,
-    sourceId: initialPrompt.id,
-    truncated: false,
-  });
+  const history: TraceMessage[] = [
+    {
+      id: initialPrompt.id,
+      role: "user",
+      text: task.instruction,
+      sequence: 0,
+      sourceId: initialPrompt.id,
+      truncated: false,
+    },
+  ];
+  let memory = emptyMemory();
   let completed = false;
-  let testPassed = false;
+  let error: string | undefined;
+  const policyViolations: string[] = [];
+  const actorTests: { testId: string; step: number; passed: boolean }[] = [];
+  const sentTexts: string[] = [];
+  const readKeys = new Set<string>();
   let rereads = 0;
   let retries = 0;
-  const policyViolations: string[] = [];
-  let unavailable: string | undefined;
+  let lastFailedKey: string | undefined;
+  let failureObserved = false;
+  let appliedExtractive = 0;
+  let appliedGenerated = 0;
+  const held: TraceMessage[] = [];
+  const startedAt = new Date().toISOString();
+  let groupStart = 0;
+
   for (let step = 0; step < config.budgets.maxActions; step++) {
-    const latest = history.slice(-2);
-    const inputState = {
+    const consumed = held.splice(0, held.length);
+    for (const message of consumed) {
+      const prompt = normalizer.prompt(message.text);
+      await engine.process(prompt);
+      history.push({ ...message, id: prompt.id, sourceId: prompt.id, sequence: history.length });
+      pushUpdate(
+        ctx,
+        trialRecord(ctx, trialId, task.id, mode, step, "injection", {
+          text: message.text,
+          sourceId: prompt.id,
+        }),
+      );
+    }
+    const group = latestGroup(history, groupStart);
+    groupStart = history.length;
+    const candidates = generateCandidates(group.messages, {
+      maxBytes: config.candidateMaxBytes,
+      observedAt: step,
+    });
+    rememberCandidates(ctx, mode, candidates);
+    const facts = factsFromState(engine.state, defaultConfig(), env.verificationFacts());
+    const projected = buildProjection({
       mode,
       instruction: task.instruction,
-      state: engine.state,
       facts,
       memory,
-      candidates: generateCandidates(latest, { maxBytes: config.candidateMaxBytes }),
-      observations: history,
-      latest,
-      step,
-      now: step,
-    } as const;
-    const projection = buildProjection({ ...inputState, history, budgets: config.budgets });
-    contexts.push(contextRecord(config, projection, mode, step));
-    if (projection.unavailable) {
-      unavailable = projection.unavailable;
+      latest: group.messages,
+      history,
+      allowedTests: task.allowedTests,
+      budgets: config.budgets,
+    });
+    recordContext(ctx, { trialId, taskId: task.id, mode, step, projected, config });
+    if (projected.bundle.unavailable) {
+      error = `state_first_unavailable:${projected.bundle.unavailable}`;
       break;
     }
-    const actor = instrumentActor(providers.actor, mode, config, calls);
-    const response = await actor.act(
-      buildActorRequest(
-        mode,
-        task.id,
-        task.instruction,
-        projection,
-        config.provider.actorModel ?? "fake",
-      ),
+    sentTexts.push(projected.userText);
+    const request = buildActorRequest({
+      mode,
+      taskId: task.id,
+      trialId,
+      step,
+      userText: projected.userText,
+      allowedTests: task.allowedTests,
+      model: config.provider.actorModel ?? "fake",
+    });
+    const response = await instrumented(
+      ctx,
+      "actor",
+      mode,
+      request,
+      () => actorProvider(providers).act(request, callOptions(config)),
+      trialId,
+      task.id,
+      step,
+      config,
     );
     if (response.error || !response.action) {
-      unavailable = response.error ?? "actor_action_missing";
+      error = response.error ?? "actor_action_missing";
       break;
     }
+    const responseId = `resp-${trialId}-${step}`;
+    if (response.text)
+      history.push({
+        id: responseId,
+        role: "assistant",
+        text: response.text,
+        sequence: history.length,
+        sourceId: responseId,
+        truncated: false,
+      });
     if (mode === "llm") {
       if (response.statePatch === undefined) {
-        unavailable = "invalid_update";
-        updates.push({ mode, taskId: task.id, step, action: response.action, unavailable });
+        error = "actor_state_patch_missing";
         break;
       }
-      const patchResult = applyActorPatch(memory, response.statePatch, inputState.candidates, step);
-      if (!patchResult.ok) {
-        unavailable = "invalid_update";
-        updates.push({ mode, taskId: task.id, step, action: response.action, unavailable });
+      const patch = response.statePatch.map((operation) => substituteSelf(operation, responseId));
+      const apply = applyOperations(
+        memory,
+        patch,
+        actorPatchContext(candidates, group.messages, memory, responseId, response.text, step),
+      );
+      if (!apply.ok) {
+        error = `invalid_update:${apply.reason}`;
         break;
       }
-      memory = patchResult.memory;
+      memory = apply.memory;
+      appliedExtractive += apply.applied.filter((op) => op.origin === "extracted").length;
+      appliedGenerated += apply.applied.filter((op) => op.origin === "generated").length;
+      countApplied(ctx, mode, apply.applied);
+      pushUpdate(
+        ctx,
+        trialRecord(ctx, trialId, task.id, mode, step, "update", {
+          source: "actor_patch",
+          operations: apply.applied.map(operationView),
+          memoryHash: memoryHash(memory),
+        }),
+      );
     } else if (mode === "rules" || mode === "jev") {
-      const result = await updateWithProviders(inputState, providers, config, calls);
-      memory = result.memory;
-      updates.push({
+      const input = {
+        instruction: task.instruction,
         mode,
-        taskId: task.id,
+        state: engine.state,
+        facts,
+        memory,
+        candidates,
+        observations: group.messages,
+        latest: group.messages,
         step,
-        decisions: result.decisions,
-        repairReasons: result.repairReasons,
-        unavailable: result.unavailable,
-      });
+        now: step,
+      } as const;
+      const result = await updateWithProviders(
+        ctx,
+        input,
+        providers,
+        config,
+        trialId,
+        task.id,
+        step,
+      );
+      memory = result.memory;
+      countDecisions(ctx, mode, result.decisions.length);
+      countApplied(ctx, mode, result.applied);
+      appliedExtractive += result.applied.filter((op) => op.origin === "extracted").length;
+      appliedGenerated += result.applied.filter((op) => op.origin === "generated").length;
+      pushUpdate(
+        ctx,
+        trialRecord(ctx, trialId, task.id, mode, step, "update", {
+          candidates: candidates.map((candidate) => candidate.id),
+          decisions: result.decisions,
+          applied: result.applied.map(operationView),
+          held: result.held.map((candidate) => candidate.id),
+          repairReasons: result.repairReasons,
+          memoryHash: memoryHash(memory),
+          ...(result.unavailable ? { unavailable: result.unavailable } : {}),
+        }),
+      );
       if (result.unavailable) {
-        unavailable = result.unavailable;
+        error = `state_first_unavailable:${result.unavailable}`;
         break;
       }
     }
-    const execution = executeAction(response.action, workspace, task);
+    const execution = await env.execute(response.action);
+    const actionKey = operationKey(response.action);
+    if (lastFailedKey !== undefined && lastFailedKey === actionKey) retries++;
+    lastFailedKey = execution.passed ? undefined : actionKey;
+    if (!execution.passed) failureObserved = true;
     if (execution.violation) {
       policyViolations.push(execution.violation);
-      unavailable = execution.violation;
+      error = execution.violation;
       break;
     }
-    if (response.action.tool === "read") rereads++;
-    if (response.action.tool === "finish") {
-      completed = true;
-      testPassed = testsPass(workspace, task);
-      break;
+    if (response.action.tool === "read") {
+      const key = `${response.action.path}|${env.observationGeneration}`;
+      if (readKeys.has(key)) rereads++;
+      readKeys.add(key);
     }
-    if (response.action.tool === "test") testPassed = execution.passed;
-    const call = normalizer.call({
+    const callEvent = normalizer.call({
       type: "tool_call",
-      toolCallId: `task-${mode}-${task.id}-${step}`,
+      toolCallId: `call-${trialId}-${step}`,
       toolName: response.action.tool,
       input: actionInput(response.action),
     });
-    const result = normalizer.result({
+    const resultEvent = normalizer.result({
       type: "tool_result",
-      toolCallId: call.toolCallId,
+      toolCallId: callEvent.toolCallId,
       toolName: response.action.tool,
       input: actionInput(response.action),
       content: [{ type: "text", text: execution.text }],
       isError: !execution.passed,
       details: undefined,
     });
-    await engine.process(call);
-    await engine.process(result);
-    facts = factsFromState(engine.state, defaultConfig());
+    await engine.process(callEvent);
+    await engine.process(resultEvent);
     history.push({
-      id: call.id,
+      id: callEvent.id,
       role: "tool_call",
       text: JSON.stringify(actionInput(response.action)),
       sequence: history.length,
-      sourceId: call.id,
+      sourceId: callEvent.id,
       toolName: response.action.tool,
-      toolCallId: call.toolCallId,
+      toolCallId: callEvent.toolCallId,
       truncated: false,
     });
     history.push({
-      id: result.id,
+      id: resultEvent.id,
       role: "tool_result",
       text: execution.text,
       sequence: history.length,
-      sourceId: result.id,
+      sourceId: resultEvent.id,
       toolName: response.action.tool,
-      toolCallId: call.toolCallId,
+      toolCallId: callEvent.toolCallId,
       isError: !execution.passed,
       truncated: false,
     });
+    if (execution.verification)
+      actorTests.push({
+        testId: execution.verification.testId,
+        step,
+        passed: execution.passed,
+      });
+    if (response.action.tool === "finish") {
+      completed = true;
+      break;
+    }
+    for (const injection of task.injections ?? [])
+      if (injection.step === step + 1)
+        held.push({
+          id: `inj-${trialId}-${step}`,
+          role: "user",
+          text: injection.text,
+          sequence: -1,
+          sourceId: `inj-${trialId}-${step}`,
+          truncated: false,
+        });
   }
-  if (!completed && !unavailable) unavailable = "action_budget_exhausted";
-  return {
+  if (!completed && !error) error = "action_budget_exhausted";
+  const testResults: Record<string, "passed" | "failed" | "not_run"> = {};
+  if (completed)
+    for (const result of await env.evaluateFinal()) testResults[result.testId] = result.status;
+  else for (const testId of task.allowedTests) testResults[testId] = "not_run";
+  const finishedAt = new Date().toISOString();
+  return scoreTrial({
+    trialId,
     taskId: task.id,
     mode,
+    iteration,
+    startedAt,
+    finishedAt,
     completed,
-    testPassed: completed && testPassed,
-    informationRetained: memoryCount(memory) > 0 || mode === "history",
+    cancelled: false,
+    ...(error ? { error } : {}),
     policyViolations,
+    testResults,
+    actorTests,
+    sentTexts,
+    checkpoints: scoring?.checkpoints ?? [],
+    failureObserved,
     rereads,
     retries,
-    ...(unavailable ? { unavailable } : {}),
-  };
+    appliedExtractive,
+    appliedGenerated,
+    activeMemoryItems: memoryItems(memory).length,
+    providerMode: config.provider.mode,
+  });
 }
 
-function executeAction(
-  action: ActorAction,
-  workspace: Map<string, string>,
-  task: HybridTask,
-): { readonly text: string; readonly passed: boolean; readonly violation?: string } {
-  if (action.path && !safePath(action.path))
-    return { text: "path rejected", passed: false, violation: "path_escape" };
-  if (action.tool === "read")
-    return {
-      text: workspace.get(action.path ?? "") ?? "file not found",
-      passed: workspace.has(action.path ?? ""),
-    };
-  if (action.tool === "write") {
-    if (!action.path || action.content === undefined)
-      return { text: "invalid write", passed: false, violation: "invalid_action" };
-    workspace.set(action.path, action.content);
-    return { text: "write ok", passed: true };
-  }
-  if (action.tool === "edit") {
-    if (!action.path || action.replacement === undefined || !workspace.has(action.path))
-      return { text: "invalid edit", passed: false, violation: "invalid_action" };
-    workspace.set(action.path, action.replacement);
-    return { text: "edit ok", passed: true };
-  }
-  if (action.tool === "test") {
-    if (action.command && !task.tests.includes(action.command))
-      return { text: "test command rejected", passed: false, violation: "test_not_allowed" };
-    const passed = testsPass(workspace, task);
-    return { text: passed ? "tests passed" : "tests failed", passed };
-  }
-  return { text: "finished", passed: true };
-}
-
-function testsPass(workspace: ReadonlyMap<string, string>, task: HybridTask): boolean {
-  const expected = task.expectedFiles;
-  if (expected)
-    return Object.entries(expected).every(([path, content]) => workspace.get(path) === content);
-  return task.tests.length > 0;
-}
-
-function actionInput(action: ActorAction): Record<string, unknown> {
-  return { ...action };
-}
-
-function safePath(path: string): boolean {
-  return !path.startsWith("/") && !path.split("/").includes("..") && !path.includes("\\");
-}
-
-function applyActorPatch(
-  memory: WorkMemory,
-  operations: readonly import("./types.js").PatchOperation[],
+function actorPatchContext(
   candidates: readonly Candidate[],
-  now: number,
-) {
-  return applyOperations(memory, operations, candidates, now);
+  observations: readonly TraceMessage[],
+  memory: WorkMemory,
+  responseId: string,
+  responseText: string | undefined,
+  step: number,
+): ApplyContext {
+  return {
+    candidates,
+    observations,
+    extraSourceIds: [responseId],
+    allowGenerated: true,
+    now: step,
+    extraSources: responseText
+      ? [{ id: responseId, role: "assistant", text: responseText, trust: "assistant" }]
+      : [],
+  };
 }
 
-function instrumentJev(
-  provider: JevProvider,
-  mode: ExperimentMode,
-  config: HybridConfig,
-  calls: CallRecord[],
-): JevProvider {
+function substituteSelf(operation: PatchOperation, responseId: string): PatchOperation {
+  if (!operation.sourceIds.includes("self")) return operation;
   return {
-    name: provider.name,
-    choose: async (request) => {
-      if (calls.length >= config.provider.maxRequests) {
-        calls.push({
-          kind: "jev",
-          mode,
-          model: config.provider.jevModel ?? provider.name,
-          requestBytes: Buffer.byteLength(JSON.stringify(request)),
-          startedAt: new Date().toISOString(),
-          latencyMs: 0,
-          error: "request_limit",
-          attempts: 1,
-        });
-        return { answers: [], error: "request_limit" };
-      }
-      return recordCall(
-        calls,
+    ...operation,
+    sourceIds: operation.sourceIds.map((id) => (id === "self" ? responseId : id)),
+  };
+}
+
+async function auditStep(
+  ctx: RunContext,
+  input: Parameters<typeof updateMemory>[0],
+  providers: ProviderSet,
+  config: HybridConfig,
+  mode: ExperimentMode,
+  step: number,
+): Promise<UpdateResult> {
+  if (mode === "llm") {
+    const provider = providers.update;
+    if (!provider)
+      return {
+        memory: input.memory,
+        candidates: input.candidates,
+        decisions: [],
+        held: [],
+        applied: [],
+        repairReasons: [],
+        unavailable: "update_provider_missing",
+      };
+    const request: GenerativeUpdateRequest = {
+      mode: "llm",
+      instruction: input.instruction,
+      facts: JSON.stringify(input.facts),
+      memory: JSON.stringify(input.memory),
+      latest: JSON.stringify(groupView(input.latest)),
+      selfSourceId: `upd-audit-llm-${step}`,
+      model: config.provider.updateModel ?? config.provider.actorModel ?? "fake",
+      promptVersion: PROMPT_VERSION,
+    };
+    const response = await instrumented(
+      ctx,
+      "update",
+      mode,
+      request,
+      () => provider.update(request, callOptions(config)),
+      `audit-${mode}`,
+      "audit",
+      step,
+      config,
+    );
+    if (response.error || !response.operations)
+      return {
+        memory: input.memory,
+        candidates: input.candidates,
+        decisions: [],
+        held: [],
+        applied: [],
+        repairReasons: ["invalid_update"],
+        unavailable: response.error ?? "invalid_update",
+      };
+    const apply = applyOperations(input.memory, response.operations, applyContext(input, true));
+    if (!apply.ok)
+      return {
+        memory: input.memory,
+        candidates: input.candidates,
+        decisions: [],
+        held: [],
+        applied: [],
+        repairReasons: ["invalid_update"],
+        unavailable: apply.reason,
+      };
+    return {
+      memory: apply.memory,
+      candidates: input.candidates,
+      decisions: response.operations.map((operation, index) => ({
+        candidateId: operation.sourceIds[0] ?? `op-${index}`,
+        disposition: "selected" as const,
+        reason: "llm_update",
+      })),
+      held: [],
+      applied: apply.applied,
+      repairReasons: [],
+    };
+  }
+  if (mode === "history")
+    return {
+      memory: input.memory,
+      candidates: input.candidates,
+      decisions: [],
+      held: [],
+      applied: [],
+      repairReasons: [],
+    };
+  return updateWithProviders(ctx, input, providers, config, `audit-${mode}`, "audit", step);
+}
+
+async function updateWithProviders(
+  ctx: RunContext,
+  input: Parameters<typeof updateMemory>[0],
+  providers: ProviderSet,
+  config: HybridConfig,
+  trialId: string,
+  taskId: string,
+  step: number,
+): Promise<UpdateResult> {
+  const jevProvider = providers.jev;
+  const repairProvider = providers.repair;
+  const jev: JevProvider | undefined = jevProvider && {
+    name: jevProvider.name,
+    choose: (request: JevRequest, options?: CallOptions) =>
+      instrumented(
+        ctx,
         "jev",
-        mode,
-        config.provider.jevModel ?? provider.name,
+        input.mode,
         request,
-        () => provider.choose(request),
-      );
-    },
+        () => jevProvider.choose(request, options ?? callOptions(config)),
+        trialId,
+        taskId,
+        step,
+        config,
+      ),
   };
-}
-
-function instrumentRepair(
-  provider: RepairProvider,
-  mode: ExperimentMode,
-  config: HybridConfig,
-  calls: CallRecord[],
-): RepairProvider {
-  return {
-    name: provider.name,
-    repair: async (request) => {
-      if (calls.length >= config.provider.maxRequests) {
-        calls.push({
-          kind: "repair",
-          mode,
-          model: config.provider.repairModel ?? provider.name,
-          requestBytes: Buffer.byteLength(JSON.stringify(request)),
-          startedAt: new Date().toISOString(),
-          latencyMs: 0,
-          error: "request_limit",
-          attempts: 1,
-        });
-        return { operations: [], error: "request_limit" };
-      }
-      return recordCall(
-        calls,
+  const repair: RepairProvider | undefined = repairProvider && {
+    name: repairProvider.name,
+    repair: (request: RepairRequest, options?: CallOptions) =>
+      instrumented(
+        ctx,
         "repair",
-        mode,
-        config.provider.repairModel ?? provider.name,
+        input.mode,
         request,
-        () => provider.repair(request),
-      );
-    },
+        () => repairProvider.repair(request, options ?? callOptions(config)),
+        trialId,
+        taskId,
+        step,
+        config,
+      ),
   };
+  return updateMemory(input, {
+    ...(jev ? { jev } : {}),
+    ...(repair ? { repair } : {}),
+    ...(config.provider.jevModel ? { jevModel: config.provider.jevModel } : {}),
+    ...((config.provider.repairModel ?? config.provider.actorModel)
+      ? { repairModel: config.provider.repairModel ?? config.provider.actorModel }
+      : {}),
+    maxQuestions: config.budgets.maxQuestions,
+    maxRepairCalls: config.budgets.maxRepairCalls,
+    memoryBytes: config.budgets.memoryBytes,
+    requestBytes: config.budgets.requestBytes,
+    signal: AbortSignal.timeout(config.provider.timeoutMs),
+  });
 }
 
-function instrumentActor(
-  provider: ActorProvider,
-  mode: ExperimentMode,
-  config: HybridConfig,
-  calls: CallRecord[],
-): ActorProvider {
-  return {
-    name: provider.name,
-    act: async (request) => {
-      if (calls.length >= config.provider.maxRequests) {
-        calls.push({
-          kind: "actor",
-          mode,
-          model: config.provider.actorModel ?? provider.name,
-          requestBytes: Buffer.byteLength(JSON.stringify(request)),
-          startedAt: new Date().toISOString(),
-          latencyMs: 0,
-          error: "request_limit",
-          attempts: 1,
-        });
-        return { error: "request_limit" };
-      }
-      return recordCall(
-        calls,
-        "actor",
-        mode,
-        config.provider.actorModel ?? provider.name,
-        request,
-        () => provider.act(request),
-      );
-    },
-  };
-}
-
-async function recordCall<
-  T extends {
-    readonly latencyMs?: number;
-    readonly usage?: import("./types.js").Usage;
-    readonly error?: string;
-  },
+async function instrumented<
+  T extends { latencyMs?: number; usage?: CallRecord["usage"]; error?: string },
 >(
-  calls: CallRecord[],
+  ctx: RunContext,
   kind: CallRecord["kind"],
   mode: ExperimentMode,
-  model: string,
   request: unknown,
-  action: () => Promise<T>,
+  call: () => Promise<T>,
+  trialId: string,
+  taskId: string,
+  step: number,
+  config: HybridConfig,
 ): Promise<T> {
+  const bytes = Buffer.byteLength(JSON.stringify(sentRequestBody(kind, request)));
+  const hash = requestHash(kind, request);
+  const notSent = (error: string): never => {
+    pushCall(ctx, {
+      runId: ctx.runId,
+      trialId,
+      taskId,
+      mode,
+      step,
+      kind,
+      model: modelFor(kind, config),
+      sent: false,
+      requestBytes: bytes,
+      requestHash: hash,
+      startedAt: new Date().toISOString(),
+      latencyMs: null,
+      error,
+      attempts: 0,
+    });
+    throw new BudgetExhausted();
+  };
+  if (ctx.budget.sent >= ctx.budget.limit) notSent("not_sent");
+  const sentForTrial = ctx.trialSent.get(trialId) ?? 0;
+  if (sentForTrial >= config.provider.trialMaxRequests) notSent("not_sent_trial_budget");
+  ctx.budget.sent++;
+  ctx.trialSent.set(trialId, sentForTrial + 1);
+  const startedAt = new Date().toISOString();
   const started = performance.now();
   try {
-    const response = await action();
-    calls.push({
-      kind,
+    const response = await call();
+    pushCall(ctx, {
+      runId: ctx.runId,
+      trialId,
+      taskId,
       mode,
-      model,
-      requestBytes: Buffer.byteLength(JSON.stringify(request)),
-      startedAt: new Date().toISOString(),
+      step,
+      kind,
+      model: modelFor(kind, config),
+      sent: true,
+      requestBytes: bytes,
+      requestHash: hash,
+      startedAt,
       latencyMs: response.latencyMs ?? performance.now() - started,
       ...(response.usage ? { usage: response.usage } : {}),
       ...(response.error ? { error: response.error } : {}),
@@ -553,12 +945,18 @@ async function recordCall<
     });
     return response;
   } catch (error) {
-    calls.push({
-      kind,
+    pushCall(ctx, {
+      runId: ctx.runId,
+      trialId,
+      taskId,
       mode,
-      model,
-      requestBytes: Buffer.byteLength(JSON.stringify(request)),
-      startedAt: new Date().toISOString(),
+      step,
+      kind,
+      model: modelFor(kind, config),
+      sent: true,
+      requestBytes: bytes,
+      requestHash: hash,
+      startedAt,
       latencyMs: performance.now() - started,
       error: error instanceof Error ? error.message : "provider_error",
       attempts: 1,
@@ -567,72 +965,188 @@ async function recordCall<
   }
 }
 
-function contextRecord(
-  config: HybridConfig,
-  input: InputBundle,
-  mode: ExperimentMode,
-  step: number,
-): ContextRecord {
+function modelFor(kind: CallRecord["kind"], config: HybridConfig): string {
+  if (kind === "jev") return config.provider.jevModel ?? "fake-jev";
+  if (kind === "repair") return config.provider.repairModel ?? "fake-repair";
+  if (kind === "update")
+    return config.provider.updateModel ?? config.provider.actorModel ?? "fake-update";
+  return config.provider.actorModel ?? "fake-actor";
+}
+
+function callOptions(config: HybridConfig): CallOptions {
+  return { signal: AbortSignal.timeout(config.provider.timeoutMs) };
+}
+
+function actorProvider(providers: ProviderSet): ActorProvider {
+  if (!providers.actor) throw new Error("actor provider is required for closed_loop");
+  return providers.actor;
+}
+
+function fakeProviders(tasks: readonly HybridTask[]): ProviderSet {
   return {
-    mode,
-    step,
-    bytes: input.bytes,
+    jev: new FakeJevProvider(),
+    repair: new FakeRepairProvider(),
+    actor: new FakeActorProvider(tasks),
+    update: new FakeUpdateProvider(),
+  };
+}
+
+function auditGroups(messages: readonly TraceMessage[]): ObservationGroup[] {
+  const groups: ObservationGroup[] = [];
+  let current: TraceMessage[] = [];
+  for (const message of messages) {
+    current.push(message);
+    if (message.role === "user") {
+      if (current.length > 1) {
+        groups.push({ messages: current.slice(0, -1) });
+        current = [message];
+      }
+    }
+  }
+  if (current.length) groups.push({ messages: current });
+  return groups.filter((group) => group.messages.length);
+}
+
+function auditInstruction(trace: TraceData): string {
+  return trace.messages.find((message) => message.role === "user")?.text ?? "Trace audit";
+}
+
+function recordContext(
+  ctx: RunContext,
+  args: {
+    trialId: string;
+    taskId: string;
+    mode: ExperimentMode;
+    step: number;
+    projected: ProjectedInput;
+    config: HybridConfig;
+  },
+): void {
+  const { projected } = args;
+  pushContext(ctx, {
+    runId: ctx.runId,
+    trialId: args.trialId,
+    taskId: args.taskId,
+    mode: args.mode,
+    step: args.step,
+    bytes: projected.bundle.bytes,
+    sentBytes: Buffer.byteLength(projected.userText),
     included: [
       "instruction",
       "fixedTools",
       "facts",
       "memory",
       "latest",
-      ...(input.history === undefined ? [] : ["history"]),
+      ...(projected.bundle.history === undefined ? [] : ["history"]),
     ],
-    truncated: input.truncated,
-    ...(config.recordContextText ? { text: JSON.stringify(input) } : {}),
+    truncated: projected.bundle.truncated,
+    ...(args.config.recordContextText ? { text: projected.userText } : {}),
+  });
+}
+
+function groupView(messages: readonly TraceMessage[]): unknown {
+  return {
+    messages: messages.map((message) => ({
+      id: message.id,
+      role: message.role,
+      text: message.text,
+      sourceId: message.sourceId,
+      toolName: message.toolName,
+      toolCallId: message.toolCallId,
+    })),
   };
 }
 
-function generatedCount(updates: readonly Record<string, unknown>[]): number {
-  return updates.reduce((count, update) => {
-    const memory = update.memory;
-    if (!memory || typeof memory !== "object") return count;
-    const items = Object.values(memory as Record<string, unknown>).flatMap((value) =>
-      Array.isArray(value) ? value : [],
-    );
-    return (
-      count +
-      items.filter(
-        (item) =>
-          item &&
-          typeof item === "object" &&
-          (item as Record<string, unknown>).origin === "generated",
-      ).length
-    );
-  }, 0);
+function trialRecord(
+  ctx: RunContext,
+  trialId: string,
+  taskId: string,
+  mode: ExperimentMode,
+  step: number,
+  kind: UpdateRecord["kind"],
+  data: Record<string, unknown>,
+): UpdateRecord {
+  return { runId: ctx.runId, trialId, taskId, mode, step, kind, ...data };
 }
 
-function selectedCount(updates: readonly Record<string, unknown>[]): number {
-  return updates.reduce((count, update) => {
-    const decisions = update.decisions;
-    if (!Array.isArray(decisions)) return count;
-    return (
-      count +
-      decisions.filter(
-        (decision) =>
-          decision &&
-          typeof decision === "object" &&
-          (decision as Record<string, unknown>).disposition === "selected",
-      ).length
-    );
-  }, 0);
+function auditRecord(
+  ctx: RunContext,
+  kind: UpdateRecord["kind"],
+  step: number,
+  mode: string,
+  data: Record<string, unknown>,
+): UpdateRecord {
+  return {
+    runId: ctx.runId,
+    trialId: `audit-${mode}`,
+    taskId: "audit",
+    mode: mode as ExperimentMode,
+    step,
+    kind,
+    ...data,
+  };
 }
 
-function memoryCount(memory: WorkMemory): number {
-  return Object.values(memory).reduce((count, items) => count + items.length, 0);
+function rememberCandidates(
+  ctx: RunContext,
+  mode: ExperimentMode,
+  candidates: readonly Candidate[],
+): void {
+  const set = ctx.uniqueCandidates.get(mode) ?? new Set<string>();
+  for (const candidate of candidates) set.add(candidate.id);
+  ctx.uniqueCandidates.set(mode, set);
+}
+
+function countDecisions(ctx: RunContext, mode: ExperimentMode, count: number): void {
+  ctx.decisionCounts.set(mode, (ctx.decisionCounts.get(mode) ?? 0) + count);
+}
+
+function countApplied(
+  ctx: RunContext,
+  mode: ExperimentMode,
+  applied: readonly PatchOperation[],
+): void {
+  const current = ctx.appliedCounts.get(mode) ?? { extractive: 0, generated: 0 };
+  for (const operation of applied) {
+    if (operation.origin === "extracted") current.extractive++;
+    else current.generated++;
+  }
+  ctx.appliedCounts.set(mode, current);
+}
+
+function operationView(operation: PatchOperation): Record<string, unknown> {
+  return {
+    operation: operation.operation,
+    kind: operation.kind,
+    sourceIds: operation.sourceIds,
+    origin: operation.origin,
+    trust: operation.trust,
+    ...(operation.itemId ? { itemId: operation.itemId } : {}),
+    ...(operation.replaces ? { replaces: operation.replaces } : {}),
+  };
+}
+
+function memoryHash(memory: WorkMemory): string {
+  return createHash("sha256").update(JSON.stringify(memory)).digest("hex").slice(0, 16);
+}
+
+function actionInput(action: ActorAction): Record<string, unknown> {
+  return { ...action };
+}
+
+function operationKey(action: ActorAction): string {
+  return JSON.stringify(actionInput(action));
+}
+
+function newRunId(): string {
+  return `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 async function createManifest(
   config: HybridConfig,
   input: string,
   evaluation: "trace_audit" | "closed_loop",
+  runId: string,
 ): Promise<ExperimentManifest> {
   let head: string | null = null;
   try {
@@ -642,6 +1156,8 @@ async function createManifest(
   }
   return {
     schemaVersion: HYBRID_SCHEMA_VERSION,
+    runId,
+    status: "completed",
     head,
     inputHash: createHash("sha256").update(input).digest("hex"),
     config,
@@ -652,6 +1168,7 @@ async function createManifest(
       jev: config.provider.jevModel ?? null,
       actor: config.provider.actorModel ?? null,
       repair: config.provider.repairModel ?? null,
+      update: config.provider.updateModel ?? null,
     },
     sdkVersion: "@earendil-works/pi-coding-agent@0.83.0",
     promptVersion: PROMPT_VERSION,

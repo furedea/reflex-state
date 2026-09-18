@@ -1,40 +1,74 @@
 # Hybrid state validation
 
-The implementation was started from the existing `feat/state-safety` checkout at commit
-`88e059d0169239c59e9c6cba2cd0d89d306c00d4` after checking the working tree, package scripts, TypeScript configuration, and installed
-Pi SDK. The requested reference commit was not checked out or reset.
+This revision started from the PR #5 head `453845c2aa8afa5d5412f2e476c9a5f01cbdf677`
+(`feat/hybrid-state-experiment`). The experiment is isolated under
+`src/experiments/hybrid-state/`; the Pi extension, state version 2, projection modes, public API,
+and replay are unchanged.
 
-The prototype is isolated under `src/experiments/hybrid-state/`. It reuses the core `HotState`
-shape and `blockerView`, and it uses `StateEngine` with the existing normalizer at the closed-loop
-action boundary. No Pi extension import starts the experiment automatically.
+## What was corrected
 
-## Offline evidence
+The previous prototype misreported its own evidence. The corrected implementation now measures
+the sent request body for bytes and hashes, distinguishes missing usage from measured zero usage,
+keeps the actor request's local metadata out of the wire payload, and validates actor actions and
+state patches against the declared contract. Memory updates are source-backed: extracted text must
+equal its cited source, generated text requires an allowed origin, and protected user constraints
+cannot be dropped for budget reasons. Latest observation groups are indivisible, and budget
+overflows are recorded as explicit `unavailable` reasons instead of silent truncation. Blocked
+calls are recorded with `sent: false`; trials report execution, wiring, and efficacy status
+separately, and fake or recorded providers always report `efficacy_status: not_evaluated`.
+Earlier claims that fake results demonstrated information retention, state-first superiority,
+Jev value, or provider correctness are withdrawn; the fake conditions are wiring evidence only.
+Existing result files were not modified.
 
-| Evidence                  | Command                                                                                                                 | Result                                                                                                |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| TypeScript build contract | `pnpm exec tsc -p tsconfig.build.json --noEmit`                                                                         | passed                                                                                                |
-| Hybrid regression tests   | `pnpm exec vitest run src/experiments/hybrid-state`                                                                     | 4 files, 12 tests passed                                                                              |
-| Trace audit               | `pnpm experiment:hybrid -- audit --config experiments/hybrid-state/config.offline.json --out .local/hybrid-state/audit` | fake/recorded-free run completed; output includes manifest, updates, calls, contexts, summary, report |
-| Closed loop               | `pnpm experiment:hybrid -- run --config experiments/hybrid-state/config.offline.json --out .local/hybrid-state/run`     | 3 synthetic tasks × 4 modes completed with fake actor                                                 |
-| Report rendering          | `pnpm experiment:hybrid -- report --input .local/hybrid-state/run`                                                      | report generated from `summary.json`                                                                  |
+## Acceptance evidence
 
-The offline run is not a real model evaluation. The fake actor follows task actions so the safe
-workspace boundary, per-exchange projection, branch separation, and output accounting can be
-checked without network access. The audit fixture is synthetic and its labels are marked
-`reviewed: false`.
+Acceptance tests live in `src/experiments/hybrid-state/acceptance.test.ts` and run under vitest.
 
-## Required acceptance evidence
+| ID  | Test name                                                                            |
+| --- | ------------------------------------------------------------------------------------ |
+| C1  | the actor wire body is the ModelRuntime.complete shape without local metadata        |
+| C2  | missing usage stays absent while measured zeros are preserved                        |
+| C3  | the actor response is one JSON object with action plus optional state patch          |
+| C4  | Jev answers decode per question with invalid entries marked, never fabricated        |
+| C5  | recorded providers replay only the call bound to kind, trial, step, and request hash |
+| C6  | exhausted request budgets record sent:false instead of pretending a call happened    |
+| E1  | extracted operations must match cited source text and generated ones need approval   |
+| E2  | an oversized latest observation group is reported unavailable, never split           |
+| E3  | Stage A compares history and llm through identical single actor calls with no Jev    |
+| E4  | a fake provider run reports efficacy as not evaluated                                |
+| E5  | the task environment rejects path escapes and unlisted test ids                      |
+| E6  | live preflight and output reservation fail before any execution                      |
+| F1  | the input-dependent fake detects providers that ignore the sent input                |
 
-The tests cover visible-only trace extraction, UTF-16 source offsets, explicit leaf selection,
-history growth, state-first removal of old conversation, Facts budget failure, trust separation,
-Jev selection of existing candidates, invalid patch preservation, and the four-mode closed loop.
-The generated `contexts.jsonl` records the input parts and byte sizes; when privacy text recording
-is disabled it does not contain the raw prompt.
+## Executed commands and results
+
+| Evidence                | Command                                                                                                                                         | Result                                                                                                                                                               |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript build        | `pnpm run build`                                                                                                                                | passed (`tsc -p tsconfig.build.json`)                                                                                                                                |
+| Hybrid-state tests      | `pnpm exec vitest run src/experiments/hybrid-state`                                                                                             | 5 files, 27 tests passed                                                                                                                                             |
+| Full repository gate    | `pnpm check`                                                                                                                                    | passed: oxfmt, oxlint, type-aware check, 163 vitest tests passed + 1 skipped, 14 release tests passed, knip clean                                                    |
+| Package verification    | `pnpm run package:check`                                                                                                                        | passed: extension packaging plus export/replay commands                                                                                                              |
+| Trace audit (wiring)    | `node dist/experiments/hybrid-state/cli.js audit --config experiments/hybrid-state/config.offline.json --out .local/hybrid-state/audit-v2`      | new run executed `run-mu6p260g-x6mt86`; 4 modes wiring passed; efficacy not_evaluated                                                                                |
+| Stage A closed loop     | `node dist/experiments/hybrid-state/cli.js run --config experiments/hybrid-state/config.stage-a.offline.json --out .local/hybrid-state/stage-a` | new run executed `run-mu6p2alx-fd3y0r`; 3 tasks × 2 modes = 6 trials, all wiring passed; efficacy not_evaluated; only actor calls recorded (no Jev, no update calls) |
+| Existing result display | `node dist/experiments/hybrid-state/cli.js report --input .local/hybrid-state/stage-a`                                                          | existing result displayed; report rendered from `summary.json` without a new run                                                                                     |
+| Live preflight          | `node dist/experiments/hybrid-state/cli.js run --config experiments/hybrid-state/config.live.example.json --out ...`                            | rejected: `provider.mode=live requires --live` (exit 1), no output directory created                                                                                 |
+| Live flag misuse        | `node dist/experiments/hybrid-state/cli.js run --live --config experiments/hybrid-state/config.offline.json --out ...`                          | rejected: `--live is only valid with provider.mode=live` (exit 1)                                                                                                    |
+| Product replay          | `node dist/replay_cli.js <exported events.jsonl> --updater noop`                                                                                | exported trace replayed; state produced without errors                                                                                                               |
+| Pi extension smoke      | inside `pnpm run test` (`src/pi/smoke.test.ts`)                                                                                                 | extension loads and persists branch-correct state through the real Pi runner                                                                                         |
+
+The Stage A output directory `.local/hybrid-state/stage-a/` contains `manifest.json`,
+`updates.jsonl`, `calls.jsonl`, `contexts.jsonl`, `summary.json`, and `report.md`. No persistence
+failure occurred; the manifest completed normally.
 
 ## Not performed
 
-No live Jev, actor, or repair request was made. No private session was supplied. No human review of
-the synthetic labels was performed. No claim about real task success, cost, latency, statistical
-non-inferiority, or general superiority is supported. The regular repository `pnpm check`, build,
-and package check remain required final gates after this change; any dependency or environment
-failure in those gates must remain visible rather than being treated as an experiment result.
+No live Jev, actor, repair, or update request was made; every live path was exercised only up to
+the preflight boundary. No private session data was supplied. No human review of the synthetic
+labels was performed (`reviewed: false`). No claim about real task success, cost, latency,
+statistical non-inferiority, or state-first superiority is supported by this evidence.
+
+Before a live Stage A run, the remaining requirements are: a live configuration with real model
+IDs (`config.live.example.json` shape), credentials resolvable through the existing Pi/TypeSafe
+paths, the `--live` flag, a sandbox mechanism when `executionIsolation` is `required`, and a
+decision about how live efficacy will be scored, since live output is only `descriptive_only`
+today.

@@ -1,7 +1,7 @@
 import type { AgentEvent, EventId, HotState } from "../../core/types.js";
 
-export const HYBRID_SCHEMA_VERSION = 1 as const;
-export const PROMPT_VERSION = "hybrid-state-prompt-v1" as const;
+export const HYBRID_SCHEMA_VERSION = 2 as const;
+export const PROMPT_VERSION = "hybrid-state-prompt-v2" as const;
 
 export type ExperimentMode = "history" | "llm" | "rules" | "jev";
 export type EvaluationKind = "trace_audit" | "closed_loop";
@@ -10,13 +10,17 @@ export type MemoryKind = "constraints" | "decisions" | "findings" | "attempts" |
 export type MemoryOrigin = "extracted" | "generated";
 export type MemoryStatus = "active" | "deferred";
 export type SourceTrust = "user" | "assistant" | "tool_result" | "unknown";
-export type CandidateDisposition = "selected" | "held" | "omitted" | "unclassified";
+export type CandidateDisposition = "selected" | "held" | "omitted" | "rejected" | "unclassified";
 export type RepairReason =
   | "budget_exceeded"
   | "ambiguous_reference"
   | "missing_evidence"
   | "invalid_update";
 export type LabelKind = "deterministic" | "extractive" | "generative" | "insufficient";
+export type ExecutionStatus = "completed" | "failed" | "cancelled" | "incomplete";
+export type WiringStatus = "passed" | "failed" | "not_evaluated";
+export type EfficacyStatus = "not_evaluated" | "descriptive_only";
+export type ManifestStatus = "running" | "completed" | "failed" | "cancelled" | "incomplete";
 
 export interface HybridBudgets {
   readonly memoryBytes: number;
@@ -33,17 +37,22 @@ export interface HybridProviderConfig {
   readonly jevModel?: string;
   readonly actorModel?: string;
   readonly repairModel?: string;
+  readonly updateModel?: string;
   readonly maxRequests: number;
+  readonly trialMaxRequests: number;
   readonly timeoutMs: number;
+  /** When "required", actor-produced code runs only inside the detected sandbox. */
+  readonly executionIsolation?: "required";
 }
 
 export interface HybridConfig {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly evaluation: EvaluationKind;
   readonly provider: HybridProviderConfig;
   readonly budgets: HybridBudgets;
   readonly modes: readonly ExperimentMode[];
   readonly seed: number;
+  readonly iterations: number;
   readonly recordContextText: boolean;
   readonly candidateMaxBytes: number;
   readonly taskRoot?: string;
@@ -93,6 +102,7 @@ export interface CandidateDecision {
   readonly disposition: CandidateDisposition;
   readonly reason: string;
   readonly probability?: number;
+  readonly confidence?: number;
 }
 
 export interface MemoryItem {
@@ -124,6 +134,7 @@ export interface FactsView {
 
 export interface UpdateInput {
   readonly mode: ExperimentMode;
+  readonly instruction: string;
   readonly state: HotState;
   readonly facts: FactsView;
   readonly memory: WorkMemory;
@@ -155,6 +166,7 @@ export interface JevAnswer {
   readonly choice: string;
   readonly probability?: number;
   readonly confidence?: number;
+  readonly invalid?: string;
 }
 
 export interface JevResponse {
@@ -185,6 +197,8 @@ export interface UpdateResult {
   readonly memory: WorkMemory;
   readonly candidates: readonly Candidate[];
   readonly decisions: readonly CandidateDecision[];
+  readonly held: readonly Candidate[];
+  readonly applied: readonly PatchOperation[];
   readonly proposal?: UpdateProposal;
   readonly repairReasons: readonly RepairReason[];
   readonly unavailable?: string;
@@ -199,28 +213,53 @@ export interface RepairRequest {
 }
 
 export interface RepairResponse {
-  readonly operations: readonly PatchOperation[];
+  readonly operations?: readonly PatchOperation[];
   readonly usage?: Usage;
   readonly latencyMs?: number;
   readonly error?: string;
 }
 
+export interface GenerativeUpdateRequest {
+  readonly mode: "llm";
+  readonly instruction: string;
+  readonly facts: string;
+  readonly memory: string;
+  readonly latest: string;
+  readonly selfSourceId: string;
+  readonly model: string;
+  readonly promptVersion: string;
+}
+
+export interface GenerativeUpdateResponse {
+  readonly operations?: readonly PatchOperation[];
+  readonly usage?: Usage;
+  readonly latencyMs?: number;
+  readonly error?: string;
+}
+
+export type ActorTool = "read" | "write" | "edit" | "test" | "finish";
+
 export interface ActorAction {
-  readonly tool: "read" | "write" | "edit" | "test" | "finish";
+  readonly tool: ActorTool;
   readonly path?: string;
   readonly content?: string;
-  readonly replacement?: string;
+  readonly old?: string;
+  readonly new?: string;
   readonly command?: string;
 }
 
 export interface ActorRequest {
   readonly mode: ExperimentMode;
   readonly taskId: string;
-  readonly instruction: string;
-  readonly input: InputBundle;
-  readonly allowedTools: readonly ActorAction["tool"][];
+  /** Local metadata: identifies the trial for fake/recorded providers; never part of the sent text. */
+  readonly trialId: string;
+  /** Local metadata: the step index inside the trial. */
+  readonly step: number;
+  readonly system: string;
+  readonly user: string;
+  readonly allowedTools: readonly ActorTool[];
+  readonly allowedTests: readonly string[];
   readonly model: string;
-  readonly promptVersion: string;
 }
 
 export interface ActorResponse {
@@ -259,10 +298,16 @@ export interface InputBundle {
 }
 
 export interface CallRecord {
-  readonly kind: "actor" | "jev" | "repair";
+  readonly runId: string;
+  readonly trialId: string;
+  readonly taskId: string;
   readonly mode: ExperimentMode;
+  readonly step: number;
+  readonly kind: "actor" | "jev" | "repair" | "update";
   readonly model: string;
+  readonly sent: boolean;
   readonly requestBytes: number;
+  readonly requestHash: string;
   readonly startedAt: string;
   readonly latencyMs: number | null;
   readonly usage?: Usage;
@@ -271,12 +316,26 @@ export interface CallRecord {
 }
 
 export interface ContextRecord {
+  readonly runId: string;
+  readonly trialId: string;
+  readonly taskId: string;
   readonly mode: ExperimentMode;
   readonly step: number;
   readonly bytes: InputBundle["bytes"];
+  readonly sentBytes: number;
   readonly included: readonly string[];
   readonly truncated: readonly string[];
   readonly text?: string;
+}
+
+export interface UpdateRecord {
+  readonly runId: string;
+  readonly trialId: string;
+  readonly taskId: string;
+  readonly mode: ExperimentMode;
+  readonly step: number;
+  readonly kind: "update" | "action" | "injection" | "audit_step" | "audit_summary";
+  readonly [key: string]: unknown;
 }
 
 export interface AuditLabel {
@@ -293,29 +352,131 @@ export interface TaskStep {
   readonly statePatch?: readonly PatchOperation[];
 }
 
+export interface TaskInjection {
+  /** Deliver this user message to the actor input built for this step index. */
+  readonly step: number;
+  readonly text: string;
+}
+
+export interface ObservationGroup {
+  readonly messages: readonly TraceMessage[];
+}
+
+export interface SourceRef {
+  readonly id: string;
+  readonly role: TraceMessage["role"];
+  readonly text: string;
+  readonly trust: SourceTrust;
+}
+
 export interface HybridTask {
   readonly id: string;
   readonly instruction: string;
   readonly files: Readonly<Record<string, string>>;
+  readonly allowedTests: readonly string[];
+  readonly injections?: readonly TaskInjection[];
   readonly expectedFiles?: Readonly<Record<string, string>>;
-  readonly steps: readonly TaskStep[];
-  readonly tests: readonly string[];
+  readonly steps?: readonly TaskStep[];
 }
 
-export interface RunScore {
+export interface CheckpointRequirement {
+  readonly id: string;
+  readonly description?: string;
+  readonly anyOf: readonly (readonly string[])[];
+}
+
+export interface TaskCheckpoint {
+  readonly id: string;
+  readonly at: number | "final";
+  /** Optional applicability condition; when unmet the checkpoint is not_applicable. */
+  readonly appliesWhen?: "always" | "failure_observed";
+  readonly required: readonly CheckpointRequirement[];
+}
+
+export interface TaskOracle {
+  readonly testId: string;
+  readonly kind: "script" | "expected_files";
+  readonly script?: string;
+}
+
+export interface TaskScoring {
+  readonly taskId: string;
+  readonly oracles?: readonly TaskOracle[];
+  readonly checkpoints?: readonly TaskCheckpoint[];
+  readonly expectedFiles?: Readonly<Record<string, string>>;
+}
+
+export interface CheckpointItemResult {
+  readonly id: string;
+  readonly retained: boolean | null;
+  readonly reason?: string;
+}
+
+export interface CheckpointResult {
+  readonly checkpointId: string;
+  readonly step: number;
+  readonly items: readonly CheckpointItemResult[];
+}
+
+export interface TrialScore {
+  readonly trialId: string;
   readonly taskId: string;
   readonly mode: ExperimentMode;
+  readonly iteration: number;
+  readonly executionStatus: ExecutionStatus;
+  readonly wiringStatus: WiringStatus;
+  readonly efficacyStatus: EfficacyStatus;
+  readonly failureReason?: string;
+  readonly startedAt: string;
+  readonly finishedAt: string;
+  readonly wallMs: number;
   readonly completed: boolean;
   readonly testPassed: boolean;
-  readonly informationRetained: boolean;
-  readonly policyViolations: readonly string[];
+  readonly constraintPassed: boolean;
+  readonly tests: Readonly<Record<string, "passed" | "failed" | "not_run">>;
+  readonly actorTests: readonly {
+    readonly testId: string;
+    readonly step: number;
+    readonly passed: boolean;
+  }[];
+  readonly checkpoints: readonly CheckpointResult[];
   readonly rereads: number;
   readonly retries: number;
-  readonly unavailable?: string;
+  readonly appliedExtractive: number;
+  readonly appliedGenerated: number;
+  readonly activeMemoryItems: number;
+}
+
+export interface SkippedTrial {
+  readonly trialId: string;
+  readonly taskId: string;
+  readonly mode: ExperimentMode;
+  readonly iteration: number;
+  readonly reason: "not_run_global_budget";
+}
+
+export interface ModeMetrics {
+  readonly uniqueCandidates: number;
+  readonly decisionCount: number;
+  readonly appliedExtractive: number;
+  readonly appliedGenerated: number;
+  readonly sentCalls: Readonly<Record<"actor" | "jev" | "repair" | "update", number>>;
+  readonly sentBytes: number;
+  readonly usage: {
+    readonly inputTokens: number | null;
+    readonly outputTokens: number | null;
+    readonly cacheReadTokens: number | null;
+    readonly cacheWriteTokens: number | null;
+    readonly coverage: number;
+  };
+  readonly wallMs: number;
+  readonly contextBytes: number;
 }
 
 export interface ExperimentManifest {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
+  readonly runId: string;
+  readonly status: ManifestStatus;
   readonly head: string | null;
   readonly inputHash: string;
   readonly config: HybridConfig;
@@ -326,19 +487,26 @@ export interface ExperimentManifest {
   readonly sdkVersion: string;
   readonly promptVersion: string;
   readonly startedAt: string;
+  readonly finishedAt?: string;
+  readonly error?: string;
   readonly privacy: { readonly recordContextText: boolean };
 }
 
 export interface ExperimentSummary {
+  readonly schemaVersion: 2;
+  readonly runId: string;
   readonly evaluation: EvaluationKind;
+  readonly provider: ProviderMode;
   readonly modes: readonly ExperimentMode[];
-  readonly calls: number;
-  readonly scores: readonly RunScore[];
-  readonly retainedCandidates: number;
-  readonly generatedItems: number;
-  readonly repairCalls: number;
-  readonly totalContextBytes: Readonly<Record<ExperimentMode, number>>;
-  readonly judgement: "promising" | "no_benefit_observed" | "insufficient_evidence";
+  readonly efficacyStatus: EfficacyStatus;
+  readonly wiring: {
+    readonly passed: number;
+    readonly failed: number;
+    readonly notEvaluated: number;
+  };
+  readonly scores: readonly TrialScore[];
+  readonly skippedTrials: readonly SkippedTrial[];
+  readonly metrics: Readonly<Record<ExperimentMode, ModeMetrics>>;
   readonly limitations: readonly string[];
 }
 
@@ -365,53 +533,261 @@ export function isExperimentMode(value: unknown): value is ExperimentMode {
   return value === "history" || value === "llm" || value === "rules" || value === "jev";
 }
 
+const PROVIDER_MODES = new Set(["fake", "recorded", "live"]);
+const EVALUATIONS = new Set(["trace_audit", "closed_loop"]);
+const PROVIDER_KEYS = new Set([
+  "mode",
+  "jevModel",
+  "actorModel",
+  "repairModel",
+  "updateModel",
+  "maxRequests",
+  "trialMaxRequests",
+  "timeoutMs",
+  "executionIsolation",
+]);
+const BUDGET_KEYS = new Set([
+  "memoryBytes",
+  "factsBytes",
+  "latestObservationBytes",
+  "requestBytes",
+  "maxQuestions",
+  "maxRepairCalls",
+  "maxActions",
+]);
+const CONFIG_KEYS = new Set([
+  "schemaVersion",
+  "evaluation",
+  "provider",
+  "budgets",
+  "modes",
+  "seed",
+  "iterations",
+  "recordContextText",
+  "candidateMaxBytes",
+  "taskRoot",
+]);
+
 export function parseHybridConfig(value: unknown): HybridConfig {
-  if (!value || typeof value !== "object") throw new Error("Invalid hybrid-state config");
-  const raw = value as Record<string, unknown>;
-  if (raw.schemaVersion !== 1) throw new Error("Unsupported hybrid-state config version");
-  if (raw.evaluation !== "trace_audit" && raw.evaluation !== "closed_loop")
+  const raw = object(value, "config");
+  unknownKeys(raw, CONFIG_KEYS, "config");
+  if (raw.schemaVersion !== 2)
+    throw new Error("Unsupported hybrid-state config version (expected 2)");
+  if (typeof raw.evaluation !== "string" || !EVALUATIONS.has(raw.evaluation))
     throw new Error("Invalid hybrid-state evaluation");
   const provider = object(raw.provider, "provider");
+  unknownKeys(provider, PROVIDER_KEYS, "provider");
   const budgets = object(raw.budgets, "budgets");
-  const modes = Array.isArray(raw.modes) ? raw.modes.filter(isExperimentMode) : [];
-  if (!modes.length || modes.length !== (Array.isArray(raw.modes) ? raw.modes.length : 0))
-    throw new Error("Config modes must contain supported modes");
-  const numberField = (obj: Record<string, unknown>, key: string, min: number) => {
+  unknownKeys(budgets, BUDGET_KEYS, "budgets");
+  if (!Array.isArray(raw.modes) || !raw.modes.length || !raw.modes.every(isExperimentMode))
+    throw new Error("Config modes must be a non-empty list of supported modes");
+  if (new Set(raw.modes).size !== raw.modes.length)
+    throw new Error("Config modes must not contain duplicates");
+  const providerMode = provider.mode;
+  if (typeof providerMode !== "string" || !PROVIDER_MODES.has(providerMode))
+    throw new Error("Invalid provider mode");
+  const model = (key: "jevModel" | "actorModel" | "repairModel" | "updateModel") => {
+    const value = provider[key];
+    if (value === undefined) return undefined;
+    if (typeof value !== "string" || !value.trim())
+      throw new Error(`Invalid provider.${key}: model IDs must be non-empty`);
+    return value;
+  };
+  const models = {
+    jevModel: model("jevModel"),
+    actorModel: model("actorModel"),
+    repairModel: model("repairModel"),
+    updateModel: model("updateModel"),
+  };
+  if (providerMode === "live") {
+    const needsActor = raw.evaluation === "closed_loop";
+    const needsJev = (raw.modes as ExperimentMode[]).includes("jev");
+    const needsUpdate = raw.evaluation === "trace_audit" && raw.modes.includes("llm");
+    if (needsActor && !models.actorModel)
+      throw new Error("Live closed_loop config requires provider.actorModel");
+    if (needsJev && !models.jevModel)
+      throw new Error("Live config with the jev mode requires provider.jevModel");
+    if (needsUpdate && !models.updateModel && !models.actorModel)
+      throw new Error("Live audit with the llm mode requires provider.updateModel or actorModel");
+    if (
+      !needsJev &&
+      models.jevModel &&
+      !(raw.modes as ExperimentMode[]).includes("jev") &&
+      providerMode === "live"
+    ) {
+      // An unused Jev model is permitted but must never be instantiated silently.
+    }
+  }
+  const integer = (obj: Record<string, unknown>, key: string, min: number) => {
     const number = obj[key];
-    if (typeof number !== "number" || !Number.isFinite(number) || number < min)
-      throw new Error(`Invalid config ${key}`);
+    if (typeof number !== "number" || !Number.isInteger(number) || number < min)
+      throw new Error(`Invalid config ${key}: expected an integer >= ${min}`);
     return number;
   };
-  const providerMode = provider.mode;
-  if (providerMode !== "fake" && providerMode !== "recorded" && providerMode !== "live")
-    throw new Error("Invalid provider mode");
-  if (providerMode === "live" && (!provider.actorModel || !provider.jevModel))
-    throw new Error("Live config requires actorModel and jevModel");
+  const maxRequests = integer(provider, "maxRequests", 1);
+  const trialMaxRequests =
+    provider.trialMaxRequests === undefined
+      ? maxRequests
+      : integer(provider, "trialMaxRequests", 1);
+  if (trialMaxRequests > maxRequests)
+    throw new Error("provider.trialMaxRequests must not exceed provider.maxRequests");
   return {
-    schemaVersion: 1,
-    evaluation: raw.evaluation,
+    schemaVersion: 2,
+    evaluation: raw.evaluation as EvaluationKind,
     provider: {
-      mode: providerMode,
-      ...(typeof provider.jevModel === "string" ? { jevModel: provider.jevModel } : {}),
-      ...(typeof provider.actorModel === "string" ? { actorModel: provider.actorModel } : {}),
-      ...(typeof provider.repairModel === "string" ? { repairModel: provider.repairModel } : {}),
-      maxRequests: numberField(provider, "maxRequests", 1),
-      timeoutMs: numberField(provider, "timeoutMs", 1),
+      mode: providerMode as ProviderMode,
+      ...(models.jevModel ? { jevModel: models.jevModel } : {}),
+      ...(models.actorModel ? { actorModel: models.actorModel } : {}),
+      ...(models.repairModel ? { repairModel: models.repairModel } : {}),
+      ...(models.updateModel ? { updateModel: models.updateModel } : {}),
+      maxRequests,
+      trialMaxRequests,
+      timeoutMs: integer(provider, "timeoutMs", 1),
+      ...(provider.executionIsolation === "required"
+        ? { executionIsolation: "required" as const }
+        : provider.executionIsolation === undefined
+          ? {}
+          : (() => {
+              throw new Error("Invalid provider.executionIsolation");
+            })()),
     },
     budgets: {
-      memoryBytes: numberField(budgets, "memoryBytes", 1),
-      factsBytes: numberField(budgets, "factsBytes", 1),
-      latestObservationBytes: numberField(budgets, "latestObservationBytes", 1),
-      requestBytes: numberField(budgets, "requestBytes", 1),
-      maxQuestions: numberField(budgets, "maxQuestions", 1),
-      maxRepairCalls: numberField(budgets, "maxRepairCalls", 0),
-      maxActions: numberField(budgets, "maxActions", 1),
+      memoryBytes: integer(budgets, "memoryBytes", 1),
+      factsBytes: integer(budgets, "factsBytes", 1),
+      latestObservationBytes: integer(budgets, "latestObservationBytes", 1),
+      requestBytes: integer(budgets, "requestBytes", 1),
+      maxQuestions: integer(budgets, "maxQuestions", 1),
+      maxRepairCalls: integer(budgets, "maxRepairCalls", 0),
+      maxActions: integer(budgets, "maxActions", 1),
     },
-    modes: [...modes],
-    seed: numberField(raw, "seed", 0),
+    modes: [...(raw.modes as ExperimentMode[])],
+    seed: integer(raw, "seed", 0),
+    iterations: raw.iterations === undefined ? 1 : integer(raw, "iterations", 1),
     recordContextText: raw.recordContextText === true,
-    candidateMaxBytes: numberField(raw, "candidateMaxBytes", 64),
+    candidateMaxBytes: integer(raw, "candidateMaxBytes", 64),
     ...(typeof raw.taskRoot === "string" ? { taskRoot: raw.taskRoot } : {}),
+  };
+}
+
+export function parseHybridTask(value: unknown, file: string): HybridTask {
+  const raw = object(value, `task ${file}`);
+  if (typeof raw.id !== "string" || !raw.id.trim()) throw new Error(`Invalid task id in ${file}`);
+  if (typeof raw.instruction !== "string" || !raw.instruction.trim())
+    throw new Error(`Invalid task instruction in ${file}`);
+  const files = object(raw.files, `task ${file} files`);
+  for (const [path, content] of Object.entries(files))
+    if (typeof content !== "string") throw new Error(`Invalid file ${path} in ${file}`);
+  const allowedTests = raw.allowedTests ?? raw.tests;
+  if (!Array.isArray(allowedTests) || allowedTests.some((test) => typeof test !== "string"))
+    throw new Error(`Invalid allowedTests in ${file}`);
+  const injections = raw.injections ?? [];
+  if (!Array.isArray(injections)) throw new Error(`Invalid injections in ${file}`);
+  for (const injection of injections) {
+    const record = object(injection, `injection in ${file}`);
+    if (
+      !Number.isInteger(record.step) ||
+      (record.step as number) < 0 ||
+      typeof record.text !== "string" ||
+      !record.text.trim()
+    )
+      throw new Error(`Invalid injection in ${file}`);
+  }
+  const steps = raw.steps === undefined ? undefined : raw.steps;
+  if (steps !== undefined && !Array.isArray(steps)) throw new Error(`Invalid steps in ${file}`);
+  const expectedFiles =
+    raw.expectedFiles === undefined ? undefined : object(raw.expectedFiles, "expectedFiles");
+  if (expectedFiles)
+    for (const content of Object.values(expectedFiles))
+      if (typeof content !== "string") throw new Error(`Invalid expectedFiles in ${file}`);
+  return {
+    id: raw.id,
+    instruction: raw.instruction,
+    files: files as Record<string, string>,
+    allowedTests: [...(allowedTests as string[])],
+    injections: injections.map((injection) => ({
+      step: (injection as Record<string, unknown>).step as number,
+      text: (injection as Record<string, unknown>).text as string,
+    })),
+    ...(expectedFiles ? { expectedFiles: expectedFiles as Record<string, string> } : {}),
+    ...(steps ? { steps: steps as TaskStep[] } : {}),
+  };
+}
+
+export function parseTaskScoring(value: unknown, file: string): TaskScoring {
+  const raw = object(value, `scoring ${file}`);
+  if (typeof raw.taskId !== "string" || !raw.taskId.trim())
+    throw new Error(`Invalid taskId in ${file}`);
+  const oracles = raw.oracles === undefined ? [] : raw.oracles;
+  if (!Array.isArray(oracles)) throw new Error(`Invalid oracles in ${file}`);
+  const parsedOracles = oracles.map((oracle) => {
+    const record = object(oracle, `oracle in ${file}`);
+    if (typeof record.testId !== "string" || !record.testId.trim())
+      throw new Error(`Invalid oracle testId in ${file}`);
+    if (record.kind === "script") {
+      if (typeof record.script !== "string" || !record.script.trim())
+        throw new Error(`Script oracle ${record.testId} in ${file} needs a script`);
+      return { testId: record.testId, kind: "script" as const, script: record.script };
+    }
+    if (record.kind === "expected_files")
+      return { testId: record.testId, kind: "expected_files" as const };
+    throw new Error(`Invalid oracle kind in ${file}`);
+  });
+  const checkpoints = raw.checkpoints === undefined ? [] : raw.checkpoints;
+  if (!Array.isArray(checkpoints)) throw new Error(`Invalid checkpoints in ${file}`);
+  const parsedCheckpoints = checkpoints.map((checkpoint) => {
+    const record = object(checkpoint, `checkpoint in ${file}`);
+    if (typeof record.id !== "string" || !record.id.trim())
+      throw new Error(`Invalid checkpoint id in ${file}`);
+    if (!(record.at === "final" || (Number.isInteger(record.at) && (record.at as number) >= 0)))
+      throw new Error(`Invalid checkpoint position in ${file}`);
+    const required = record.required;
+    if (!Array.isArray(required)) throw new Error(`Invalid required in ${file}`);
+    const items = required.map((item) => {
+      const entry = object(item, `required item in ${file}`);
+      if (typeof entry.id !== "string" || !entry.id.trim())
+        throw new Error(`Invalid required item id in ${file}`);
+      if (
+        !Array.isArray(entry.anyOf) ||
+        !entry.anyOf.length ||
+        !entry.anyOf.every(
+          (group) =>
+            Array.isArray(group) &&
+            group.length > 0 &&
+            group.every((phrase) => typeof phrase === "string" && phrase.trim()),
+        )
+      )
+        throw new Error(`Invalid anyOf for required item ${entry.id} in ${file}`);
+      return {
+        id: entry.id,
+        ...(typeof entry.description === "string" ? { description: entry.description } : {}),
+        anyOf: entry.anyOf.map((group) => [...(group as string[])]),
+      };
+    });
+    if (
+      record.appliesWhen !== undefined &&
+      record.appliesWhen !== "always" &&
+      record.appliesWhen !== "failure_observed"
+    )
+      throw new Error(`Invalid appliesWhen in ${file}`);
+    return {
+      id: record.id,
+      at: record.at as number | "final",
+      ...(typeof record.appliesWhen === "string"
+        ? { appliesWhen: record.appliesWhen as "always" | "failure_observed" }
+        : {}),
+      required: items,
+    };
+  });
+  const expectedFiles =
+    raw.expectedFiles === undefined ? undefined : object(raw.expectedFiles, "expectedFiles");
+  if (expectedFiles)
+    for (const content of Object.values(expectedFiles))
+      if (typeof content !== "string") throw new Error(`Invalid expectedFiles in ${file}`);
+  return {
+    taskId: raw.taskId,
+    oracles: parsedOracles,
+    checkpoints: parsedCheckpoints,
+    ...(expectedFiles ? { expectedFiles: expectedFiles as Record<string, string> } : {}),
   };
 }
 
@@ -419,4 +795,9 @@ function object(value: unknown, name: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error(`Invalid ${name}`);
   return value as Record<string, unknown>;
+}
+
+function unknownKeys(raw: Record<string, unknown>, allowed: ReadonlySet<string>, name: string) {
+  for (const key of Object.keys(raw))
+    if (!allowed.has(key)) throw new Error(`Unknown ${name} key: ${key}`);
 }

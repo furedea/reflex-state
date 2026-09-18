@@ -1,13 +1,13 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "evaluation": "closed_loop",
   "provider": {
     "mode": "live",
-    "jevModel": "typesafe/jev-latest",
     "actorModel": "anthropic/claude-sonnet-4-5",
-    "repairModel": "anthropic/claude-sonnet-4-5",
-    "maxRequests": 24,
-    "timeoutMs": 30000
+    "maxRequests": 64,
+    "trialMaxRequests": 32,
+    "timeoutMs": 30000,
+    "executionIsolation": "required"
   },
   "budgets": {
     "memoryBytes": 8192,
@@ -15,11 +15,12 @@
     "latestObservationBytes": 8192,
     "requestBytes": 24000,
     "maxQuestions": 8,
-    "maxRepairCalls": 1,
+    "maxRepairCalls": 0,
     "maxActions": 8
   },
-  "modes": ["history", "llm", "rules", "jev"],
+  "modes": ["history", "llm"],
   "seed": 17,
+  "iterations": 1,
   "recordContextText": false,
   "candidateMaxBytes": 4096,
   "taskRoot": "experiments/hybrid-state/tasks"

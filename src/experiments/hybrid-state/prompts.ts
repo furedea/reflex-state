@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import type {
   ActorRequest,
   Candidate,
+  ExperimentMode,
   FactsView,
-  InputBundle,
   JevQuestion,
   JevRequest,
   MemoryItem,
@@ -14,34 +14,47 @@ import type {
 } from "./types.js";
 import { PROMPT_VERSION } from "./types.js";
 
+export interface JevQuestionPlan {
+  readonly questions: readonly JevQuestion[];
+  readonly unasked: readonly Candidate[];
+}
+
 export function buildJevQuestions(
   candidates: readonly Candidate[],
   memory: WorkMemory,
   maxQuestions: number,
-): JevQuestion[] {
+): JevQuestionPlan {
   const known = new Set(
     Object.values(memory)
       .flat()
       .map((item) => item.text),
   );
-  return candidates
-    .filter((candidate) => !known.has(candidate.text))
-    .slice(0, maxQuestions)
-    .map((candidate, index) => ({
-      id: `candidate-selection-${index + 1}`,
+  const fresh = candidates.filter((candidate) => !known.has(candidate.text));
+  const asked = fresh.slice(0, maxQuestions);
+  const unasked = fresh.slice(maxQuestions);
+  return {
+    questions: asked.map((candidate, index) => ({
+      id: `candidate-selection-${index + 1}-${candidate.id}`,
       kind: "choice" as const,
       prompt: `Choose the candidate's role in the current work. Candidate ${candidate.id} is shown with its source and trust: ${candidate.text}`,
       options: {
         [`keep-${candidate.id}`]: "keep this existing candidate in working memory",
         none: "do not select it yet",
         unknown: "insufficient evidence to decide",
+        drop: "the candidate is not useful for the current goal",
       },
       candidateIds: [candidate.id],
       evidence: candidate.sourceIds,
-    }));
+    })),
+    unasked,
+  };
 }
 
-export function buildJevRequest(input: UpdateInput, questions: readonly JevQuestion[]): JevRequest {
+export function buildJevRequest(
+  input: UpdateInput,
+  questions: readonly JevQuestion[],
+  model: string,
+): JevRequest {
   return {
     questions,
     state: JSON.stringify({
@@ -53,7 +66,7 @@ export function buildJevRequest(input: UpdateInput, questions: readonly JevQuest
         ),
       ),
     }),
-    model: "jev-latest",
+    model,
     promptVersion: promptHash("jev", JSON.stringify(questions)),
   };
 }
@@ -73,40 +86,79 @@ export function buildRepairRequest(
   };
 }
 
-export function buildActorRequest(
-  mode: ActorRequest["mode"],
-  taskId: string,
-  instruction: string,
-  input: InputBundle,
-  model: string,
-): ActorRequest {
-  return {
-    mode,
-    taskId,
-    instruction,
-    input,
-    allowedTools: ["read", "write", "edit", "test", "finish"],
-    model,
-    promptVersion: promptHash("actor", input.instruction),
-  };
+const ACTION_CONTRACT = [
+  '"action" is one of:',
+  '  {"tool":"read","path":"<workspace path>"}',
+  '  {"tool":"write","path":"<workspace path>","content":"<complete new file content>"}',
+  '  {"tool":"edit","path":"<workspace path>","old":"<exact existing text>","new":"<replacement text>"}',
+  '  {"tool":"test","command":"<one of the allowed test ids>"}',
+  '  {"tool":"finish"}',
+].join("\n");
+
+const PATCH_CONTRACT = [
+  '"statePatch" is an array of memory operations (an empty array is valid):',
+  '  {"operation":"add","kind":"<constraints|decisions|findings|attempts|open_questions>","text":"...","sourceIds":["<source id>"],"origin":"extracted|generated"}',
+  '  {"operation":"replace","itemId":"<existing memory id>","kind":"...","text":"...","sourceIds":["..."],"origin":"extracted|generated"}',
+  'sourceIds must cite ids from the latest observation, existing memory items, or the string "self" for this response\'s visible text.',
+  "An extracted operation's text must equal the cited source text. A generated operation records a judgment; distinguish evidence from inference and never fabricate observations.",
+  "The patch reflects the latest observation and your current judgment. Do not record the action's result before it happens.",
+].join("\n");
+
+export function actorSystemPrompt(mode: ExperimentMode): string {
+  const shape =
+    mode === "llm"
+      ? 'Return one JSON object: {"action": ..., "statePatch": [...], "text"?: "visible explanation"}'
+      : 'Return one JSON object: {"action": ..., "text"?: "visible explanation"}';
+  const lines = [
+    "You are the actor in a controlled coding experiment. Return JSON only, no markdown fences.",
+    shape,
+    ACTION_CONTRACT,
+    "Use only the allowed tools, workspace paths, and test ids.",
+    '"text" is an optional visible explanation; it must not contain the JSON action or patch.',
+  ];
+  if (mode === "llm") lines.push(PATCH_CONTRACT);
+  return lines.join("\n");
 }
 
 export function repairSystemPrompt(): string {
   return [
-    "Return JSON only.",
+    'Return JSON only: {"operations": [<memory operations>]}.',
     "Create only add or replace operations backed by sourceIds in the supplied observations.",
     "Never change facts, verification, or unresolved blockers.",
-    "Do not invent missing text.",
-  ].join(" ");
+    "Distinguish evidence from inference; do not invent missing text.",
+  ].join("\n");
 }
 
-export function actorSystemPrompt(mode: ActorRequest["mode"]): string {
+export function updateSystemPrompt(): string {
   return [
-    "Return one JSON object with action and optional statePatch.",
-    "Use only the allowed tools and paths inside the experiment workspace.",
-    "For statePatch, use existing sourceIds only; never invent a conclusion.",
-    `Comparison condition: ${mode}.`,
-  ].join(" ");
+    'Return JSON only: {"operations": [<memory operations>]}.',
+    "Update the supplied working memory for the latest observation using add or replace operations.",
+    "Cite sourceIds from the latest observation or existing memory; extracted text must equal the cited source.",
+    "You may record grounded conclusions as generated operations; distinguish evidence from inference.",
+    "Never change facts, verification, or unresolved blockers.",
+  ].join("\n");
+}
+
+export function buildActorRequest(options: {
+  readonly mode: ExperimentMode;
+  readonly taskId: string;
+  readonly trialId: string;
+  readonly step: number;
+  readonly userText: string;
+  readonly allowedTests: readonly string[];
+  readonly model: string;
+}): ActorRequest {
+  return {
+    mode: options.mode,
+    taskId: options.taskId,
+    trialId: options.trialId,
+    step: options.step,
+    system: actorSystemPrompt(options.mode),
+    user: options.userText,
+    allowedTools: ["read", "write", "edit", "test", "finish"],
+    allowedTests: options.allowedTests,
+    model: options.model,
+  };
 }
 
 export function serializeState(facts: FactsView, memory: WorkMemory): string {
@@ -137,4 +189,11 @@ export function renderItem(item: MemoryItem): string {
 
 export function promptHash(kind: string, text: string): string {
   return `${PROMPT_VERSION}:${kind}:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`;
+}
+
+export function requestBytes(system: string, user: string): number {
+  return Buffer.byteLength(
+    JSON.stringify({ system, messages: [{ role: "user", content: user }] }),
+    "utf8",
+  );
 }

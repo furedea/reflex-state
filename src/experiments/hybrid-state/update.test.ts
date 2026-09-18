@@ -31,6 +31,7 @@ function input(mode: "rules" | "jev") {
   );
   return {
     mode,
+    instruction: "Do not add dependencies.",
     state: {
       version: 2,
       goal: null,
@@ -91,8 +92,7 @@ describe("hybrid updates", () => {
           origin: "generated",
         },
       ],
-      [],
-      1,
+      { candidates: [], observations: [], allowGenerated: true, now: 1 },
     );
     expect(result.ok).toBe(false);
     expect(memory.findings).toHaveLength(0);

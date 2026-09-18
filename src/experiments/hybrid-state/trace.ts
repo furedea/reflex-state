@@ -5,7 +5,7 @@ import { defaultConfig } from "../../core/config.js";
 import { isRecord } from "../../core/serialization.js";
 import type { AgentEvent } from "../../core/types.js";
 import { PiEventNormalizer } from "../../pi/normalization.js";
-import type { Candidate, TraceData, TraceMessage } from "./types.js";
+import type { Candidate, ObservationGroup, TraceData, TraceMessage } from "./types.js";
 import type { MemoryKind, SourceTrust } from "./types.js";
 
 export interface TraceReadOptions {
@@ -69,7 +69,6 @@ export function generateCandidates(
 ): Candidate[] {
   const maxBytes = options.maxBytes ?? 4096;
   const candidates: Candidate[] = [];
-  let ordinal = 0;
   for (const message of messages) {
     if (!message.text.trim()) continue;
     const units = splitVisibleUnits(message.text);
@@ -78,7 +77,7 @@ export function generateCandidates(
       const truncated = Buffer.byteLength(text) > maxBytes;
       const category = classify(message);
       const candidate: Candidate = {
-        id: `candidate-${++ordinal}`,
+        id: candidateId(message, unit.start, unit.end, text),
         category,
         sourceId: message.sourceId,
         sourceIds: [message.sourceId],
@@ -91,12 +90,31 @@ export function generateCandidates(
         sourceHash: hash(message.text),
         observedAt: options.observedAt ?? message.sequence,
         truncated,
-        contextComplete: !truncated,
+        contextComplete: !truncated && !message.truncated,
       };
       candidates.push(candidate);
     }
   }
   return candidates;
+}
+
+/**
+ * The observation group for the next actor call: every message recorded since
+ * `fromIndex`. Tool call/result pairs and injected user instructions are kept
+ * together because the runner only advances the index between actor calls.
+ */
+export function latestGroup(history: readonly TraceMessage[], fromIndex = 0): ObservationGroup {
+  return { messages: history.slice(fromIndex) };
+}
+
+export function candidateId(
+  message: TraceMessage,
+  start: number,
+  end: number,
+  text: string,
+): string {
+  const digest = hash(`${message.id}:${start}:${end}:${text}`).slice(0, 12);
+  return `cand-${digest}`;
 }
 
 export function hash(value: string): string {
@@ -281,14 +299,10 @@ function trustFor(message: TraceMessage): SourceTrust {
   return "unknown";
 }
 
-function deriveEvents(messages: readonly TraceMessage[]): AgentEvent[] {
-  const normalizer = new PiEventNormalizer({
-    eventCount: 0,
-    turnIndex: 0,
-    config: defaultConfig(),
-    now: () => 0,
-    cwd: "/experiment",
-  });
+export function eventsForMessages(
+  messages: readonly TraceMessage[],
+  normalizer: PiEventNormalizer,
+): AgentEvent[] {
   const events: AgentEvent[] = [];
   for (const message of messages) {
     if (message.role === "user") events.push(normalizer.prompt(message.text));
@@ -315,6 +329,19 @@ function deriveEvents(messages: readonly TraceMessage[]): AgentEvent[] {
       );
   }
   return events;
+}
+
+function deriveEvents(messages: readonly TraceMessage[]): AgentEvent[] {
+  return eventsForMessages(
+    messages,
+    new PiEventNormalizer({
+      eventCount: 0,
+      turnIndex: 0,
+      config: defaultConfig(),
+      now: () => 0,
+      cwd: "/experiment",
+    }),
+  );
 }
 
 function parseInput(text: string): Record<string, unknown> {
