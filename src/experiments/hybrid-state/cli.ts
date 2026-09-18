@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
@@ -15,7 +15,13 @@ import {
   readRecordedProviders,
   type ProviderSet,
 } from "./providers.js";
-import { runAudit, runClosedLoop, type ExperimentRun, type RunContext } from "./runner.js";
+import {
+  PersistenceError,
+  runAudit,
+  runClosedLoop,
+  type ExperimentRun,
+  type RunRecorder,
+} from "./runner.js";
 import { checkIsolation } from "./task_environment.js";
 import { parseTraceEntries } from "./trace.js";
 import type {
@@ -26,7 +32,13 @@ import type {
   TaskScoring,
   TraceData,
 } from "./types.js";
-import { parseHybridConfig, parseHybridTask, parseTaskScoring } from "./types.js";
+import {
+  HYBRID_SCHEMA_VERSION,
+  parseHybridConfig,
+  parseHybridTask,
+  parseTaskScoring,
+  PROMPT_VERSION,
+} from "./types.js";
 
 interface CliOptions {
   readonly config?: string;
@@ -57,10 +69,7 @@ export class ResultWriter {
   }
 
   async writeManifest(manifest: ExperimentManifest): Promise<void> {
-    await writeFile(
-      join(this.directory, "manifest.json"),
-      JSON.stringify(manifest, null, 2) + "\n",
-    );
+    await this.writeAtomic("manifest.json", JSON.stringify(manifest, null, 2) + "\n");
   }
 
   append(record: object, file: string): Promise<void> {
@@ -68,11 +77,19 @@ export class ResultWriter {
   }
 
   async writeSummary(summary: unknown): Promise<void> {
-    await writeFile(join(this.directory, "summary.json"), JSON.stringify(summary, null, 2) + "\n");
+    await this.writeAtomic("summary.json", JSON.stringify(summary, null, 2) + "\n");
   }
 
   async writeReport(text: string): Promise<void> {
-    await writeFile(join(this.directory, "report.md"), text);
+    await this.writeAtomic("report.md", text);
+  }
+
+  /** Same-directory tmp + rename so a torn write never leaves a partial file. */
+  private async writeAtomic(file: string, content: string): Promise<void> {
+    const target = join(this.directory, file);
+    const temp = join(this.directory, `.${file}.tmp`);
+    await writeFile(temp, content);
+    await rename(temp, target);
   }
 }
 
@@ -103,12 +120,21 @@ async function main(): Promise<void> {
 
 async function execute(command: "audit" | "run", values: CliOptions): Promise<void> {
   const config = await loadHybridConfig(values.config, command, values.live);
+  // Preflight completes before the output directory is reserved or any record
+  // is written, so a rejected run leaves no partial result.
   enforceLivePolicy(config, values);
-  if (config.provider.mode === "live" && config.provider.executionIsolation === "required") {
+  if (config.provider.mode === "live") {
     const isolation = await checkIsolation();
     if (!isolation.available)
       throw new Error(
-        `Live code execution requires a sandbox, but none is available (${isolation.detail})`,
+        `live_ready=false: ${isolation.detail}${
+          isolation.checks
+            ? ` (${isolation.checks
+                .filter((check) => !check.passed)
+                .map((check) => check.name)
+                .join(", ")})`
+            : ""
+        }`,
       );
   }
   const writer = await ResultWriter.reserve(values.out);
@@ -120,8 +146,6 @@ async function execute(command: "audit" | "run", values: CliOptions): Promise<vo
       const labels = values.labels
         ? await loadLabels(values.labels)
         : await loadLabels("experiments/hybrid-state/labels/basic.json").catch(() => undefined);
-      if (config.provider.mode === "live" && trace.format !== "synthetic")
-        throw new Error("Live audit requires an approved synthetic fixture");
       const providers = await providerSet(config, values);
       manifest = startManifest(config, runId, "trace_audit", trace.sourceHash);
       await writer.writeManifest(manifest);
@@ -138,6 +162,7 @@ async function execute(command: "audit" | "run", values: CliOptions): Promise<vo
       const taskRoot = config.taskRoot ?? "experiments/hybrid-state/tasks";
       const tasks = await loadTasks(taskRoot);
       const scoring = await loadScoring(taskRoot, tasks);
+      validateScoredTasks(tasks, scoring);
       const providers = await providerSet(config, values, tasks);
       manifest = startManifest(config, runId, "closed_loop", taskInputHash(tasks));
       await writer.writeManifest(manifest);
@@ -158,6 +183,7 @@ async function execute(command: "audit" | "run", values: CliOptions): Promise<vo
         status: "failed",
         finishedAt: new Date().toISOString(),
         error: error instanceof Error ? error.message : "run_failed",
+        failedStage: error instanceof PersistenceError ? "recording" : "execution",
       };
       await writer.writeManifest(failed).catch(() => undefined);
     }
@@ -165,28 +191,44 @@ async function execute(command: "audit" | "run", values: CliOptions): Promise<vo
   }
 }
 
+/** Runs end with summary and report persisted before the completed manifest is
+ * finalized; a persistence failure leaves status "failed", never "completed". */
 async function finalize(
   writer: ResultWriter,
   started: ExperimentManifest,
   result: ExperimentRun,
 ): Promise<void> {
+  await writer.writeSummary(result.summary);
+  await writer.writeReport(reportMarkdown(result.summary, result.manifest));
   await writer.writeManifest({
     ...result.manifest,
     status: "completed",
     startedAt: started.startedAt,
     finishedAt: new Date().toISOString(),
   });
-  await writer.writeSummary(result.summary);
-  await writer.writeReport(reportMarkdown(result.summary, result.manifest));
   console.log(`new run executed: ${result.summary.runId}`);
   console.log(JSON.stringify(result.summary, null, 2));
 }
 
-function recorderFor(writer: ResultWriter): NonNullable<RunContext["recorder"]> {
+/** Serialized, awaited writes: a persistence failure is retained and propagated
+ * so the run stops instead of continuing with a torn record set. */
+export function recorderFor(writer: ResultWriter): RunRecorder {
+  let queue: Promise<void> = Promise.resolve();
+  let failure: Error | undefined;
+  const enqueue = (file: string, record: object): Promise<void> => {
+    if (failure) return Promise.reject(failure);
+    const next = queue.then(() => writer.append(record, file));
+    queue = next.catch(() => undefined);
+    return next.catch((error: unknown) => {
+      failure = error instanceof Error ? error : new Error("record_write_failed");
+      throw failure;
+    });
+  };
   return {
-    call: (record) => void writer.append(record, "calls.jsonl"),
-    context: (record) => void writer.append(record, "contexts.jsonl"),
-    update: (record) => void writer.append(record, "updates.jsonl"),
+    callStart: (record) => enqueue("calls.jsonl", record),
+    call: (record) => enqueue("calls.jsonl", record),
+    context: (record) => enqueue("contexts.jsonl", record),
+    update: (record) => enqueue("updates.jsonl", record),
   };
 }
 
@@ -206,18 +248,38 @@ async function report(values: Record<string, string | boolean | undefined>): Pro
     console.log(`existing result (run ${manifest.runId}) is ${manifest.status}; no summary yet`);
     return;
   }
-  const summary: unknown = JSON.parse(await readFile(join(directory, "summary.json"), "utf8"));
+  const summary = parseSummaryForManifest(
+    JSON.parse(await readFile(join(directory, "summary.json"), "utf8")),
+    manifest,
+  );
   console.log(`existing result displayed: run ${manifest.runId} (${manifest.status})`);
   console.log(reportMarkdown(summary, manifest));
 }
 
-function parseManifest(value: unknown): ExperimentManifest {
+/** The summary must belong to the manifest in the same directory; a report
+ * never invents a run and never mixes results across runs. */
+function parseSummaryForManifest(value: unknown, manifest: ExperimentManifest): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("Invalid summary.json");
+  const record = value as Record<string, unknown>;
+  if (record.runId !== manifest.runId)
+    throw new Error(
+      `summary.json runId ${String(record.runId)} does not match manifest runId ${manifest.runId}`,
+    );
+  if (record.schemaVersion !== manifest.schemaVersion)
+    throw new Error(
+      `summary.json schemaVersion ${String(record.schemaVersion)} does not match manifest schemaVersion ${manifest.schemaVersion}`,
+    );
+  return value;
+}
+
+export function parseManifest(value: unknown): ExperimentManifest {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("Invalid manifest.json");
   const record = value as Record<string, unknown>;
   if (typeof record.runId !== "string" || typeof record.status !== "string")
     throw new Error("Invalid manifest.json: missing runId/status");
-  if (record.schemaVersion !== 2)
+  if (record.schemaVersion !== HYBRID_SCHEMA_VERSION)
     console.log("note: legacy result schema; metrics may be untrusted");
   return record as unknown as ExperimentManifest;
 }
@@ -240,11 +302,56 @@ export async function loadHybridConfig(
   return config;
 }
 
-function enforceLivePolicy(config: HybridConfig, values: CliOptions): void {
+const APPROVED_TASK_ROOT = resolve("experiments");
+
+/** Live runs are restricted to the Stage A closed-loop shape: history/llm
+ * modes only, checked-in task fixtures, required isolation, and no session,
+ * case, or recorded inputs that could smuggle unapproved content. */
+export function enforceLivePolicy(config: HybridConfig, values: CliOptions): void {
   if (config.provider.mode !== "live") return;
+  if (values.live !== true) throw new Error("provider.mode=live requires --live");
   if (typeof values.session === "string")
     throw new Error("Live provider does not accept --session inputs");
-  if (values.live !== true) throw new Error("provider.mode=live requires --live");
+  if (typeof values.case === "string")
+    throw new Error("Live provider does not accept --case inputs");
+  if (typeof values.recorded === "string")
+    throw new Error("Live provider does not accept --recorded inputs");
+  if (config.evaluation !== "closed_loop")
+    throw new Error("Live execution is limited to Stage A closed_loop runs");
+  const unsupported = config.modes.filter((mode) => mode !== "history" && mode !== "llm");
+  if (unsupported.length)
+    throw new Error(
+      `Live execution is limited to Stage A modes (history, llm): ${unsupported.join(", ")}`,
+    );
+  if (config.provider.executionIsolation !== "required")
+    throw new Error("Live execution requires provider.executionIsolation=required");
+  if (!config.provider.actorModel)
+    throw new Error("Live execution requires an explicit provider.actorModel");
+  const taskRoot = resolve(config.taskRoot ?? "experiments/hybrid-state/tasks");
+  if (!taskRoot.startsWith(`${APPROVED_TASK_ROOT}/`))
+    throw new Error("Live execution requires checked-in task fixtures under experiments/");
+}
+
+/** When a scoring directory is present, every task must be independently
+ * scored: each allowed test needs an oracle; a missing file or empty oracle
+ * list is a preflight error, not a silent expectedFiles fallback. */
+export function validateScoredTasks(
+  tasks: readonly HybridTask[],
+  scoring: ReadonlyMap<string, TaskScoring>,
+): void {
+  if (!scoring.size) return;
+  for (const task of tasks) {
+    const scored = scoring.get(task.id);
+    if (!scored) throw new Error(`task ${task.id} has no scoring file in the scoring directory`);
+    for (const testId of task.allowedTests) {
+      const oracle = scored.oracles?.find((candidate) => candidate.testId === testId);
+      if (!oracle) throw new Error(`task ${task.id} test ${testId} has no oracle registered`);
+      if (oracle.kind === "script" && !oracle.script?.trim())
+        throw new Error(`task ${task.id} test ${testId} has an empty script oracle`);
+      if (oracle.kind === "expected_files" && !Object.keys(scored.expectedFiles ?? {}).length)
+        throw new Error(`task ${task.id} test ${testId} has an empty expected_files oracle`);
+    }
+  }
 }
 
 async function providerSet(
@@ -311,7 +418,7 @@ async function readJsonLines(path: string): Promise<Record<string, unknown>[]> {
     });
 }
 
-async function loadTasks(root: string): Promise<HybridTask[]> {
+export async function loadTasks(root: string): Promise<HybridTask[]> {
   const files = (await readdir(root)).filter((file) => file.endsWith(".json")).sort();
   const tasks: HybridTask[] = [];
   for (const file of files)
@@ -320,7 +427,7 @@ async function loadTasks(root: string): Promise<HybridTask[]> {
   return tasks;
 }
 
-async function loadScoring(
+export async function loadScoring(
   taskRoot: string,
   tasks: readonly HybridTask[],
 ): Promise<ReadonlyMap<string, TaskScoring>> {
@@ -351,7 +458,7 @@ function startManifest(
   input: string,
 ): ExperimentManifest {
   return {
-    schemaVersion: 2,
+    schemaVersion: HYBRID_SCHEMA_VERSION,
     runId,
     status: "running",
     head: null,
@@ -367,8 +474,13 @@ function startManifest(
       update: config.provider.updateModel ?? null,
     },
     sdkVersion: "@earendil-works/pi-coding-agent@0.83.0",
-    promptVersion: "hybrid-state-prompt-v2",
+    promptVersion: PROMPT_VERSION,
     startedAt: new Date().toISOString(),
+    environment: {
+      node: process.version,
+      platform: process.platform,
+      isolation: config.provider.executionIsolation === "required" ? "sandbox-exec" : "none",
+    },
     privacy: { recordContextText: config.recordContextText },
   };
 }

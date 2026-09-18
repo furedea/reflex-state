@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import type { ReflexStateConfig } from "../../core/config.js";
 import { blockerView } from "../../core/state_view.js";
 import type { HotState } from "../../core/types.js";
-import { buildJevQuestions, buildJevRequest, buildRepairRequest, renderMemory } from "./prompts.js";
+import { renderMemoryProjection } from "./projection.js";
+import { buildJevQuestions, buildJevRequest, buildRepairRequest } from "./prompts.js";
 import type { JevProvider, RepairProvider } from "./providers.js";
 import type {
   Candidate,
@@ -29,30 +30,6 @@ const MEMORY_KINDS = new Set<MemoryKind>([
   "findings",
   "attempts",
   "open_questions",
-]);
-
-const STOPWORDS = new Set([
-  "that",
-  "this",
-  "with",
-  "from",
-  "have",
-  "will",
-  "should",
-  "must",
-  "only",
-  "when",
-  "then",
-  "than",
-  "into",
-  "does",
-  "instead",
-  "rather",
-  "keep",
-  "make",
-  "file",
-  "test",
-  "user",
 ]);
 
 export function factsFromState(
@@ -217,7 +194,11 @@ export async function updateMemory(
     }
   }
   if (repaired || !reasons.length) {
-    const applied = applyOperations(input.memory, proposal.operations, context);
+    const applied = applyOperations(
+      input.memory,
+      proposal.operations,
+      applyContext(input, repaired),
+    );
     if (applied.ok)
       return {
         memory: applied.memory,
@@ -311,7 +292,7 @@ export function needsRepair(
     reasons.push("invalid_update");
   const applied = applyOperations(input.memory, validation.valid, ctx);
   if (applied.ok) {
-    if (Buffer.byteLength(renderMemory(applied.memory)) > memoryBytes)
+    if (Buffer.byteLength(renderMemoryProjection(applied.memory)) > memoryBytes)
       reasons.push("budget_exceeded");
   } else if (!validation.errors.length) reasons.push("invalid_update");
   return [...new Set(reasons)];
@@ -332,6 +313,7 @@ export function applyOperations(
   const next: Record<MemoryKind, MemoryItem[]> = Object.fromEntries(
     Object.entries(memory).map(([kind, items]) => [kind as MemoryKind, [...items]]),
   ) as Record<MemoryKind, MemoryItem[]>;
+  const applied: PatchOperation[] = [];
   for (const operation of validation.valid) {
     const bucket = next[operation.kind];
     const id = operation.itemId ?? memoryId(operation);
@@ -348,10 +330,26 @@ export function applyOperations(
     };
     if (operation.operation === "replace") {
       const index = bucket.findIndex((existing) => existing.id === operation.itemId);
-      bucket[index] = item;
-    } else if (!bucket.some((existing) => existing.text === item.text)) bucket.push(item);
+      if (!sameItem(bucket[index]!, item)) {
+        bucket[index] = item;
+        applied.push(operation);
+      }
+    } else if (!bucket.some((existing) => existing.text === item.text)) {
+      bucket.push(item);
+      applied.push(operation);
+    }
   }
-  return { ok: true, memory: next, applied: validation.valid };
+  return { ok: true, memory: next, applied };
+}
+
+function sameItem(existing: MemoryItem, next: MemoryItem): boolean {
+  return (
+    existing.text === next.text &&
+    existing.origin === next.origin &&
+    existing.trust === next.trust &&
+    existing.sourceIds.length === next.sourceIds.length &&
+    existing.sourceIds.every((id, index) => id === next.sourceIds[index])
+  );
 }
 
 export function validateOperations(
@@ -363,6 +361,9 @@ export function validateOperations(
   const errors: string[] = [];
   const valid: PatchOperation[] = [];
   const candidates = context.candidates;
+  const items = Object.values(memory).flat();
+  const claimedIds = new Set(items.map((item) => item.id));
+  const replacedTargets = new Set<string>();
   for (const [index, operation] of operations.entries()) {
     const fail = (reason: string) => errors.push(`${reason}#${index}`);
     if (!MEMORY_KINDS.has(operation.kind)) {
@@ -399,28 +400,41 @@ export function validateOperations(
       fail("extracted_text_mismatch");
       continue;
     }
+    if (
+      operation.itemId !== undefined &&
+      operation.replaces !== undefined &&
+      operation.itemId !== operation.replaces
+    ) {
+      fail("replace_id_mismatch");
+      continue;
+    }
     const trust = deriveTrust(operation, cited);
     let itemId = operation.itemId;
     let replaces = operation.replaces;
     if (operation.operation === "replace") {
       const targetId = itemId ?? replaces;
-      const target = targetId
-        ? Object.values(memory)
-            .flat()
-            .find((item) => item.id === targetId)
-        : undefined;
+      const target = targetId ? items.find((item) => item.id === targetId) : undefined;
       if (!target) {
         fail("replace_unknown_target");
         continue;
       }
-      if (!relatedText(operation.text, target.text)) {
-        fail("replace_unrelated");
+      if (target.kind !== operation.kind) {
+        fail("replace_kind_mismatch");
         continue;
       }
+      if (target.kind === "constraints" && target.trust === "user") {
+        fail("protected_constraint");
+        continue;
+      }
+      if (replacedTargets.has(target.id)) {
+        fail("replace_duplicate_target");
+        continue;
+      }
+      replacedTargets.add(target.id);
       itemId = target.id;
       replaces = target.id;
     }
-    valid.push({
+    const normalized: PatchOperation = {
       operation: operation.operation,
       ...(itemId ? { itemId } : {}),
       kind: operation.kind,
@@ -429,7 +443,16 @@ export function validateOperations(
       trust,
       origin: operation.origin,
       ...(replaces ? { replaces } : {}),
-    });
+    };
+    if (operation.operation === "add") {
+      const effectiveId = normalized.itemId ?? memoryId(normalized);
+      if (claimedIds.has(effectiveId)) {
+        fail("duplicate_id");
+        continue;
+      }
+      claimedIds.add(effectiveId);
+    }
+    valid.push(normalized);
   }
   return { valid, errors };
 }
@@ -496,14 +519,6 @@ function citedSources(
     .filter((item) => ids.has(item.id) || item.sourceIds.some((id) => ids.has(id)));
   const fromExtra = extraSources.filter((source) => ids.has(source.id));
   return [...fromCandidates, ...fromMemory, ...fromExtra];
-}
-
-function relatedText(next: string, previous: string): boolean {
-  const tokens = (text: string) =>
-    new Set((text.toLowerCase().match(/[a-z]{4,}/g) ?? []).filter((word) => !STOPWORDS.has(word)));
-  const a = tokens(next);
-  const b = tokens(previous);
-  return [...a].some((word) => b.has(word));
 }
 
 async function jevSelection(

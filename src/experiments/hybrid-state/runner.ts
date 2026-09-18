@@ -7,7 +7,7 @@ import { StateEngine } from "../../core/engine.js";
 import { NoopStateUpdater } from "../../core/updater.js";
 import { PiEventNormalizer } from "../../pi/normalization.js";
 import { evaluateAudit, scoreTrial, summarize, type LabelsFile } from "./evaluation.js";
-import { buildProjection, type ProjectedInput } from "./projection.js";
+import { buildProjection, renderMemoryProjection, type ProjectedInput } from "./projection.js";
 import { buildActorRequest } from "./prompts.js";
 import {
   FakeActorProvider,
@@ -27,8 +27,10 @@ import { eventsForMessages, generateCandidates, latestGroup } from "./trace.js";
 import type {
   ActorAction,
   CallRecord,
+  CallStartRecord,
   Candidate,
   ContextRecord,
+  ExperimentEnvironment,
   ExperimentManifest,
   ExperimentMode,
   ExperimentSummary,
@@ -69,9 +71,17 @@ export interface ExperimentRun {
 }
 
 export interface RunRecorder {
-  call(record: CallRecord): void;
-  context(record: ContextRecord): void;
-  update(record: UpdateRecord): void;
+  callStart(record: CallStartRecord): Promise<void>;
+  call(record: CallRecord): Promise<void>;
+  context(record: ContextRecord): Promise<void>;
+  update(record: UpdateRecord): Promise<void>;
+}
+
+export class PersistenceError extends Error {
+  constructor(message: string) {
+    super(`persistence_failed:${message}`);
+    this.name = "PersistenceError";
+  }
 }
 
 export interface RunContext {
@@ -84,6 +94,7 @@ export interface RunContext {
   readonly appliedCounts: Map<ExperimentMode, { extractive: number; generated: number }>;
   readonly budget: RequestBudget;
   readonly trialSent: Map<string, number>;
+  callSeq: number;
   readonly recorder?: RunRecorder;
 }
 
@@ -109,23 +120,43 @@ function newRunContext(runId: string, config: HybridConfig, recorder?: RunRecord
     appliedCounts: new Map(),
     budget: { sent: 0, limit: config.provider.maxRequests },
     trialSent: new Map(),
+    callSeq: 0,
     ...(recorder ? { recorder } : {}),
   };
 }
 
-function pushCall(ctx: RunContext, record: CallRecord): void {
+async function writeRecord(
+  ctx: RunContext,
+  file: string,
+  write: (recorder: RunRecorder) => Promise<void>,
+): Promise<void> {
+  if (!ctx.recorder) return;
+  try {
+    await write(ctx.recorder);
+  } catch (error) {
+    throw new PersistenceError(
+      `${file}: ${error instanceof Error ? error.message : "write_failed"}`,
+    );
+  }
+}
+
+async function pushCall(ctx: RunContext, record: CallRecord): Promise<void> {
   ctx.calls.push(record);
-  ctx.recorder?.call(record);
+  await writeRecord(ctx, "calls.jsonl", (recorder) => recorder.call(record));
 }
 
-function pushContext(ctx: RunContext, record: ContextRecord): void {
+async function pushCallStart(ctx: RunContext, record: CallStartRecord): Promise<void> {
+  await writeRecord(ctx, "calls.jsonl", (recorder) => recorder.callStart(record));
+}
+
+async function pushContext(ctx: RunContext, record: ContextRecord): Promise<void> {
   ctx.contexts.push(record);
-  ctx.recorder?.context(record);
+  await writeRecord(ctx, "contexts.jsonl", (recorder) => recorder.context(record));
 }
 
-function pushUpdate(ctx: RunContext, record: UpdateRecord): void {
+async function pushUpdate(ctx: RunContext, record: UpdateRecord): Promise<void> {
   ctx.updates.push(record);
-  ctx.recorder?.update(record);
+  await writeRecord(ctx, "updates.jsonl", (recorder) => recorder.update(record));
 }
 
 export async function runAudit(options: {
@@ -142,10 +173,10 @@ export async function runAudit(options: {
   const labels = options.labels?.labels ?? [];
   const labelsUsable = options.labels?.sourceHash === options.trace.sourceHash;
   if (options.labels && !labelsUsable)
-    pushUpdate(
+    await pushUpdate(
       ctx,
       auditRecord(ctx, "audit_summary", -1, "-", {
-        warning: "labels_source_hash_mismatch",
+        labels_rejected: "source_hash_mismatch",
         expected: options.trace.sourceHash,
         actual: options.labels.sourceHash,
       }),
@@ -157,16 +188,28 @@ export async function runAudit(options: {
     jev: [],
   };
   const scores: TrialScore[] = [];
-  const history: TraceMessage[] = [];
-  const normalizer = new PiEventNormalizer({
-    eventCount: 0,
-    turnIndex: 0,
-    config: defaultConfig(),
-    cwd: "/experiment",
-  });
+  const skipped: SkippedTrial[] = [];
   for (const mode of options.config.modes) {
-    if (ctx.budget.sent >= ctx.budget.limit) break;
+    if (ctx.budget.sent >= ctx.budget.limit) {
+      skipped.push({
+        trialId: `audit-${mode}`,
+        taskId: "audit",
+        mode,
+        iteration: 0,
+        reason: "not_run_global_budget",
+      });
+      continue;
+    }
     let memory = emptyMemory();
+    let endReason = "completed";
+    // Trial-local state: each mode gets a fresh history, normalizer, engine, and memory.
+    const history: TraceMessage[] = [];
+    const normalizer = new PiEventNormalizer({
+      eventCount: 0,
+      turnIndex: 0,
+      config: defaultConfig(),
+      cwd: "/experiment",
+    });
     const groups = auditGroups(options.trace.messages);
     const engine = new StateEngine({
       cwd: "/experiment",
@@ -195,7 +238,7 @@ export async function runAudit(options: {
           allowedTests: [],
           budgets: options.config.budgets,
         });
-        recordContext(ctx, {
+        await recordContext(ctx, {
           trialId: `audit-${mode}`,
           taskId: "audit",
           mode,
@@ -224,7 +267,7 @@ export async function runAudit(options: {
         );
         countDecisions(ctx, mode, result.decisions.length);
         countApplied(ctx, mode, result.applied);
-        pushUpdate(
+        await pushUpdate(
           ctx,
           auditRecord(ctx, "audit_step", step, mode, {
             candidates: candidates.map((candidate) => candidate.id),
@@ -236,9 +279,14 @@ export async function runAudit(options: {
             ...(result.unavailable ? { unavailable: result.unavailable } : {}),
           }),
         );
+        if (result.unavailable) {
+          endReason = `state_first_unavailable:${result.unavailable}`;
+          break;
+        }
       }
     } catch (error) {
       if (!(error instanceof BudgetExhausted)) throw error;
+      endReason = "not_run_global_budget";
     }
     scores.push(
       scoreTrial({
@@ -248,8 +296,9 @@ export async function runAudit(options: {
         iteration: 0,
         startedAt: new Date().toISOString(),
         finishedAt: new Date().toISOString(),
-        completed: true,
+        completed: endReason === "completed",
         cancelled: false,
+        ...(endReason === "completed" ? {} : { error: endReason }),
         policyViolations: [],
         testResults: {},
         actorTests: [],
@@ -268,14 +317,15 @@ export async function runAudit(options: {
   const allCandidates = generateCandidates(options.trace.messages, {
     maxBytes: options.config.candidateMaxBytes,
   });
-  const audit = labelsUsable ? evaluateAudit(allCandidates, labels, selected) : undefined;
-  pushUpdate(
+  const audit = labelsUsable ? evaluateAudit(allCandidates, labels) : undefined;
+  await pushUpdate(
     ctx,
     auditRecord(ctx, "audit_summary", -1, "-", {
       labelsUsable,
       labelCount: labels.length,
       selected,
-      agreement: audit?.agreement ?? null,
+      distribution: audit?.distribution ?? {},
+      selectionAccuracy: "not_evaluated",
       evaluated: audit?.total ?? 0,
       coverage: audit?.coverage ?? 0,
     }),
@@ -286,13 +336,17 @@ export async function runAudit(options: {
     provider: options.config.provider.mode,
     modes: options.config.modes,
     scores,
-    skipped: [],
+    plannedTrials: options.config.modes.length,
+    skipped,
     calls: ctx.calls,
     contexts: ctx.contexts,
     uniqueCandidates: ctx.uniqueCandidates,
     decisionCounts: ctx.decisionCounts,
     appliedCounts: ctx.appliedCounts,
-    limitations: labelsUsable ? [] : ["audit labels were not evaluated (source hash mismatch)"],
+    environment: experimentEnvironment(options.config),
+    limitations: labelsUsable
+      ? ["audit labels are update-method classifications; selection accuracy is not evaluated"]
+      : ["audit labels were rejected (source hash mismatch); selection is not evaluated"],
   });
   const manifest = await createManifest(
     options.config,
@@ -316,7 +370,10 @@ export async function runClosedLoop(options: {
   const ctx = newRunContext(runId, options.config, options.recorder);
   const scores: TrialScore[] = [];
   const skipped: SkippedTrial[] = [];
-  const trials = planTrials(options.config, options.tasks, options.scoring);
+  const trials = seededOrder(
+    planTrials(options.config, options.tasks, options.scoring),
+    options.config.seed,
+  );
   for (const plan of trials) {
     if (ctx.budget.sent >= ctx.budget.limit) {
       skipped.push({
@@ -343,12 +400,14 @@ export async function runClosedLoop(options: {
     provider: options.config.provider.mode,
     modes: options.config.modes,
     scores,
+    plannedTrials: trials.length,
     skipped,
     calls: ctx.calls,
     contexts: ctx.contexts,
     uniqueCandidates: ctx.uniqueCandidates,
     decisionCounts: ctx.decisionCounts,
     appliedCounts: ctx.appliedCounts,
+    environment: experimentEnvironment(options.config),
   });
   const inputHash = options.tasks.map((task) => JSON.stringify(task)).join("\n");
   const manifest = await createManifest(options.config, inputHash, "closed_loop", runId);
@@ -361,6 +420,23 @@ interface TrialPlan {
   readonly scoring?: TaskScoring;
   readonly mode: ExperimentMode;
   readonly iteration: number;
+}
+
+/** Deterministic trial order derived from config.seed. */
+function seededOrder<T>(items: readonly T[], seed: number): T[] {
+  const result = [...items];
+  let state = seed >>> 0 || 1;
+  const next = () => {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    return state / 0x100000000;
+  };
+  for (let index = result.length - 1; index > 0; index--) {
+    const swap = Math.floor(next() * (index + 1));
+    const temp = result[index]!;
+    result[index] = result[swap]!;
+    result[swap] = temp;
+  }
+  return result;
 }
 
 function planTrials(
@@ -382,6 +458,17 @@ function planTrials(
         });
     }
   return trials;
+}
+
+/** Bounded per-trial set of undecided candidates carried into the next step. */
+const HELD_CANDIDATE_LIMIT = 32;
+
+function mergeCandidates(
+  held: ReadonlyMap<string, Candidate>,
+  fresh: readonly Candidate[],
+): readonly Candidate[] {
+  const freshIds = new Set(fresh.map((candidate) => candidate.id));
+  return [...fresh, ...[...held.values()].filter((candidate) => !freshIds.has(candidate.id))];
 }
 
 function unfinishedTrial(
@@ -461,6 +548,7 @@ async function runTrial(
   let appliedExtractive = 0;
   let appliedGenerated = 0;
   const held: TraceMessage[] = [];
+  const heldCandidates = new Map<string, Candidate>();
   const startedAt = new Date().toISOString();
   let groupStart = 0;
 
@@ -470,7 +558,7 @@ async function runTrial(
       const prompt = normalizer.prompt(message.text);
       await engine.process(prompt);
       history.push({ ...message, id: prompt.id, sourceId: prompt.id, sequence: history.length });
-      pushUpdate(
+      await pushUpdate(
         ctx,
         trialRecord(ctx, trialId, task.id, mode, step, "injection", {
           text: message.text,
@@ -485,6 +573,66 @@ async function runTrial(
       observedAt: step,
     });
     rememberCandidates(ctx, mode, candidates);
+    if (mode === "rules" || mode === "jev") {
+      // Update memory from unprocessed observations and held candidates BEFORE
+      // building the next actor input; the visible response text is captured as
+      // part of the next step's observation group instead.
+      const merged = mergeCandidates(heldCandidates, candidates);
+      const input = {
+        instruction: task.instruction,
+        mode,
+        state: engine.state,
+        facts: factsFromState(engine.state, defaultConfig(), env.verificationFacts()),
+        memory,
+        candidates: merged,
+        observations: group.messages,
+        latest: group.messages,
+        step,
+        now: step,
+      } as const;
+      const result = await updateWithProviders(
+        ctx,
+        input,
+        providers,
+        config,
+        trialId,
+        task.id,
+        step,
+      );
+      memory = result.memory;
+      heldCandidates.clear();
+      for (const candidate of result.held) heldCandidates.set(candidate.id, candidate);
+      countDecisions(ctx, mode, result.decisions.length);
+      countApplied(ctx, mode, result.applied);
+      appliedExtractive += result.applied.filter((op) => op.origin === "extracted").length;
+      appliedGenerated += result.applied.filter((op) => op.origin === "generated").length;
+      await pushUpdate(
+        ctx,
+        trialRecord(ctx, trialId, task.id, mode, step, "update", {
+          candidates: merged.map((candidate) => candidate.id),
+          decisions: result.decisions,
+          applied: result.applied.map(operationView),
+          held: result.held.map((candidate) => candidate.id),
+          repairReasons: result.repairReasons,
+          memoryHash: memoryHash(memory),
+          ...(result.unavailable ? { unavailable: result.unavailable } : {}),
+        }),
+      );
+      if (result.unavailable) {
+        error = `state_first_unavailable:${result.unavailable}`;
+        break;
+      }
+      if (heldCandidates.size > HELD_CANDIDATE_LIMIT) {
+        error = "state_first_unavailable:held_overflow";
+        await pushUpdate(
+          ctx,
+          trialRecord(ctx, trialId, task.id, mode, step, "update", {
+            held_overflow: heldCandidates.size,
+          }),
+        );
+        break;
+      }
+    }
     const facts = factsFromState(engine.state, defaultConfig(), env.verificationFacts());
     const projected = buildProjection({
       mode,
@@ -496,7 +644,7 @@ async function runTrial(
       allowedTests: task.allowedTests,
       budgets: config.budgets,
     });
-    recordContext(ctx, { trialId, taskId: task.id, mode, step, projected, config });
+    await recordContext(ctx, { trialId, taskId: task.id, mode, step, projected, config });
     if (projected.bundle.unavailable) {
       error = `state_first_unavailable:${projected.bundle.unavailable}`;
       break;
@@ -537,11 +685,11 @@ async function runTrial(
         truncated: false,
       });
     if (mode === "llm") {
-      if (response.statePatch === undefined) {
-        error = "actor_state_patch_missing";
-        break;
-      }
-      const patch = response.statePatch.map((operation) => substituteSelf(operation, responseId));
+      // The state patch is optional: an absent or empty patch leaves memory
+      // unchanged; the actor still commits through the same validation path.
+      const patch = (response.statePatch ?? []).map((operation) =>
+        substituteSelf(operation, responseId),
+      );
       const apply = applyOperations(
         memory,
         patch,
@@ -551,11 +699,26 @@ async function runTrial(
         error = `invalid_update:${apply.reason}`;
         break;
       }
+      // The patch is tentative until the final memory render fits the shared
+      // projection budget; an over-budget patch is never committed and the
+      // action is never executed.
+      if (Buffer.byteLength(renderMemoryProjection(apply.memory)) > config.budgets.memoryBytes) {
+        await pushUpdate(
+          ctx,
+          trialRecord(ctx, trialId, task.id, mode, step, "update", {
+            source: "actor_patch",
+            rejected: "memory_exceeds_budget",
+            memoryHash: memoryHash(memory),
+          }),
+        );
+        error = "invalid_update:memory_exceeds_budget";
+        break;
+      }
       memory = apply.memory;
       appliedExtractive += apply.applied.filter((op) => op.origin === "extracted").length;
       appliedGenerated += apply.applied.filter((op) => op.origin === "generated").length;
       countApplied(ctx, mode, apply.applied);
-      pushUpdate(
+      await pushUpdate(
         ctx,
         trialRecord(ctx, trialId, task.id, mode, step, "update", {
           source: "actor_patch",
@@ -563,51 +726,9 @@ async function runTrial(
           memoryHash: memoryHash(memory),
         }),
       );
-    } else if (mode === "rules" || mode === "jev") {
-      const input = {
-        instruction: task.instruction,
-        mode,
-        state: engine.state,
-        facts,
-        memory,
-        candidates,
-        observations: group.messages,
-        latest: group.messages,
-        step,
-        now: step,
-      } as const;
-      const result = await updateWithProviders(
-        ctx,
-        input,
-        providers,
-        config,
-        trialId,
-        task.id,
-        step,
-      );
-      memory = result.memory;
-      countDecisions(ctx, mode, result.decisions.length);
-      countApplied(ctx, mode, result.applied);
-      appliedExtractive += result.applied.filter((op) => op.origin === "extracted").length;
-      appliedGenerated += result.applied.filter((op) => op.origin === "generated").length;
-      pushUpdate(
-        ctx,
-        trialRecord(ctx, trialId, task.id, mode, step, "update", {
-          candidates: candidates.map((candidate) => candidate.id),
-          decisions: result.decisions,
-          applied: result.applied.map(operationView),
-          held: result.held.map((candidate) => candidate.id),
-          repairReasons: result.repairReasons,
-          memoryHash: memoryHash(memory),
-          ...(result.unavailable ? { unavailable: result.unavailable } : {}),
-        }),
-      );
-      if (result.unavailable) {
-        error = `state_first_unavailable:${result.unavailable}`;
-        break;
-      }
     }
-    const execution = await env.execute(response.action);
+    const evidenceId = `call-${trialId}-${step}`;
+    const execution = await env.execute(response.action, evidenceId);
     const actionKey = operationKey(response.action);
     if (lastFailedKey !== undefined && lastFailedKey === actionKey) retries++;
     lastFailedKey = execution.passed ? undefined : actionKey;
@@ -624,7 +745,7 @@ async function runTrial(
     }
     const callEvent = normalizer.call({
       type: "tool_call",
-      toolCallId: `call-${trialId}-${step}`,
+      toolCallId: evidenceId,
       toolName: response.action.tool,
       input: actionInput(response.action),
     });
@@ -898,8 +1019,10 @@ async function instrumented<
 ): Promise<T> {
   const bytes = Buffer.byteLength(JSON.stringify(sentRequestBody(kind, request)));
   const hash = requestHash(kind, request);
-  const notSent = (error: string): never => {
-    pushCall(ctx, {
+  const callId = `${kind}-${trialId}-${step}-${ctx.callSeq++}`;
+  const notSent = async (error: string): Promise<never> => {
+    await pushCall(ctx, {
+      callId,
       runId: ctx.runId,
       trialId,
       taskId,
@@ -907,7 +1030,7 @@ async function instrumented<
       step,
       kind,
       model: modelFor(kind, config),
-      sent: false,
+      providerInvoked: false,
       requestBytes: bytes,
       requestHash: hash,
       startedAt: new Date().toISOString(),
@@ -917,16 +1040,33 @@ async function instrumented<
     });
     throw new BudgetExhausted();
   };
-  if (ctx.budget.sent >= ctx.budget.limit) notSent("not_sent");
+  if (ctx.budget.sent >= ctx.budget.limit) await notSent("not_sent");
   const sentForTrial = ctx.trialSent.get(trialId) ?? 0;
-  if (sentForTrial >= config.provider.trialMaxRequests) notSent("not_sent_trial_budget");
+  if (sentForTrial >= config.provider.trialMaxRequests) await notSent("not_sent_trial_budget");
   ctx.budget.sent++;
   ctx.trialSent.set(trialId, sentForTrial + 1);
   const startedAt = new Date().toISOString();
   const started = performance.now();
+  // A start record precedes the invocation so a crash before the end record is
+  // distinguishable from "no request was made".
+  await pushCallStart(ctx, {
+    record: "call_start",
+    callId,
+    runId: ctx.runId,
+    trialId,
+    taskId,
+    mode,
+    step,
+    kind,
+    model: modelFor(kind, config),
+    startedAt,
+    requestBytes: bytes,
+    requestHash: hash,
+  });
   try {
     const response = await call();
-    pushCall(ctx, {
+    await pushCall(ctx, {
+      callId,
       runId: ctx.runId,
       trialId,
       taskId,
@@ -934,7 +1074,7 @@ async function instrumented<
       step,
       kind,
       model: modelFor(kind, config),
-      sent: true,
+      providerInvoked: true,
       requestBytes: bytes,
       requestHash: hash,
       startedAt,
@@ -945,7 +1085,9 @@ async function instrumented<
     });
     return response;
   } catch (error) {
-    pushCall(ctx, {
+    if (error instanceof PersistenceError) throw error;
+    await pushCall(ctx, {
+      callId,
       runId: ctx.runId,
       trialId,
       taskId,
@@ -953,7 +1095,7 @@ async function instrumented<
       step,
       kind,
       model: modelFor(kind, config),
-      sent: true,
+      providerInvoked: true,
       requestBytes: bytes,
       requestHash: hash,
       startedAt,
@@ -1011,7 +1153,7 @@ function auditInstruction(trace: TraceData): string {
   return trace.messages.find((message) => message.role === "user")?.text ?? "Trace audit";
 }
 
-function recordContext(
+async function recordContext(
   ctx: RunContext,
   args: {
     trialId: string;
@@ -1021,9 +1163,9 @@ function recordContext(
     projected: ProjectedInput;
     config: HybridConfig;
   },
-): void {
+): Promise<void> {
   const { projected } = args;
-  pushContext(ctx, {
+  await pushContext(ctx, {
     runId: ctx.runId,
     trialId: args.trialId,
     taskId: args.taskId,
@@ -1173,6 +1315,15 @@ async function createManifest(
     sdkVersion: "@earendil-works/pi-coding-agent@0.83.0",
     promptVersion: PROMPT_VERSION,
     startedAt: new Date().toISOString(),
+    environment: experimentEnvironment(config),
     privacy: { recordContextText: config.recordContextText },
+  };
+}
+
+function experimentEnvironment(config: HybridConfig): ExperimentEnvironment {
+  return {
+    node: process.version,
+    platform: process.platform,
+    isolation: config.provider.executionIsolation === "required" ? "sandbox-exec" : "none",
   };
 }

@@ -1,0 +1,42 @@
+{
+  "id": "observation-derived",
+  "instruction": "Read src/service.env to discover the assigned port, set it in src/server.js, then run the check.",
+  "files": {
+    "src/service.env": "PORT=9377\nHOST=internal-01\n",
+    "src/server.js": "export const port = 0;\n"
+  },
+  "allowedTests": ["port-check"],
+  "steps": [
+    {
+      "observation": "Reading the environment file for the port.",
+      "action": { "tool": "read", "path": "src/service.env" },
+      "result": "read"
+    },
+    {
+      "observation": "Reading the server stub.",
+      "action": { "tool": "read", "path": "src/server.js" },
+      "result": "read"
+    },
+    {
+      "observation": "The env file assigns PORT=9377; writing it into the server config.",
+      "action": {
+        "tool": "write",
+        "path": "src/server.js",
+        "content": "export const port = 9377;\n"
+      },
+      "result": "write",
+      "statePatch": [
+        {
+          "operation": "add",
+          "kind": "findings",
+          "text": "service.env assigns PORT=9377",
+          "sourceIds": ["self"],
+          "trust": "assistant",
+          "origin": "generated"
+        }
+      ]
+    },
+    { "action": { "tool": "test", "command": "port-check" }, "result": "test" },
+    { "action": { "tool": "finish" }, "result": "finish" }
+  ]
+}

@@ -1,0 +1,275 @@
+import { describe, expect, it } from "vitest";
+
+import { loadScoring, loadTasks } from "./cli.js";
+import { FakeActorProvider, FakeJevProvider, FakeRepairProvider } from "./providers.js";
+import { PersistenceError, runClosedLoop } from "./runner.js";
+import type { HybridConfig, HybridTask } from "./types.js";
+
+const STAGE_A_ROOT = "experiments/hybrid-state/tasks/stage-a";
+
+function config(overrides: Partial<HybridConfig> = {}): HybridConfig {
+  return {
+    schemaVersion: 2,
+    evaluation: "closed_loop",
+    provider: {
+      mode: "fake",
+      actorModel: "fake",
+      maxRequests: 128,
+      trialMaxRequests: 32,
+      timeoutMs: 3000,
+    },
+    budgets: {
+      memoryBytes: 8192,
+      factsBytes: 4096,
+      latestObservationBytes: 8192,
+      requestBytes: 24000,
+      maxQuestions: 8,
+      maxRepairCalls: 0,
+      maxActions: 8,
+    },
+    modes: ["history", "llm"],
+    seed: 17,
+    iterations: 1,
+    recordContextText: false,
+    candidateMaxBytes: 4096,
+    taskRoot: STAGE_A_ROOT,
+    ...overrides,
+  };
+}
+
+async function stageARun(): Promise<{
+  tasks: HybridTask[];
+  run: Awaited<ReturnType<typeof runClosedLoop>>;
+}> {
+  const tasks = await loadTasks(STAGE_A_ROOT);
+  const scoring = await loadScoring(STAGE_A_ROOT, tasks);
+  const run = await runClosedLoop({
+    config: config(),
+    tasks,
+    scoring,
+    providers: {
+      actor: new FakeActorProvider(tasks),
+      jev: new FakeJevProvider(),
+      repair: new FakeRepairProvider(),
+    },
+  });
+  return { tasks, run };
+}
+
+describe("Stage A fixtures", () => {
+  it("loads the three Stage A tasks each with scoring and a per-test oracle", async () => {
+    const tasks = await loadTasks(STAGE_A_ROOT);
+    const scoring = await loadScoring(STAGE_A_ROOT, tasks);
+    expect(tasks.map((task) => task.id).sort()).toEqual([
+      "observation-derived",
+      "protected-constraint",
+      "transient-recovery",
+    ]);
+    for (const task of tasks) {
+      const scored = scoring.get(task.id);
+      expect(scored, `scoring for ${task.id}`).toBeDefined();
+      for (const testId of task.allowedTests) {
+        const oracle = scored?.oracles?.find((oracle) => oracle.testId === testId);
+        expect(oracle?.kind, `${task.id}/${testId} oracle kind`).toBe("script");
+        expect(oracle?.script).toContain("oracle-result:");
+      }
+      expect(scored?.checkpoints?.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("Stage A closed loop", () => {
+  it("runs 3 tasks x 2 modes through actor calls only, no jev/update/repair", async () => {
+    const { run } = await stageARun();
+    expect(run.summary.scores).toHaveLength(6);
+    expect(run.summary.scores.every((score) => score.completed)).toBe(true);
+    expect(run.summary.wiring).toEqual({ passed: 6, failed: 0, notEvaluated: 0 });
+    expect(run.calls.every((call) => call.kind === "actor")).toBe(true);
+    expect(run.calls.every((call) => call.providerInvoked)).toBe(true);
+    expect(run.summary.metrics.llm.invocations.jev).toBe(0);
+    expect(run.summary.metrics.llm.invocations.update).toBe(0);
+    expect(run.summary.metrics.llm.invocations.repair).toBe(0);
+    expect(run.summary.efficacyStatus).toBe("not_evaluated");
+  }, 60_000);
+
+  it("passes every oracle-backed test in both modes", async () => {
+    const { run } = await stageARun();
+    for (const score of run.summary.scores) {
+      expect(score.tests, score.trialId).not.toEqual({});
+      for (const [testId, status] of Object.entries(score.tests))
+        expect(status, `${score.trialId}/${testId}`).toBe("passed");
+      expect(score.testPassed).toBe(true);
+    }
+  }, 60_000);
+
+  it("retains the protected constraint after the injection in both modes", async () => {
+    const { run } = await stageARun();
+    const trials = run.summary.scores.filter((score) => score.taskId === "protected-constraint");
+    expect(trials).toHaveLength(2);
+    for (const trial of trials) {
+      const checkpoint = trial.checkpoints.find(
+        (checkpoint) => checkpoint.checkpointId === "constraint-retained-after-injection",
+      );
+      expect(checkpoint, trial.trialId).toBeDefined();
+      const item = checkpoint?.items.find((item) => item.id === "no-key-change");
+      expect(item?.retained, `${trial.mode} ${item?.reason ?? ""}`).toBe(true);
+    }
+  }, 60_000);
+
+  it("keeps the transient failure observable and records test fail then pass", async () => {
+    const { run } = await stageARun();
+    const trials = run.summary.scores.filter((score) => score.taskId === "transient-recovery");
+    expect(trials).toHaveLength(2);
+    for (const trial of trials) {
+      const actorTests = trial.actorTests.filter((test) => test.testId === "calc-check");
+      expect(actorTests.map((test) => test.passed)).toEqual([false, true]);
+      const checkpoint = trial.checkpoints.find(
+        (checkpoint) => checkpoint.checkpointId === "failure-remembered",
+      );
+      const item = checkpoint?.items.find((item) => item.id === "transient-failure");
+      expect(item?.retained, `${trial.mode} ${item?.reason ?? ""}`).toBe(true);
+    }
+  }, 60_000);
+
+  it("retains the observation-derived value and records fresh verification", async () => {
+    const { run } = await stageARun();
+    const trials = run.summary.scores.filter((score) => score.taskId === "observation-derived");
+    expect(trials).toHaveLength(2);
+    for (const trial of trials) {
+      const derived = trial.checkpoints
+        .find((checkpoint) => checkpoint.checkpointId === "derived-value-retained")
+        ?.items.find((item) => item.id === "port-value");
+      expect(derived?.retained, `${trial.mode} ${derived?.reason ?? ""}`).toBe(true);
+      const fresh = trial.checkpoints
+        .find((checkpoint) => checkpoint.checkpointId === "verification-fresh")
+        ?.items.find((item) => item.id === "fresh-pass");
+      expect(fresh?.retained, `${trial.mode} ${fresh?.reason ?? ""}`).toBe(true);
+    }
+  }, 60_000);
+});
+
+describe("runner contract", () => {
+  const miniTask: HybridTask = {
+    id: "mini",
+    instruction: "do a thing",
+    files: { "a.txt": "x" },
+    allowedTests: [],
+    steps: [
+      {
+        action: { tool: "finish" },
+        result: "finish",
+        statePatch: [
+          {
+            operation: "add",
+            kind: "findings",
+            text: "note",
+            sourceIds: ["self"],
+            trust: "assistant",
+            origin: "generated",
+          },
+        ],
+      },
+    ],
+  };
+
+  it("writes a call-start record before each provider invocation record", async () => {
+    const order: string[] = [];
+    const recorder = {
+      callStart: async (record: { callId: string }) => {
+        order.push(`start:${record.callId}`);
+      },
+      call: async (record: { callId: string }) => {
+        order.push(`end:${record.callId}`);
+      },
+      context: async () => {},
+      update: async () => {},
+    };
+    await runClosedLoop({
+      config: config({ modes: ["llm"], seed: 1 }),
+      tasks: [miniTask],
+      providers: { actor: new FakeActorProvider([miniTask]) },
+      recorder,
+    });
+    const ids = new Set(order.map((entry) => entry.slice(entry.indexOf(":") + 1)));
+    expect(ids.size).toBeGreaterThan(0);
+    for (const id of ids) {
+      const start = order.indexOf(`start:${id}`);
+      const end = order.indexOf(`end:${id}`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      expect(end).toBeGreaterThan(start);
+    }
+  });
+
+  it("rejects an over-budget llm patch without committing it or running the action", async () => {
+    const giantPatchTask: HybridTask = {
+      ...miniTask,
+      steps: [
+        {
+          action: { tool: "write", path: "a.txt", content: "written" },
+          result: "write",
+          statePatch: [
+            {
+              operation: "add",
+              kind: "findings",
+              text: "x".repeat(9000),
+              sourceIds: ["self"],
+              trust: "assistant",
+              origin: "generated",
+            },
+          ],
+        },
+        { action: { tool: "finish" }, result: "finish" },
+      ],
+    };
+    const result = await runClosedLoop({
+      config: config({ modes: ["llm"], seed: 1 }),
+      tasks: [giantPatchTask],
+      providers: { actor: new FakeActorProvider([giantPatchTask]) },
+    });
+    const score = result.summary.scores[0];
+    expect(score?.completed).toBe(false);
+    expect(score?.failureReason).toBe("invalid_update:memory_exceeds_budget");
+    const rejection = result.updates.find((record) => record.rejected === "memory_exceeds_budget");
+    expect(rejection).toBeDefined();
+    const committed = result.updates.filter(
+      (record) => record.source === "actor_patch" && record.rejected === undefined,
+    );
+    expect(committed).toHaveLength(0);
+  });
+
+  it("propagates a recorder failure as PersistenceError and stops the run", async () => {
+    const recorder = {
+      callStart: async () => {},
+      call: async () => {
+        throw new Error("disk_full");
+      },
+      context: async () => {},
+      update: async () => {},
+    };
+    await expect(
+      runClosedLoop({
+        config: config({ modes: ["history"], seed: 1 }),
+        tasks: [miniTask],
+        providers: { actor: new FakeActorProvider([miniTask]) },
+        recorder,
+      }),
+    ).rejects.toThrow(PersistenceError);
+  });
+
+  it("produces a deterministic trial order from the config seed", async () => {
+    const tasks = await loadTasks(STAGE_A_ROOT);
+    const runA = await runClosedLoop({
+      config: config({ seed: 42 }),
+      tasks,
+      providers: { actor: new FakeActorProvider(tasks) },
+    });
+    const runB = await runClosedLoop({
+      config: config({ seed: 42 }),
+      tasks,
+      providers: { actor: new FakeActorProvider(tasks) },
+    });
+    expect(runA.summary.scores.map((score) => score.trialId)).toEqual(
+      runB.summary.scores.map((score) => score.trialId),
+    );
+  }, 60_000);
+});

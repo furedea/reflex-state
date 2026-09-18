@@ -22,5 +22,5 @@
   "iterations": 1,
   "recordContextText": false,
   "candidateMaxBytes": 4096,
-  "taskRoot": "experiments/hybrid-state/tasks"
+  "taskRoot": "experiments/hybrid-state/tasks/stage-a"
 }

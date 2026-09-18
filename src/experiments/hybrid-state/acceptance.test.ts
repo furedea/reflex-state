@@ -261,7 +261,7 @@ describe("acceptance: provider communication contract", () => {
       tasks: [task],
       providers: { actor: new FakeActorProvider([task]) },
     });
-    const blocked = result.calls.filter((call) => !call.sent);
+    const blocked = result.calls.filter((call) => !call.providerInvoked);
     expect(blocked.length).toBeGreaterThan(0);
     expect(blocked.every((call) => call.error?.startsWith("not_sent"))).toBe(true);
     expect(blocked.every((call) => call.attempts === 0 && call.latencyMs === null)).toBe(true);

@@ -5,9 +5,11 @@ import type {
   Candidate,
   CallRecord,
   CheckpointItemResult,
+  CheckpointRequirement,
   CheckpointResult,
   ContextRecord,
   EvaluationKind,
+  ExperimentEnvironment,
   ExperimentManifest,
   ExperimentMode,
   ExperimentSummary,
@@ -17,17 +19,18 @@ import type {
   SkippedTrial,
   TaskCheckpoint,
   TrialScore,
+  UsageFieldSummary,
 } from "./types.js";
 
 export interface AuditResult {
   readonly labels: readonly AuditLabel[];
-  readonly matched: number;
+  /** Count of reviewed labels per update-method kind. These labels classify the
+   * update method, not whether a candidate should be adopted; without an
+   * independent adoption ground truth there is no selection accuracy. */
+  readonly distribution: Readonly<Record<LabelKind, number>>;
   readonly total: number;
-  readonly agreement: number | null;
   readonly coverage: number;
 }
-
-const SELECTED_KINDS = new Set<LabelKind>(["deterministic", "extractive", "generative"]);
 
 export interface LabelsFile {
   readonly sourceHash: string | null;
@@ -74,25 +77,20 @@ export function parseLabelsFile(value: unknown, name = "labels"): LabelsFile {
 export function evaluateAudit(
   candidates: readonly Candidate[],
   labels: readonly AuditLabel[],
-  selected: Readonly<Record<ExperimentMode, readonly string[]>>,
 ): AuditResult {
   const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
-  const modes = Object.keys(selected) as ExperimentMode[];
   const reviewed = labels.filter((label) => label.reviewed && byId.has(label.candidateId));
-  let matched = 0;
-  for (const label of reviewed) {
-    const expected = SELECTED_KINDS.has(label.kind);
-    const every = modes.every((mode) => {
-      const chosen = selected[mode].includes(label.candidateId);
-      return chosen === expected;
-    });
-    if (every) matched++;
-  }
+  const distribution: Record<LabelKind, number> = {
+    deterministic: 0,
+    extractive: 0,
+    generative: 0,
+    insufficient: 0,
+  };
+  for (const label of reviewed) distribution[label.kind]++;
   return {
     labels,
-    matched,
+    distribution,
     total: reviewed.length,
-    agreement: reviewed.length ? matched / reviewed.length : null,
     coverage: candidates.length ? reviewed.length / candidates.length : 0,
   };
 }
@@ -141,6 +139,8 @@ const WIRING_FAILURES = new Set([
 ]);
 
 export function scoreTrial(outcome: TrialOutcome): TrialScore {
+  const persistenceFailed =
+    outcome.error === "persistence_failed" || outcome.error?.startsWith("persistence_failed:");
   const executionStatus = outcome.completed
     ? "completed"
     : outcome.cancelled
@@ -153,8 +153,11 @@ export function scoreTrial(outcome: TrialOutcome): TrialScore {
         (prefix) => outcome.error === prefix || outcome.error!.startsWith(`${prefix}:`),
       ) || outcome.policyViolations.length > 0
     : outcome.policyViolations.length > 0;
-  const wiringStatus =
-    executionStatus === "completed" && !contractFailure
+  // Persistence failure is distinguished from execution failure: the trial's
+  // wiring was neither proven nor disproven.
+  const wiringStatus = persistenceFailed
+    ? "not_evaluated"
+    : executionStatus === "completed" && !contractFailure
       ? "passed"
       : contractFailure || executionStatus === "failed"
         ? "failed"
@@ -190,27 +193,64 @@ export function scoreTrial(outcome: TrialOutcome): TrialScore {
 
 function scoreCheckpoints(outcome: TrialOutcome): readonly CheckpointResult[] {
   return outcome.checkpoints.map((checkpoint) => {
-    if (checkpoint.appliesWhen === "failure_observed" && !outcome.failureObserved) {
-      return {
-        checkpointId: checkpoint.id,
-        step: checkpoint.at === "final" ? outcome.sentTexts.length - 1 : checkpoint.at,
-        items: checkpoint.required.map((item) => ({
-          id: item.id,
-          retained: null,
-          reason: "not_applicable",
-        })),
-      };
-    }
     const step = checkpoint.at === "final" ? outcome.sentTexts.length - 1 : checkpoint.at;
-    const text = outcome.sentTexts[step];
     const items: CheckpointItemResult[] = checkpoint.required.map((item) => {
+      if (checkpoint.appliesWhen === "failure_observed" && !outcome.failureObserved)
+        return { id: item.id, retained: null, reason: "not_applicable" };
+      const text = outcome.sentTexts[step];
       if (text === undefined) return { id: item.id, retained: null, reason: "step_not_reached" };
-      const retained = item.anyOf.some((group) => group.every((phrase) => text.includes(phrase)));
-      return { id: item.id, retained };
+      return evaluateRequirement(item, text);
     });
     return { checkpointId: checkpoint.id, step, items };
   });
 }
+
+/**
+ * Verbatim retention check on the input actually sent at the checkpoint step.
+ * It distinguishes: retained / missing / inverted / condition_dropped /
+ * needs_semantic_review. It never judges paraphrases by word overlap alone.
+ */
+function evaluateRequirement(item: CheckpointRequirement, sentText: string): CheckpointItemResult {
+  const text = sectionsText(sentText, item.sections);
+  const residue = (item.inverted ?? []).reduce(
+    (current, pattern) => current.split(pattern).join(""),
+    text,
+  );
+  const canonicalPresent = (source: string) =>
+    item.anyOf.some((group) => group.every((phrase) => source.includes(phrase)));
+  if (canonicalPresent(residue)) {
+    if (item.condition !== undefined && !text.includes(item.condition))
+      return { id: item.id, retained: false, reason: "condition_dropped" };
+    return { id: item.id, retained: true };
+  }
+  if (canonicalPresent(text)) return { id: item.id, retained: false, reason: "inverted" };
+  if ((item.markers ?? []).some((marker) => text.includes(marker)))
+    return { id: item.id, retained: null, reason: "needs_semantic_review" };
+  return { id: item.id, retained: false, reason: "missing" };
+}
+
+/** Extract the named JSON sections from a sent userText; falls back to the raw
+ * text when it is not JSON. */
+function sectionsText(sentText: string, sections: readonly string[] | undefined): string {
+  if (!sections?.length) return sentText;
+  try {
+    const parsed: unknown = JSON.parse(sentText);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return sentText;
+    const record = parsed as Record<string, unknown>;
+    return sections
+      .map((section) => (section in record ? JSON.stringify(record[section]) : ""))
+      .join("\n");
+  } catch {
+    return sentText;
+  }
+}
+
+const USAGE_FIELDS = [
+  "inputTokens",
+  "outputTokens",
+  "cacheReadTokens",
+  "cacheWriteTokens",
+] as const;
 
 export function summarize(options: {
   readonly runId: string;
@@ -218,6 +258,7 @@ export function summarize(options: {
   readonly provider: ProviderMode;
   readonly modes: readonly ExperimentMode[];
   readonly scores: readonly TrialScore[];
+  readonly plannedTrials: number;
   readonly skipped: readonly SkippedTrial[];
   readonly calls: readonly CallRecord[];
   readonly contexts: readonly ContextRecord[];
@@ -227,33 +268,34 @@ export function summarize(options: {
     ExperimentMode,
     { readonly extractive: number; readonly generated: number }
   >;
+  readonly environment?: ExperimentEnvironment;
   readonly limitations?: readonly string[];
 }): ExperimentSummary {
   const metrics = Object.fromEntries(
     options.modes.map((mode) => {
-      const modeCalls = options.calls.filter((call) => call.mode === mode && call.sent);
-      const usageValues = modeCalls.map((call) => call.usage);
-      const measured = usageValues.filter(
-        (usage) =>
-          usage &&
-          (usage.inputTokens !== null ||
-            usage.outputTokens !== null ||
-            usage.cacheReadTokens !== null ||
-            usage.cacheWriteTokens !== null),
-      );
-      const sum = (
-        field: "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheWriteTokens",
-      ) =>
-        measured.length && measured.every((usage) => usage![field] !== null)
-          ? measured.reduce((total, usage) => total + (usage![field] ?? 0), 0)
-          : null;
+      const modeCalls = options.calls.filter((call) => call.mode === mode && call.providerInvoked);
+      const fieldSummary = (field: (typeof USAGE_FIELDS)[number]): UsageFieldSummary => {
+        const observed = modeCalls
+          .map((call) => call.usage?.[field])
+          .filter((value): value is number => typeof value === "number");
+        return {
+          observedSubtotal: observed.length
+            ? observed.reduce((total, value) => total + value, 0)
+            : null,
+          completeTotal:
+            modeCalls.length > 0 && observed.length === modeCalls.length
+              ? observed.reduce((total, value) => total + value, 0)
+              : null,
+          coverage: modeCalls.length ? observed.length / modeCalls.length : 0,
+        };
+      };
       const scores = options.scores.filter((score) => score.mode === mode);
       const metric: ModeMetrics = {
         uniqueCandidates: options.uniqueCandidates.get(mode)?.size ?? 0,
         decisionCount: options.decisionCounts.get(mode) ?? 0,
         appliedExtractive: options.appliedCounts.get(mode)?.extractive ?? 0,
         appliedGenerated: options.appliedCounts.get(mode)?.generated ?? 0,
-        sentCalls: {
+        invocations: {
           actor: modeCalls.filter((call) => call.kind === "actor").length,
           jev: modeCalls.filter((call) => call.kind === "jev").length,
           repair: modeCalls.filter((call) => call.kind === "repair").length,
@@ -261,11 +303,10 @@ export function summarize(options: {
         },
         sentBytes: modeCalls.reduce((total, call) => total + call.requestBytes, 0),
         usage: {
-          inputTokens: sum("inputTokens"),
-          outputTokens: sum("outputTokens"),
-          cacheReadTokens: sum("cacheReadTokens"),
-          cacheWriteTokens: sum("cacheWriteTokens"),
-          coverage: modeCalls.length ? measured.length / modeCalls.length : 0,
+          inputTokens: fieldSummary("inputTokens"),
+          outputTokens: fieldSummary("outputTokens"),
+          cacheReadTokens: fieldSummary("cacheReadTokens"),
+          cacheWriteTokens: fieldSummary("cacheWriteTokens"),
         },
         wallMs: scores.reduce((total, score) => total + score.wallMs, 0),
         contextBytes: options.contexts
@@ -289,8 +330,10 @@ export function summarize(options: {
       notEvaluated: scores.filter((score) => score.wiringStatus === "not_evaluated").length,
     },
     scores,
+    plannedTrials: options.plannedTrials,
     skippedTrials: options.skipped,
     metrics,
+    ...(options.environment ? { environment: options.environment } : {}),
     limitations: [...(options.limitations ?? defaultLimitations(options))],
   };
 }
@@ -333,6 +376,7 @@ export function reportMarkdown(value: unknown, manifest?: ExperimentManifest | n
       "",
     ].join("\n");
   }
+  const env = summary.environment;
   const lines: string[] = [
     "# Hybrid-state experiment report",
     "",
@@ -341,21 +385,30 @@ export function reportMarkdown(value: unknown, manifest?: ExperimentManifest | n
     `- provider: ${summary.provider}`,
     ...(manifest
       ? [
-          `- manifest: started ${manifest.startedAt}, status ${manifest.status}${manifest.finishedAt ? `, finished ${manifest.finishedAt}` : ""}`,
+          `- manifest: started ${manifest.startedAt}, status ${manifest.status}${manifest.finishedAt ? `, finished ${manifest.finishedAt}` : ""}${manifest.failedStage ? ` (failed stage: ${manifest.failedStage})` : ""}`,
         ]
       : []),
     `- efficacy_status: **${summary.efficacyStatus}**`,
     `- wiring: ${summary.wiring.passed} passed / ${summary.wiring.failed} failed / ${summary.wiring.notEvaluated} not_evaluated`,
+    `- trials: ${summary.scores.length}/${summary.plannedTrials} executed, ${summary.skippedTrials.length} skipped`,
+    ...(env
+      ? [`- environment: node ${env.node}, ${env.platform}, isolation: ${env.isolation}`]
+      : []),
+    "- sent bytes are application-side request bodies (system + user), not HTTP bytes or token counts",
     "",
     "## Per-mode metrics",
     "",
-    "| mode | actor | jev | repair | update | sent bytes | unique candidates | decisions | applied ex/gen | wall ms | usage coverage |",
+    "| mode | actor | jev | repair | update | sent bytes | unique candidates | decisions | applied ex/gen | wall ms | usage fields reported |",
     "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
   ];
   for (const mode of summary.modes) {
     const metric = summary.metrics[mode];
+    const usageCoverage = USAGE_FIELDS.map(
+      (field) =>
+        `${field.replace("Tokens", "")}:${(metric.usage[field].coverage * 100).toFixed(0)}%`,
+    ).join(" ");
     lines.push(
-      `| ${mode} | ${metric.sentCalls.actor} | ${metric.sentCalls.jev} | ${metric.sentCalls.repair} | ${metric.sentCalls.update} | ${metric.sentBytes} | ${metric.uniqueCandidates} | ${metric.decisionCount} | ${metric.appliedExtractive}/${metric.appliedGenerated} | ${metric.wallMs} | ${(metric.usage.coverage * 100).toFixed(0)}% |`,
+      `| ${mode} | ${metric.invocations.actor} | ${metric.invocations.jev} | ${metric.invocations.repair} | ${metric.invocations.update} | ${metric.sentBytes} | ${metric.uniqueCandidates} | ${metric.decisionCount} | ${metric.appliedExtractive}/${metric.appliedGenerated} | ${metric.wallMs} | ${usageCoverage} |`,
     );
   }
   if (summary.scores.length) {
@@ -363,19 +416,28 @@ export function reportMarkdown(value: unknown, manifest?: ExperimentManifest | n
       "",
       "## Trials",
       "",
-      "| trial | task | mode | status | wiring | completed | tests | checkpoints |",
-      "| --- | --- | --- | --- | --- | --- | --- | --- |",
+      "| trial | task | mode | status | wiring | completed | tests | actor tests | checkpoints |",
+      "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     );
     for (const score of summary.scores) {
       const checkpoints = score.checkpoints
         .flatMap((checkpoint) => checkpoint.items)
-        .map((item) => (item.retained === null ? "n/a" : item.retained ? "ok" : "miss"))
+        .map((item) =>
+          item.retained === null
+            ? `n/a${item.reason ? `(${item.reason})` : ""}`
+            : item.retained
+              ? "ok"
+              : `miss${item.reason ? `(${item.reason})` : ""}`,
+        )
         .join(",");
       const tests = Object.entries(score.tests)
         .map(([id, status]) => `${id}:${status}`)
         .join(",");
+      const actorTests = score.actorTests
+        .map((test) => `${test.testId}@${test.step}:${test.passed ? "pass" : "fail"}`)
+        .join(",");
       lines.push(
-        `| ${score.trialId} | ${score.taskId} | ${score.mode} | ${score.executionStatus} | ${score.wiringStatus} | ${score.completed} | ${tests || "-"} | ${checkpoints || "-"} |`,
+        `| ${score.trialId} | ${score.taskId} | ${score.mode} | ${score.executionStatus} | ${score.wiringStatus} | ${score.completed} | ${tests || "-"} | ${actorTests || "-"} | ${checkpoints || "-"} |`,
       );
     }
   }

@@ -38,7 +38,8 @@ promoted to a user constraint by trust alone.
 Budgets are byte budgets measured on the sent text: memory 8 KiB, Facts 4 KiB, latest observation
 8 KiB, and provider request 24,000 bytes in the offline configuration. Provider requests also have
 a global count budget (`maxRequests`) and a per-trial count budget (`trialMaxRequests`); a blocked
-call is recorded with `sent: false` instead of being reported as a call that happened.
+call is recorded with `providerInvoked: false`, zero attempts, and a `not_sent` error instead of
+being reported as a call that happened.
 
 ## Communication contract
 
@@ -64,9 +65,11 @@ pnpm experiment:hybrid -- report --input .local/hybrid-state/stage-a
 
 The output directory is reserved exclusively before execution; an existing directory is rejected.
 It contains `manifest.json`, `updates.jsonl`, `calls.jsonl`, `contexts.jsonl`, `summary.json`, and
-`report.md`. The manifest moves through `running` → `completed`/`failed`, so a persistence failure
-after execution stays distinguishable from an execution failure. `report` displays an existing
-result without starting a new run.
+`report.md`. Each invoked call writes a `call_start` record before its completion record so a
+crash mid-call is distinguishable from a call never made. The manifest moves through `running` →
+`completed`/`failed`, so a persistence failure after execution stays distinguishable from an
+execution failure. `report` displays an existing result without starting a new run and verifies
+that the summary's run id and schema match the manifest.
 
 ## Evaluation honesty
 
@@ -79,8 +82,11 @@ not be described as real-model task success.
 The checked-in tasks are virtual workspaces with read/write/edit/test/finish operations. They
 reject absolute paths, `..` escapes, arbitrary shell, network operations, and unlisted test ids.
 Each allowed test id resolves through a declared oracle (script or expected files), and test
-observations feed the Facts view with a check key and generation. This is an experiment boundary,
-not a general-purpose sandbox.
+observations feed the Facts view with a check key and generation. Script oracles must print a
+final `oracle-result:` line whose JSON carries a boolean `passed` field; a clean exit or matching
+text is not a pass. Each verification carries the evidence id of the action that produced it and
+a generation plus sequence number so stale checks never outrank newer ones. This is an experiment
+boundary, not a general-purpose sandbox.
 
 ## Live execution
 
@@ -89,9 +95,12 @@ for non-live configs and required for live ones. Provider and model ids, request
 limits, and timeouts must be present and are validated before any call is made. A live provider
 that is needed but unconfigured fails preflight instead of being silently skipped. When
 `provider.executionIsolation` is `required`, the run aborts unless a sandbox mechanism is
-available. Live runs do not accept `--session` inputs. Authentication uses the existing Pi and
-TypeSafe credential paths; keys are not written to configuration or output. Live execution is
-intentionally not part of the default checks.
+available and its boundary is verified. On macOS the mechanism is a deny-default `sandbox-exec`
+seatbelt profile around a resolved absolute node binary; the preflight probes workspace writes,
+outside reads, symlink escapes, environment non-inheritance, network denial, and timeout
+enforcement, and reports each failed check. Live runs do not accept `--session` inputs.
+Authentication uses the existing Pi and TypeSafe credential paths; keys are not written to
+configuration or output. Live execution is intentionally not part of the default checks.
 
 ## What this prototype does not claim
 

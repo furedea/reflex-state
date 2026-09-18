@@ -150,6 +150,33 @@ export function stateFirstHistoryLength(input: ProjectionInput): number {
   return byteLength(renderMessages(input.history.length ? input.history : []));
 }
 
+/** The exact memory representation sent inside the actor input. Shared by
+ * projection and patch validation so budgets measure the same bytes. */
+export function renderMemoryProjection(memory: WorkMemory): string {
+  const all = Object.values(memory).flat();
+  return renderMemoryItems(all, all.length, null);
+}
+
+function renderMemoryItems(
+  shown: readonly MemoryItem[],
+  total: number,
+  omittedIds: readonly string[] | null,
+): string {
+  return JSON.stringify({
+    items: shown.map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      text: item.text,
+      sources: item.sourceIds,
+      origin: item.origin,
+      trust: item.trust,
+    })),
+    shown_count: shown.length,
+    omitted_count: omittedIds ? omittedIds.length : total - shown.length,
+    ...(omittedIds ? { omitted_ids: omittedIds } : {}),
+  });
+}
+
 function boundedMemory(
   memory: WorkMemory,
   budget: number,
@@ -158,19 +185,7 @@ function boundedMemory(
   const required = all.filter((item) => item.kind === "constraints" && item.trust === "user");
   const optional = all.filter((item) => !(item.kind === "constraints" && item.trust === "user"));
   const render = (shown: readonly MemoryItem[], omittedIds: readonly string[] | null) =>
-    JSON.stringify({
-      items: shown.map((item) => ({
-        id: item.id,
-        kind: item.kind,
-        text: item.text,
-        sources: item.sourceIds,
-        origin: item.origin,
-        trust: item.trust,
-      })),
-      shown_count: shown.length,
-      omitted_count: omittedIds ? omittedIds.length : all.length - shown.length,
-      ...(omittedIds ? { omitted_ids: omittedIds } : {}),
-    });
+    renderMemoryItems(shown, all.length, omittedIds);
   if (byteLength(render(required, [])) > budget)
     return {
       text: render(required, []),

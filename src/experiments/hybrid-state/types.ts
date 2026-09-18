@@ -297,7 +297,25 @@ export interface InputBundle {
   readonly unavailable?: string;
 }
 
+/** Start-of-call record: lets a crash between invocation and response recording
+ * be distinguished from "no request was made". */
+export interface CallStartRecord {
+  readonly record: "call_start";
+  readonly callId: string;
+  readonly runId: string;
+  readonly trialId: string;
+  readonly taskId: string;
+  readonly mode: ExperimentMode;
+  readonly step: number;
+  readonly kind: CallRecord["kind"];
+  readonly model: string;
+  readonly startedAt: string;
+  readonly requestBytes: number;
+  readonly requestHash: string;
+}
+
 export interface CallRecord {
+  readonly callId: string;
   readonly runId: string;
   readonly trialId: string;
   readonly taskId: string;
@@ -305,7 +323,8 @@ export interface CallRecord {
   readonly step: number;
   readonly kind: "actor" | "jev" | "repair" | "update";
   readonly model: string;
-  readonly sent: boolean;
+  /** The provider was invoked; this is not a direct observation of network I/O. */
+  readonly providerInvoked: boolean;
   readonly requestBytes: number;
   readonly requestHash: string;
   readonly startedAt: string;
@@ -382,7 +401,16 @@ export interface HybridTask {
 export interface CheckpointRequirement {
   readonly id: string;
   readonly description?: string;
+  /** Acceptable verbatim forms; any group whose strings all appear retains the item. */
   readonly anyOf: readonly (readonly string[])[];
+  /** Verbatim forms that invert the required meaning; their presence voids retention. */
+  readonly inverted?: readonly string[];
+  /** Required accompanying phrase (e.g., a condition); its absence means condition_dropped. */
+  readonly condition?: string;
+  /** Distinctive substrings: present without canonical text marks an unverifiable paraphrase. */
+  readonly markers?: readonly string[];
+  /** userText JSON sections to search; defaults to all sections. */
+  readonly sections?: readonly string[];
 }
 
 export interface TaskCheckpoint {
@@ -452,7 +480,17 @@ export interface SkippedTrial {
   readonly taskId: string;
   readonly mode: ExperimentMode;
   readonly iteration: number;
-  readonly reason: "not_run_global_budget";
+  readonly reason: "not_run_global_budget" | "persistence_failed";
+}
+
+/** Per-usage-field totals that distinguish "not measured" from "measured zero". */
+export interface UsageFieldSummary {
+  /** Sum over calls where the field was reported; null when no call reported it. */
+  readonly observedSubtotal: number | null;
+  /** Sum over all invoked calls; null unless every invoked call reported the field. */
+  readonly completeTotal: number | null;
+  /** calls reporting the field / invoked calls. */
+  readonly coverage: number;
 }
 
 export interface ModeMetrics {
@@ -460,17 +498,24 @@ export interface ModeMetrics {
   readonly decisionCount: number;
   readonly appliedExtractive: number;
   readonly appliedGenerated: number;
-  readonly sentCalls: Readonly<Record<"actor" | "jev" | "repair" | "update", number>>;
+  readonly invocations: Readonly<Record<"actor" | "jev" | "repair" | "update", number>>;
+  /** Application-side request bytes (serialized system+user bodies), not HTTP or token counts. */
   readonly sentBytes: number;
   readonly usage: {
-    readonly inputTokens: number | null;
-    readonly outputTokens: number | null;
-    readonly cacheReadTokens: number | null;
-    readonly cacheWriteTokens: number | null;
-    readonly coverage: number;
+    readonly inputTokens: UsageFieldSummary;
+    readonly outputTokens: UsageFieldSummary;
+    readonly cacheReadTokens: UsageFieldSummary;
+    readonly cacheWriteTokens: UsageFieldSummary;
   };
   readonly wallMs: number;
   readonly contextBytes: number;
+}
+
+export interface ExperimentEnvironment {
+  readonly node: string;
+  readonly platform: string;
+  /** Isolation actually verified on this host for this run, if any. */
+  readonly isolation: "none" | "sandbox-exec" | "unverified";
 }
 
 export interface ExperimentManifest {
@@ -489,6 +534,9 @@ export interface ExperimentManifest {
   readonly startedAt: string;
   readonly finishedAt?: string;
   readonly error?: string;
+  /** Pipeline stage that failed, when status is "failed" (e.g. "recording", "execution"). */
+  readonly failedStage?: string;
+  readonly environment?: ExperimentEnvironment;
   readonly privacy: { readonly recordContextText: boolean };
 }
 
@@ -505,8 +553,10 @@ export interface ExperimentSummary {
     readonly notEvaluated: number;
   };
   readonly scores: readonly TrialScore[];
+  readonly plannedTrials: number;
   readonly skippedTrials: readonly SkippedTrial[];
   readonly metrics: Readonly<Record<ExperimentMode, ModeMetrics>>;
+  readonly environment?: ExperimentEnvironment;
   readonly limitations: readonly string[];
 }
 
@@ -746,6 +796,7 @@ export function parseTaskScoring(value: unknown, file: string): TaskScoring {
       const entry = object(item, `required item in ${file}`);
       if (typeof entry.id !== "string" || !entry.id.trim())
         throw new Error(`Invalid required item id in ${file}`);
+      const id = entry.id;
       if (
         !Array.isArray(entry.anyOf) ||
         !entry.anyOf.length ||
@@ -756,11 +807,27 @@ export function parseTaskScoring(value: unknown, file: string): TaskScoring {
             group.every((phrase) => typeof phrase === "string" && phrase.trim()),
         )
       )
-        throw new Error(`Invalid anyOf for required item ${entry.id} in ${file}`);
+        throw new Error(`Invalid anyOf for required item ${id} in ${file}`);
+      const strings = (key: string) => {
+        const value = entry[key];
+        if (value === undefined) return undefined;
+        if (
+          !Array.isArray(value) ||
+          !value.every((item) => typeof item === "string" && item.trim())
+        )
+          throw new Error(`Invalid ${key} for required item ${id} in ${file}`);
+        return [...(value as string[])];
+      };
+      if (entry.condition !== undefined && typeof entry.condition !== "string")
+        throw new Error(`Invalid condition for required item ${id} in ${file}`);
       return {
-        id: entry.id,
+        id,
         ...(typeof entry.description === "string" ? { description: entry.description } : {}),
         anyOf: entry.anyOf.map((group) => [...(group as string[])]),
+        ...(strings("inverted") ? { inverted: strings("inverted")! } : {}),
+        ...(typeof entry.condition === "string" ? { condition: entry.condition } : {}),
+        ...(strings("markers") ? { markers: strings("markers")! } : {}),
+        ...(strings("sections") ? { sections: strings("sections")! } : {}),
       };
     });
     if (

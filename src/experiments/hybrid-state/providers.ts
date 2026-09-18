@@ -63,14 +63,52 @@ export interface ProviderSet {
 /**
  * The exact body handed to the transport for a call. Request bytes and the
  * recorded-response hash are both derived from this single serialization so
- * they can never disagree about what was sent.
+ * they can never disagree about what was sent. Local metadata (runId, trialId,
+ * step) is never part of these bodies.
  */
 export function sentRequestBody(kind: string, request: unknown): unknown {
   if (kind === "actor") {
     const actor = request as ActorRequest;
     return { system: actor.system, messages: [{ role: "user", content: actor.user }] };
   }
+  if (kind === "repair") {
+    const body = repairCompletionBody(request as RepairRequest);
+    return { system: body.system, messages: [{ role: "user", content: body.user }] };
+  }
+  if (kind === "update") {
+    const body = updateCompletionBody(request as GenerativeUpdateRequest);
+    return { system: body.system, messages: [{ role: "user", content: body.user }] };
+  }
+  if (kind === "jev") {
+    const jev = request as JevRequest;
+    return {
+      state: jev.state,
+      model: jev.model,
+      questions: Object.fromEntries(
+        jev.questions.map((question) => [
+          question.id,
+          { type: "choice", instructions: question.prompt, criteria: question.options },
+        ]),
+      ),
+    };
+  }
   return request;
+}
+
+/** Shared serialization for repair completions: the provider call and the
+ * measurement path must use the same body. */
+function repairCompletionBody(request: RepairRequest): {
+  readonly system: string;
+  readonly user: string;
+} {
+  return { system: repairSystemPrompt(), user: JSON.stringify(request) };
+}
+
+function updateCompletionBody(request: GenerativeUpdateRequest): {
+  readonly system: string;
+  readonly user: string;
+} {
+  return { system: updateSystemPrompt(), user: JSON.stringify(request) };
 }
 
 export function requestHash(kind: string, request: unknown): string {
@@ -460,17 +498,28 @@ export class LiveJevProvider implements JevProvider {
       return {
         answers: decodeAnswers(response, request.questions),
         latencyMs: performance.now() - started,
-        ...(usage ? { usage } : {}),
+        ...(usage ? { usage: sanitizeUsage(usage) } : {}),
       };
     } catch (error) {
       return {
         answers: [],
         latencyMs: performance.now() - started,
         error: errorMessage(error),
-        usage: emptyUsage(),
       };
     }
   }
+}
+
+/** Keep finite, non-negative values; anything else is treated as unreported. */
+function sanitizeUsage(usage: Usage): Usage {
+  const field = (value: number | null) =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+  return {
+    inputTokens: field(usage.inputTokens),
+    outputTokens: field(usage.outputTokens),
+    cacheReadTokens: field(usage.cacheReadTokens),
+    cacheWriteTokens: field(usage.cacheWriteTokens),
+  };
 }
 
 export class LiveActorProvider implements ActorProvider {
@@ -482,26 +531,33 @@ export class LiveActorProvider implements ActorProvider {
 
   async act(request: ActorRequest, options?: CallOptions): Promise<ActorResponse> {
     const started = performance.now();
+    let response;
     try {
-      const response = await this.client.complete(
+      response = await this.client.complete(
         { system: request.system, user: request.user, model: request.model || this.model },
         { signal: options?.signal ?? new AbortController().signal },
       );
-      const decoded = decodeActorResponse(response.text, request.mode);
-      return {
-        action: decoded.action,
-        ...(decoded.statePatch ? { statePatch: decoded.statePatch } : {}),
-        ...(decoded.text ? { text: decoded.text } : {}),
-        latencyMs: performance.now() - started,
-        ...(response.usage ? { usage: response.usage } : {}),
-      };
+    } catch (error) {
+      return { latencyMs: performance.now() - started, error: errorMessage(error) };
+    }
+    const usage = response.usage ? sanitizeUsage(response.usage) : undefined;
+    let decoded;
+    try {
+      decoded = decodeActorResponse(response.text, request.mode);
     } catch (error) {
       return {
         latencyMs: performance.now() - started,
         error: errorMessage(error),
-        usage: emptyUsage(),
+        ...(usage ? { usage } : {}),
       };
     }
+    return {
+      action: decoded.action,
+      ...(decoded.statePatch ? { statePatch: decoded.statePatch } : {}),
+      ...(decoded.text ? { text: decoded.text } : {}),
+      latencyMs: performance.now() - started,
+      ...(usage ? { usage } : {}),
+    };
   }
 }
 
@@ -514,27 +570,28 @@ export class LiveRepairProvider implements RepairProvider {
 
   async repair(request: RepairRequest, options?: CallOptions): Promise<RepairResponse> {
     const started = performance.now();
+    const body = repairCompletionBody(request);
+    let response;
     try {
-      const response = await this.client.complete(
-        {
-          system: repairSystemPrompt(),
-          user: JSON.stringify(request),
-          model: request.model || this.model,
-        },
+      response = await this.client.complete(
+        { system: body.system, user: body.user, model: request.model || this.model },
         { signal: options?.signal ?? new AbortController().signal },
       );
-      return {
-        operations: decodeOperationsEnvelope(response.text),
-        latencyMs: performance.now() - started,
-        ...(response.usage ? { usage: response.usage } : {}),
-      };
+    } catch (error) {
+      return { latencyMs: performance.now() - started, error: errorMessage(error) };
+    }
+    const usage = response.usage ? sanitizeUsage(response.usage) : undefined;
+    let operations;
+    try {
+      operations = decodeOperationsEnvelope(response.text);
     } catch (error) {
       return {
         latencyMs: performance.now() - started,
         error: errorMessage(error),
-        usage: emptyUsage(),
+        ...(usage ? { usage } : {}),
       };
     }
+    return { operations, latencyMs: performance.now() - started, ...(usage ? { usage } : {}) };
   }
 }
 
@@ -550,27 +607,28 @@ export class LiveUpdateProvider implements UpdateProvider {
     options?: CallOptions,
   ): Promise<GenerativeUpdateResponse> {
     const started = performance.now();
+    const body = updateCompletionBody(request);
+    let response;
     try {
-      const response = await this.client.complete(
-        {
-          system: updateSystemPrompt(),
-          user: JSON.stringify(request),
-          model: request.model || this.model,
-        },
+      response = await this.client.complete(
+        { system: body.system, user: body.user, model: request.model || this.model },
         { signal: options?.signal ?? new AbortController().signal },
       );
-      return {
-        operations: decodeOperationsEnvelope(response.text),
-        latencyMs: performance.now() - started,
-        ...(response.usage ? { usage: response.usage } : {}),
-      };
+    } catch (error) {
+      return { latencyMs: performance.now() - started, error: errorMessage(error) };
+    }
+    const usage = response.usage ? sanitizeUsage(response.usage) : undefined;
+    let operations;
+    try {
+      operations = decodeOperationsEnvelope(response.text);
     } catch (error) {
       return {
         latencyMs: performance.now() - started,
         error: errorMessage(error),
-        usage: emptyUsage(),
+        ...(usage ? { usage } : {}),
       };
     }
+    return { operations, latencyMs: performance.now() - started, ...(usage ? { usage } : {}) };
   }
 }
 

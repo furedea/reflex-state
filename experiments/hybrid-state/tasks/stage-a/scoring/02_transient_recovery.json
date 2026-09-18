@@ -1,0 +1,39 @@
+{
+  "taskId": "transient-recovery",
+  "oracles": [
+    {
+      "testId": "calc-check",
+      "kind": "script",
+      "script": "const mod = await import(\"./src/calc.js\");\nconst result = mod.add(3, 4);\nconst ok = result === 7;\nconsole.log(\"oracle-result: \" + JSON.stringify({ passed: ok, detail: `add(3,4)=${result}` }));"
+    }
+  ],
+  "checkpoints": [
+    {
+      "id": "failure-remembered",
+      "at": 4,
+      "appliesWhen": "failure_observed",
+      "required": [
+        {
+          "id": "transient-failure",
+          "description": "The failed calc-check observation is still visible in the evolving context before the retry.",
+          "anyOf": [["calc-check", "failed"]],
+          "markers": ["calc-check"],
+          "sections": ["memory", "history"]
+        }
+      ]
+    },
+    {
+      "id": "recovery-verified",
+      "at": "final",
+      "required": [
+        {
+          "id": "fresh-pass",
+          "description": "The final input reflects a fresh passing verification, not a stale or absent one.",
+          "anyOf": [["\"status\":\"passed\"", "observedGeneration"], ["calc-check: passed"]],
+          "markers": ["calc-check"],
+          "sections": ["facts", "history"]
+        }
+      ]
+    }
+  ]
+}
