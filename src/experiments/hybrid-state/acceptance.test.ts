@@ -51,6 +51,7 @@ function config(overrides: Partial<HybridConfig> = {}): HybridConfig {
     seed: 1,
     iterations: 1,
     recordContextText: true,
+    recordResponseText: false,
     candidateMaxBytes: 4096,
     ...overrides,
   };
@@ -163,15 +164,61 @@ describe("acceptance: provider communication contract", () => {
     expect(decoded.action.tool).toBe("write");
     expect(decoded.statePatch).toHaveLength(1);
     expect(decoded.text).toBe("done");
-    expect(() => decodeActorResponse('{"action":{"tool":"finish"}}', "llm")).toThrow(
-      "actor_state_patch_missing",
-    );
+    // A missing patch decodes as no update; malformed patches still fail.
+    expect(decodeActorResponse('{"action":{"tool":"finish"}}', "llm").statePatch).toEqual([]);
+    expect(() =>
+      decodeActorResponse('{"action":{"tool":"finish"},"statePatch":"oops"}', "llm"),
+    ).toThrow("operations_not_array");
     expect(() => decodeActorResponse('{"action":{"tool":"shell"}}', "history")).toThrow(
       "actor_action_invalid",
     );
     expect(decodeActorResponse('{"action":{"tool":"finish"}}', "history").action.tool).toBe(
       "finish",
     );
+  });
+
+  it("C3b: the actor response decodes the first JSON object amid prose, fences, and extras", () => {
+    const action = '{"action":{"tool":"finish"}}';
+    for (const wrapped of [
+      `Here is my answer:\n${action}\nDone.`,
+      `\`\`\`json\n${action}\n\`\`\``,
+      `${action}\n{"extra": true}`,
+      `{"action":{"tool":"read","path":"src/{weird}.ts"}} extra text`,
+    ])
+      expect(decodeActorResponse(wrapped, "history").action.tool).not.toBeUndefined();
+    expect(
+      decodeActorResponse('prefix {"action":{"tool":"finish"}} suffix {"a":1}', "history").action
+        .tool,
+    ).toBe("finish");
+    expect(() => decodeActorResponse("no json at all", "history")).toThrow("response_invalid_json");
+    expect(() => decodeActorResponse('{"action":{"tool":"finish"', "history")).toThrow(
+      "response_invalid_json",
+    );
+    // The shorthand forms `{"action":"read","path":...}` and a bare
+    // `{"tool":...}` normalize to the same validated action; unknown tools
+    // still fail.
+    const shorthand = decodeActorResponse('{"action":"read","path":"src/calc.js"}', "history");
+    expect(shorthand.action).toEqual({ tool: "read", path: "src/calc.js" });
+    const bare = decodeActorResponse('{"tool":"read","path":"src/calc.js"}', "history");
+    expect(bare.action).toEqual({ tool: "read", path: "src/calc.js" });
+    const withPatch = decodeActorResponse(
+      '{"action":"test","command":"t1","statePatch":[]}',
+      "llm",
+    );
+    expect(withPatch.action).toEqual({ tool: "test", command: "t1" });
+    expect(() => decodeActorResponse('{"action":"shell","path":"x"}', "history")).toThrow(
+      "actor_action_invalid",
+    );
+  });
+
+  it("C3c: a failed decode keeps the raw provider text for recording", async () => {
+    const client: CompletionClient = {
+      complete: () => Promise.resolve({ text: "```json\n{}\n```\nextra" }),
+    };
+    const provider = new LiveActorProvider("model", client);
+    const response = await provider.act(actorRequest());
+    expect(response.error).toBe("actor_action_invalid");
+    expect(response.rawText).toBe("```json\n{}\n```\nextra");
   });
 
   it("C4: Jev answers decode per question with invalid entries marked, never fabricated", () => {

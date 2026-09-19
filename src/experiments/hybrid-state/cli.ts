@@ -544,7 +544,10 @@ function startManifest(
       platform: process.platform,
       isolation: config.provider.executionIsolation === "required" ? "sandbox-exec" : "none",
     },
-    privacy: { recordContextText: config.recordContextText },
+    privacy: {
+      recordContextText: config.recordContextText,
+      recordResponseText: config.recordResponseText,
+    },
   };
 }
 

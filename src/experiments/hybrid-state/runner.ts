@@ -57,6 +57,7 @@ import {
   factsFromState,
   memoryItems,
   updateMemory,
+  validateOperations,
   type ApplyContext,
 } from "./update.js";
 
@@ -707,11 +708,19 @@ async function runTrial(
       const patch = (response.statePatch ?? []).map((operation) =>
         substituteSelf(operation, responseId),
       );
-      const apply = applyOperations(
+      // Invalid operations are dropped and recorded rather than killing the
+      // trial: a miscited extraction never reaches memory, and the missing
+      // retention shows up in the checkpoint scores instead.
+      const patchContext = actorPatchContext(
+        candidates,
+        group.messages,
         memory,
-        patch,
-        actorPatchContext(candidates, group.messages, memory, responseId, response.text, step),
+        responseId,
+        response.text,
+        step,
       );
+      const validation = validateOperations(memory, patch, patchContext);
+      const apply = applyOperations(memory, validation.valid, patchContext);
       if (!apply.ok) {
         error = `invalid_update:${apply.reason}`;
         break;
@@ -740,6 +749,7 @@ async function runTrial(
         trialRecord(ctx, trialId, task.id, mode, step, "update", {
           source: "actor_patch",
           operations: apply.applied.map(operationView),
+          ...(validation.errors.length ? { dropped: validation.errors } : {}),
           memoryHash: memoryHash(memory),
         }),
       );
@@ -1028,7 +1038,12 @@ async function updateWithProviders(
 }
 
 async function instrumented<
-  T extends { latencyMs?: number; usage?: CallRecord["usage"]; error?: string },
+  T extends {
+    latencyMs?: number;
+    usage?: CallRecord["usage"];
+    error?: string;
+    rawText?: string;
+  },
 >(
   ctx: RunContext,
   kind: CallRecord["kind"],
@@ -1104,6 +1119,9 @@ async function instrumented<
       latencyMs: response.latencyMs ?? performance.now() - started,
       ...(response.usage ? { usage: response.usage } : {}),
       ...(response.error ? { error: response.error } : {}),
+      ...(config.recordResponseText && typeof response.rawText === "string"
+        ? { responseText: response.rawText }
+        : {}),
       attempts: 1,
     });
     return response;
@@ -1339,7 +1357,10 @@ async function createManifest(
     promptVersion: PROMPT_VERSION,
     startedAt: new Date().toISOString(),
     environment: experimentEnvironment(config),
-    privacy: { recordContextText: config.recordContextText },
+    privacy: {
+      recordContextText: config.recordContextText,
+      recordResponseText: config.recordResponseText,
+    },
   };
 }
 

@@ -54,6 +54,9 @@ export interface HybridConfig {
   readonly seed: number;
   readonly iterations: number;
   readonly recordContextText: boolean;
+  /** Record raw provider text on decode failures in calls.jsonl (debug aid
+   * for live runs; defaults off). */
+  readonly recordResponseText: boolean;
   readonly candidateMaxBytes: number;
   readonly taskRoot?: string;
 }
@@ -228,6 +231,7 @@ export interface RepairRequest {
 
 export interface RepairResponse {
   readonly operations?: readonly PatchOperation[];
+  readonly rawText?: string;
   readonly usage?: Usage;
   readonly latencyMs?: number;
   readonly error?: string;
@@ -246,6 +250,7 @@ export interface GenerativeUpdateRequest {
 
 export interface GenerativeUpdateResponse {
   readonly operations?: readonly PatchOperation[];
+  readonly rawText?: string;
   readonly usage?: Usage;
   readonly latencyMs?: number;
   readonly error?: string;
@@ -280,6 +285,9 @@ export interface ActorResponse {
   readonly action?: ActorAction;
   readonly statePatch?: readonly PatchOperation[];
   readonly text?: string;
+  /** Raw provider text when decoding failed; recorded only when the run opts
+   * into response logging so contract failures stay inspectable. */
+  readonly rawText?: string;
   readonly usage?: Usage;
   readonly latencyMs?: number;
   readonly error?: string;
@@ -345,6 +353,9 @@ export interface CallRecord {
   readonly latencyMs: number | null;
   readonly usage?: Usage;
   readonly error?: string;
+  /** Raw provider text for a failed decode, present only when the run opted
+   * into response logging (`recordResponseText`). */
+  readonly responseText?: string;
   readonly attempts: number;
 }
 
@@ -588,7 +599,10 @@ export interface ExperimentManifest {
   /** Pipeline stage that failed, when status is "failed" (e.g. "recording", "execution"). */
   readonly failedStage?: string;
   readonly environment?: ExperimentEnvironment;
-  readonly privacy: { readonly recordContextText: boolean };
+  readonly privacy: {
+    readonly recordContextText: boolean;
+    readonly recordResponseText: boolean;
+  };
 }
 
 export interface ExperimentSummary {
@@ -665,6 +679,7 @@ const CONFIG_KEYS = new Set([
   "seed",
   "iterations",
   "recordContextText",
+  "recordResponseText",
   "candidateMaxBytes",
   "taskRoot",
 ]);
@@ -765,6 +780,7 @@ export function parseHybridConfig(value: unknown): HybridConfig {
     seed: integer(raw, "seed", 0),
     iterations: raw.iterations === undefined ? 1 : integer(raw, "iterations", 1),
     recordContextText: raw.recordContextText === true,
+    recordResponseText: raw.recordResponseText === true,
     candidateMaxBytes: integer(raw, "candidateMaxBytes", 64),
     ...(typeof raw.taskRoot === "string" ? { taskRoot: raw.taskRoot } : {}),
   };

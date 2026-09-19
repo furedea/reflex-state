@@ -99,9 +99,10 @@ const PATCH_CONTRACT = [
   '"statePatch" is an array of memory operations (an empty array is valid):',
   '  {"operation":"add","kind":"<constraints|decisions|findings|attempts|open_questions>","text":"...","sourceIds":["<source id>"],"origin":"extracted|generated"}',
   '  {"operation":"replace","itemId":"<existing memory id>","kind":"...","text":"...","sourceIds":["..."],"origin":"extracted|generated"}',
+  'Example: {"action":{"tool":"read","path":"src/config.ts"},"statePatch":[{"operation":"add","kind":"findings","text":"FALLBACK_PORT=8080","sourceIds":["E0003"],"origin":"extracted"}]}',
   'sourceIds must cite ids from the latest observation, existing memory items, or the string "self" for this response\'s visible text.',
-  "An extracted operation's text must equal the cited source text. A generated operation records a judgment; distinguish evidence from inference and never fabricate observations.",
-  "The patch reflects the latest observation and your current judgment. Do not record the action's result before it happens.",
+  'An "extracted" text must equal the cited source verbatim; use "generated" whenever you summarize, infer, or are unsure of the exact wording. Distinguish evidence from inference and never fabricate observations.',
+  "Record what you learned from the latest observation now; later steps see only your memory, not this response. Do not record the action's result before it happens.",
 ].join("\n");
 
 export function actorSystemPrompt(mode: ExperimentMode): string {

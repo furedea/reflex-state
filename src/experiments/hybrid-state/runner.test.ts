@@ -29,6 +29,7 @@ const config: HybridConfig = {
   seed: 1,
   iterations: 1,
   recordContextText: true,
+  recordResponseText: false,
   candidateMaxBytes: 4096,
 };
 
@@ -85,5 +86,29 @@ describe("hybrid closed loop", () => {
       providers: { actor: new FakeActorProvider([task]) },
     });
     expect(result.summary.efficacyStatus).toBe("not_evaluated");
+  });
+
+  it("records raw provider text on decode failures only when opted in", async () => {
+    const failing = {
+      name: "failing-actor",
+      act: () =>
+        Promise.resolve({
+          error: "actor_action_invalid",
+          rawText: "```json\n{}\n```",
+          latencyMs: 1,
+        }),
+    };
+    const runWith = async (recordResponseText: boolean) =>
+      runClosedLoop({
+        config: { ...config, recordResponseText },
+        tasks: [task],
+        providers: { actor: failing },
+      });
+    const optedIn = await runWith(true);
+    expect(optedIn.calls.find((call) => call.kind === "actor")?.responseText).toBe(
+      "```json\n{}\n```",
+    );
+    const optedOut = await runWith(false);
+    expect(optedOut.calls.find((call) => call.kind === "actor")?.responseText).toBeUndefined();
   });
 });

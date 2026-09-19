@@ -552,6 +552,7 @@ export class LiveActorProvider implements ActorProvider {
       return {
         latencyMs: performance.now() - started,
         error: errorMessage(error),
+        rawText: response.text,
         ...(usage ? { usage } : {}),
       };
     }
@@ -560,6 +561,7 @@ export class LiveActorProvider implements ActorProvider {
       ...(decoded.statePatch ? { statePatch: decoded.statePatch } : {}),
       ...(decoded.text ? { text: decoded.text } : {}),
       latencyMs: performance.now() - started,
+      rawText: response.text,
       ...(usage ? { usage } : {}),
     };
   }
@@ -592,10 +594,16 @@ export class LiveRepairProvider implements RepairProvider {
       return {
         latencyMs: performance.now() - started,
         error: errorMessage(error),
+        rawText: response.text,
         ...(usage ? { usage } : {}),
       };
     }
-    return { operations, latencyMs: performance.now() - started, ...(usage ? { usage } : {}) };
+    return {
+      operations,
+      latencyMs: performance.now() - started,
+      rawText: response.text,
+      ...(usage ? { usage } : {}),
+    };
   }
 }
 
@@ -629,10 +637,16 @@ export class LiveUpdateProvider implements UpdateProvider {
       return {
         latencyMs: performance.now() - started,
         error: errorMessage(error),
+        rawText: response.text,
         ...(usage ? { usage } : {}),
       };
     }
-    return { operations, latencyMs: performance.now() - started, ...(usage ? { usage } : {}) };
+    return {
+      operations,
+      latencyMs: performance.now() - started,
+      rawText: response.text,
+      ...(usage ? { usage } : {}),
+    };
   }
 }
 
@@ -699,6 +713,8 @@ function invalid(questionId: string, reason: string): JevAnswer {
   return { questionId, choice: "", invalid: reason };
 }
 
+const ACTION_TOOLS = new Set(["read", "write", "edit", "test", "finish"]);
+
 export function decodeActorResponse(
   text: string,
   mode: ActorRequest["mode"],
@@ -708,12 +724,13 @@ export function decodeActorResponse(
   readonly text?: string;
 } {
   const value = parseJsonObject(text);
-  const action = decodeAction(value.action);
+  const action = normalizeAction(value);
   if (!action) throw new Error("actor_action_invalid");
   const visible = typeof value.text === "string" && value.text.trim() ? value.text : undefined;
   if (mode === "llm") {
-    if (!("statePatch" in value)) throw new Error("actor_state_patch_missing");
-    const operations = decodeOperationsArray(value.statePatch);
+    // A missing patch means "no memory update this step"; an invalid patch
+    // still fails so malformed operations are never silently dropped.
+    const operations = "statePatch" in value ? decodeOperationsArray(value.statePatch) : [];
     return { action, statePatch: operations, ...(visible ? { text: visible } : {}) };
   }
   return { action, ...(visible ? { text: visible } : {}) };
@@ -781,6 +798,29 @@ export function decodeOperationsArray(value: unknown): PatchOperation[] {
   });
 }
 
+/** The action may arrive as the canonical nested object
+ * `{"action":{"tool":...}}`, as a tool-name string with the parameters at the
+ * envelope level `{"action":"read","path":"x"}`, or as a bare tool object
+ * `{"tool":"read","path":"x"}`; all decode to the same validated action.
+ * Anything else is invalid. */
+function normalizeAction(value: Record<string, unknown>): ActorAction | undefined {
+  if (typeof value.action === "string" && ACTION_TOOLS.has(value.action))
+    return decodeAction(pickActionFields(value, value.action));
+  if (typeof value.tool === "string") return decodeAction(pickActionFields(value, value.tool));
+  return decodeAction(value.action);
+}
+
+function pickActionFields(value: Record<string, unknown>, tool: string) {
+  return {
+    tool,
+    path: value.path,
+    content: value.content,
+    old: value.old,
+    new: value.new,
+    command: value.command,
+  };
+}
+
 function decodeAction(value: unknown): ActorAction | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
@@ -835,13 +875,39 @@ function isProbability(value: unknown): value is number {
 }
 
 function parseJsonObject(text: string): Record<string, unknown> {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start < 0 || end <= start) throw new Error("response_invalid_json");
-  const value: unknown = JSON.parse(text.slice(start, end + 1));
+  const candidate = extractFirstJsonObject(text);
+  if (candidate === null) throw new Error("response_invalid_json");
+  const value: unknown = JSON.parse(candidate);
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("response_invalid_object");
   return value as Record<string, unknown>;
+}
+
+/** The first balanced `{...}` span, string-aware so braces inside strings do
+ * not count. Responses wrapped in prose, markdown fences, or followed by
+ * extra content are still decoded against the first complete object. */
+function extractFirstJsonObject(text: string): string | null {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
 }
 
 function jevUsage(response: unknown): Usage | undefined {

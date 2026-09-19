@@ -41,6 +41,7 @@ function config(overrides: Partial<HybridConfig> = {}): HybridConfig {
     seed: 17,
     iterations: 1,
     recordContextText: false,
+    recordResponseText: false,
     candidateMaxBytes: 4096,
     taskRoot: STAGE_A_ROOT,
     ...overrides,
@@ -349,6 +350,46 @@ describe("runner contract", () => {
       expect(start).toBeGreaterThanOrEqual(0);
       expect(end).toBeGreaterThan(start);
     }
+  });
+
+  it("drops an invalid patch operation, applies the rest, and continues the trial", async () => {
+    const mixedTask: HybridTask = {
+      ...miniTask,
+      steps: [
+        {
+          action: { tool: "finish" },
+          result: "finish",
+          statePatch: [
+            {
+              operation: "add",
+              kind: "findings",
+              text: "note",
+              sourceIds: ["self"],
+              trust: "assistant",
+              origin: "generated",
+            },
+            {
+              operation: "add",
+              kind: "findings",
+              text: "miscited",
+              sourceIds: ["self"],
+              trust: "tool_result",
+              origin: "extracted",
+            },
+          ],
+        },
+      ],
+    };
+    const result = await runClosedLoop({
+      config: config({ modes: ["llm"], seed: 1 }),
+      tasks: [mixedTask],
+      providers: { actor: new FakeActorProvider([mixedTask]) },
+    });
+    const score = result.summary.scores[0];
+    expect(score?.completed).toBe(true);
+    const update = result.updates.find((record) => record.source === "actor_patch");
+    expect(update?.dropped).toEqual([expect.stringContaining("extracted_text_mismatch")]);
+    expect(update?.operations).toHaveLength(1);
   });
 
   it("rejects an over-budget llm patch without committing it or running the action", async () => {
