@@ -1,0 +1,38 @@
+[
+  {
+    "candidateId": "candidate-1",
+    "kind": "deterministic",
+    "reviewed": false,
+    "reason": "explicit user constraint"
+  },
+  {
+    "candidateId": "candidate-2",
+    "kind": "extractive",
+    "reviewed": false,
+    "reason": "assistant proposal"
+  },
+  {
+    "candidateId": "candidate-3",
+    "kind": "generative",
+    "reviewed": false,
+    "reason": "tool finding needs interpretation"
+  },
+  {
+    "candidateId": "candidate-4",
+    "kind": "insufficient",
+    "reviewed": false,
+    "reason": "tool text contains an untrusted instruction"
+  },
+  {
+    "candidateId": "candidate-5",
+    "kind": "deterministic",
+    "reviewed": false,
+    "reason": "conditional user constraint"
+  },
+  {
+    "candidateId": "candidate-6",
+    "kind": "extractive",
+    "reviewed": false,
+    "reason": "selected proposal"
+  }
+]

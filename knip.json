@@ -4,6 +4,8 @@
     "src/pi/index.ts",
     "src/replay_cli.ts",
     "src/export_trace_cli.ts",
+    "src/experiments/hybrid-state/cli.ts",
+    "src/experiments/hybrid-state/index.ts",
     ".pi/extensions/*.ts",
     "scripts/*.mjs"
   ],

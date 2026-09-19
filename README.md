@@ -252,4 +252,7 @@ Current limitations:
 projection, budget, and legacy rules. [Validation notes](docs/state_safety_validation.md) map those
 rules to regression tests and offline verification.
 
+[The hybrid-state experiment](docs/hybrid_state_experiment.md) describes the isolated offline
+comparison of history, rules, Jev, and same-response state updates.
+
 [ADR-0001](https://github.com/furedea/reflex-state/blob/main/docs/adr/0001_compose_adapters_at_entry_points.md) explains composition.

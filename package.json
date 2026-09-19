@@ -52,6 +52,7 @@
     "package:check": "node scripts/check_package.mjs",
     "replay": "pnpm --silent run build && node dist/replay_cli.js",
     "export-trace": "pnpm --silent run build && node dist/export_trace_cli.js",
+    "experiment:hybrid": "pnpm --silent run build && node dist/experiments/hybrid-state/cli.js",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint .",

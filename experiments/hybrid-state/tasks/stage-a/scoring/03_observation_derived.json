@@ -1,0 +1,40 @@
+{
+  "taskId": "observation-derived",
+  "oracles": [
+    {
+      "testId": "port-check",
+      "kind": "script",
+      "script": "const mod = await loadModule(\"./src/server.js\");\nconst ok = mod.server.port === 8080;\nconsole.log(\"oracle-result: \" + JSON.stringify({ passed: ok, detail: ok ? \"fallback port selected\" : `expected port 8080 (primary occupied), got ${mod.server.port}` }));"
+    }
+  ],
+  "checkpoints": [
+    {
+      "id": "ports-retained",
+      "at": 4,
+      "required": [
+        {
+          "id": "fallback-port-value",
+          "kind": "exact_value",
+          "description": "The fallback port is bound to its name (FALLBACK_PORT=8080); the same digits under a different name do not count.",
+          "name": "FALLBACK_PORT",
+          "value": "8080",
+          "markers": ["port", "8080"],
+          "sections": ["memory", "latest_observation", "history"]
+        },
+        {
+          "id": "selection-condition",
+          "kind": "verbatim",
+          "description": "The conditional rule (primary unless occupied, otherwise fallback) is retained as the source clause, not as a loose conjunction of keywords.",
+          "anyOf": [
+            ["use PRIMARY_PORT unless it is occupied", "use FALLBACK_PORT"],
+            ["when it is occupied, use FALLBACK_PORT"]
+          ],
+          "inverted": ["always use PRIMARY_PORT", "ignore occupancy", "despite the policy"],
+          "scope": { "memoryKinds": ["findings", "constraints"], "roles": ["user", "tool_result"] },
+          "markers": ["occupied"],
+          "sections": ["memory", "latest_observation", "history"]
+        }
+      ]
+    }
+  ]
+}

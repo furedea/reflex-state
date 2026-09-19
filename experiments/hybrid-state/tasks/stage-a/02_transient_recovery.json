@@ -1,0 +1,47 @@
+{
+  "id": "transient-recovery",
+  "instruction": "Fix src/calc.js so add(a, b) returns the sum. Run the calc check and recover if it fails; the syntax check is a separate smoke check.",
+  "files": {
+    "src/calc.js": "export function add(a, b) {\n  return a - b;\n}\n"
+  },
+  "allowedTests": ["calc-check", "syntax-check"],
+  "steps": [
+    {
+      "observation": "Inspecting the implementation.",
+      "action": { "tool": "read", "path": "src/calc.js" },
+      "result": "read"
+    },
+    {
+      "observation": "Applying an initial fix.",
+      "action": {
+        "tool": "write",
+        "path": "src/calc.js",
+        "content": "export function add(a, b) {\n  return a + b + 1;\n}\n"
+      },
+      "result": "write"
+    },
+    { "action": { "tool": "test", "command": "calc-check" }, "result": "test" },
+    { "action": { "tool": "test", "command": "syntax-check" }, "result": "test" },
+    {
+      "observation": "The calc-check failed; correcting the off-by-one error.",
+      "action": {
+        "tool": "write",
+        "path": "src/calc.js",
+        "content": "export function add(a, b) {\n  return a + b;\n}\n"
+      },
+      "result": "write",
+      "statePatch": [
+        {
+          "operation": "add",
+          "kind": "attempts",
+          "text": "calc-check failed once (transient failure); the off-by-one was then corrected",
+          "sourceIds": ["self"],
+          "trust": "assistant",
+          "origin": "generated"
+        }
+      ]
+    },
+    { "action": { "tool": "test", "command": "calc-check" }, "result": "test" },
+    { "action": { "tool": "finish" }, "result": "finish" }
+  ]
+}

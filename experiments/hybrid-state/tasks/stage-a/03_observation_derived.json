@@ -1,0 +1,64 @@
+{
+  "id": "observation-derived",
+  "instruction": "Configure src/server.js with the correct port from config/ports.conf, choosing per the occupancy rule in docs/net-policy.md.",
+  "files": {
+    "src/server.js": "export const server = {\n  port: 0,\n};\n",
+    "config/ports.conf": "PRIMARY_PORT=9377\nFALLBACK_PORT=8080\n",
+    "docs/net-policy.md": "# Network policy\n\nUse PRIMARY_PORT unless it is occupied; when it is occupied, use FALLBACK_PORT.\n",
+    "docs/port-status.txt": "port-scan: PRIMARY_PORT 9377 is currently occupied by another service\n"
+  },
+  "allowedTests": ["port-check"],
+  "steps": [
+    {
+      "observation": "Reading the current server config.",
+      "action": { "tool": "read", "path": "src/server.js" },
+      "result": "read"
+    },
+    {
+      "observation": "Reading the candidate ports.",
+      "action": { "tool": "read", "path": "config/ports.conf" },
+      "result": "read",
+      "statePatch": [
+        {
+          "operation": "add",
+          "kind": "findings",
+          "text": "PRIMARY_PORT=9377 and FALLBACK_PORT=8080 are the candidates from ports.conf",
+          "sourceIds": ["self"],
+          "trust": "tool_result",
+          "origin": "generated"
+        }
+      ]
+    },
+    {
+      "observation": "Reading the selection policy and occupancy status.",
+      "action": { "tool": "read", "path": "docs/net-policy.md" },
+      "result": "read",
+      "statePatch": [
+        {
+          "operation": "add",
+          "kind": "findings",
+          "text": "policy: use PRIMARY_PORT unless it is occupied; when it is occupied, use FALLBACK_PORT",
+          "sourceIds": ["self"],
+          "trust": "tool_result",
+          "origin": "generated"
+        }
+      ]
+    },
+    {
+      "observation": "Checking which port is currently occupied.",
+      "action": { "tool": "read", "path": "docs/port-status.txt" },
+      "result": "read"
+    },
+    {
+      "observation": "9377 is occupied, so the policy selects the fallback 8080.",
+      "action": {
+        "tool": "write",
+        "path": "src/server.js",
+        "content": "export const server = {\n  port: 8080,\n};\n"
+      },
+      "result": "write"
+    },
+    { "action": { "tool": "test", "command": "port-check" }, "result": "test" },
+    { "action": { "tool": "finish" }, "result": "finish" }
+  ]
+}
