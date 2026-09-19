@@ -76,6 +76,32 @@ const PORT: CheckpointRequirement = {
   markers: ["port"],
 };
 
+const FALLBACK_PORT: CheckpointRequirement = {
+  id: "fallback-port",
+  kind: "exact_value",
+  name: "FALLBACK_PORT",
+  value: "8080",
+  markers: ["8080"],
+};
+
+const FALLBACK_CLAUSE: CheckpointRequirement = {
+  id: "fallback-clause",
+  kind: "verbatim",
+  anyOf: [["use FALLBACK_PORT"]],
+  markers: ["FALLBACK_PORT"],
+};
+
+const SELECTION_CONDITION: CheckpointRequirement = {
+  id: "selection-condition",
+  kind: "verbatim",
+  anyOf: [
+    ["use PRIMARY_PORT unless it is occupied", "use FALLBACK_PORT"],
+    ["when it is occupied, use FALLBACK_PORT"],
+  ],
+  scope: { memoryKinds: ["findings", "constraints"], roles: ["tool_result"] },
+  markers: ["occupied"],
+};
+
 const API_KEY_RULE: CheckpointRequirement = {
   id: "no-key-change",
   kind: "verbatim",
@@ -167,6 +193,28 @@ describe("checkpoint verification requirements", () => {
     );
     expect(result.retained).toBe(true);
   });
+
+  it("ignores a passing example quoted inside an assistant message", () => {
+    const result = scored(
+      VERIFICATION,
+      historyInput([
+        `[t-1 tool_result test] test calc-check: failed check=${CHECK} gen=1 seq=0`,
+        `[a-1 assistant] when it succeeds the output looks like:\ntest calc-check: passed check=${CHECK} gen=9 seq=9`,
+      ]),
+    );
+    expect(result).toEqual({ retained: false, reason: "wrong_status" });
+  });
+
+  it("ignores a passing line quoted inside a file that was read", () => {
+    const result = scored(
+      VERIFICATION,
+      historyInput([
+        `[t-1 tool_result test] test calc-check: failed check=${CHECK} gen=1 seq=0`,
+        `[t-2 tool_result read] sample log contents:\ntest calc-check: passed check=${CHECK} gen=9 seq=9`,
+      ]),
+    );
+    expect(result).toEqual({ retained: false, reason: "wrong_status" });
+  });
 });
 
 describe("checkpoint exact-value requirements", () => {
@@ -197,6 +245,53 @@ describe("checkpoint exact-value requirements", () => {
 
   it("rejects the value when it is only a name suffix", () => {
     const result = scored(PORT, historyInput(["[t-1 tool_result read] PORT_9377_BACKUP=1"]));
+    expect(result.retained).not.toBe(true);
+  });
+
+  it("accepts the value bound to the declared name", () => {
+    const result = scored(
+      FALLBACK_PORT,
+      stateInput({
+        memory: {
+          items: [
+            {
+              id: "m1",
+              kind: "findings",
+              text: "PRIMARY_PORT=9377 and FALLBACK_PORT=8080",
+              trust: "tool_result",
+            },
+          ],
+        },
+      }),
+    );
+    expect(result.retained).toBe(true);
+  });
+
+  it("rejects the value when it is bound to a different name", () => {
+    const result = scored(
+      FALLBACK_PORT,
+      stateInput({
+        memory: {
+          items: [
+            {
+              id: "m1",
+              kind: "findings",
+              text: "PRIMARY_PORT=8080; FALLBACK_PORT=9377",
+              trust: "tool_result",
+            },
+          ],
+        },
+      }),
+    );
+    expect(result.retained).toBeNull();
+    expect(result.reason).toBe("needs_semantic_review");
+  });
+
+  it("rejects the binding inside a longer identifier", () => {
+    const result = scored(
+      FALLBACK_PORT,
+      historyInput(["[t-1 tool_result read] BACKUP_FALLBACK_PORT=8080"]),
+    );
     expect(result.retained).not.toBe(true);
   });
 });
@@ -251,6 +346,64 @@ describe("checkpoint verbatim requirements", () => {
   it("reports missing when nothing related is present", () => {
     const result = scored(API_KEY_RULE, historyInput(["[u-1 user] update the retries"]));
     expect(result).toEqual({ retained: false, reason: "missing" });
+  });
+
+  it("rejects a canonical phrase that the item immediately negates", () => {
+    const result = scored(
+      FALLBACK_CLAUSE,
+      stateInput({
+        memory: {
+          items: [
+            {
+              id: "m1",
+              kind: "findings",
+              text: "note: do not use FALLBACK_PORT here",
+              trust: "tool_result",
+            },
+          ],
+        },
+      }),
+    );
+    expect(result.retained).not.toBe(true);
+  });
+
+  it("rejects an inverted condition that only shares the keywords", () => {
+    const result = scored(
+      SELECTION_CONDITION,
+      stateInput({
+        memory: {
+          items: [
+            {
+              id: "m1",
+              kind: "findings",
+              text: "When occupied, do not use FALLBACK_PORT.",
+              trust: "tool_result",
+            },
+          ],
+        },
+      }),
+    );
+    expect(result.retained).toBeNull();
+    expect(result.reason).toBe("needs_semantic_review");
+  });
+
+  it("accepts the conditional rule as the source clause", () => {
+    const result = scored(
+      SELECTION_CONDITION,
+      stateInput({
+        memory: {
+          items: [
+            {
+              id: "m1",
+              kind: "findings",
+              text: "policy: use PRIMARY_PORT unless it is occupied; when it is occupied, use FALLBACK_PORT",
+              trust: "tool_result",
+            },
+          ],
+        },
+      }),
+    );
+    expect(result.retained).toBe(true);
   });
 });
 

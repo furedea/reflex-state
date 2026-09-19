@@ -228,6 +228,7 @@ interface SentItem {
   readonly section: string;
   readonly text: string;
   readonly role?: string;
+  readonly toolName?: string;
   readonly memoryKind?: string;
   readonly trust?: string;
 }
@@ -272,31 +273,37 @@ function extractItems(sentText: string, sections?: readonly string[]): SentItem[
           });
       }
   }
-  if (take("history") && typeof parsed.history === "string") {
-    // History items are messages, not lines: a multi-line tool result keeps
-    // the role of the line that opened it, so provenance survives embedded
-    // newlines inside the message text.
-    let current = -1;
-    for (const line of parsed.history.split("\n")) {
-      const match = /^\[([^\]]+)\] (.*)$/s.exec(line);
-      if (match?.[1] !== undefined && match[2] !== undefined) {
-        const meta = match[1].split(/\s+/);
-        items.push({
-          section: "history",
-          ...(meta[1] !== undefined ? { role: meta[1] } : {}),
-          text: match[2],
-        });
-        current = items.length - 1;
-      } else if (current >= 0) {
-        const item = items[current]!;
-        items[current] = { ...item, text: `${item.text}\n${line}` };
-      } else if (line.trim()) {
-        items.push({ section: "history", text: line });
-      }
-    }
-  }
+  if (take("history") && typeof parsed.history === "string")
+    items.push(...historyItems(parsed.history));
   if (take("facts") && parsed.facts !== undefined)
     items.push({ section: "facts", text: JSON.stringify(parsed.facts) });
+  return items;
+}
+
+/** Itemize a transcript into messages, not lines: a multi-line tool result
+ * keeps the role and tool name of the line that opened it, so provenance
+ * survives embedded newlines inside the message text. */
+function historyItems(transcript: string): SentItem[] {
+  const items: SentItem[] = [];
+  let current = -1;
+  for (const line of transcript.split("\n")) {
+    const match = /^\[([^\]]+)\] (.*)$/s.exec(line);
+    if (match?.[1] !== undefined && match[2] !== undefined) {
+      const meta = match[1].split(/\s+/);
+      items.push({
+        section: "history",
+        ...(meta[1] !== undefined ? { role: meta[1] } : {}),
+        ...(meta[2] !== undefined ? { toolName: meta[2] } : {}),
+        text: match[2],
+      });
+      current = items.length - 1;
+    } else if (current >= 0) {
+      const item = items[current]!;
+      items[current] = { ...item, text: `${item.text}\n${line}` };
+    } else if (line.trim()) {
+      items.push({ section: "history", text: line });
+    }
+  }
   return items;
 }
 
@@ -308,6 +315,22 @@ function parseSentJson(sentText: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+/** A canonical phrase does not count when a negation immediately precedes it
+ * in the same item ("do not use X" must not satisfy "use X"). Only the short
+ * window directly before the phrase is inspected, so a negation earlier in a
+ * longer passage does not produce false negatives. */
+const NEGATION_PREFIX = /(?:\bnot\b|\bnever\b|n't\b|\bwithout\b|\bno longer\b)\s*$/i;
+const NEGATION_WINDOW = 24;
+
+function hasAffirmativeOccurrence(text: string, phrase: string): boolean {
+  let index = text.indexOf(phrase);
+  while (index >= 0) {
+    if (!NEGATION_PREFIX.test(text.slice(Math.max(0, index - NEGATION_WINDOW), index))) return true;
+    index = text.indexOf(phrase, index + 1);
+  }
+  return false;
 }
 
 /** Verbatim retention: the canonical text must appear inside one item whose
@@ -322,7 +345,9 @@ function evaluateVerbatim(item: CheckpointRequirement, sentText: string): Checkp
     (entry.trust !== undefined && (scope.trusts ?? []).includes(entry.trust)) ||
     (entry.role !== undefined && (scope.roles ?? []).includes(entry.role));
   const canonical = (text: string) =>
-    (item.anyOf ?? []).some((group) => group.every((phrase) => text.includes(phrase)));
+    (item.anyOf ?? []).some((group) =>
+      group.every((phrase) => hasAffirmativeOccurrence(text, phrase)),
+    );
   const clean = (entry: SentItem) => !inverted.some((pattern) => entry.text.includes(pattern));
   const hit = items.find((entry) => eligible(entry) && clean(entry) && canonical(entry.text));
   if (hit) {
@@ -344,13 +369,21 @@ function escapeRegExp(value: string): string {
 }
 
 /** Exact typed value: the token must appear with identifier/numeric
- * boundaries, so 9377 never matches inside 19377 or 93770. */
+ * boundaries, so 9377 never matches inside 19377 or 93770. When a `name` is
+ * declared, the value must be bound to that name (`NAME=VALUE`), so a swapped
+ * assignment such as `PRIMARY_PORT=8080` cannot satisfy `FALLBACK_PORT=8080`. */
 function evaluateExactValue(item: CheckpointRequirement, sentText: string): CheckpointItemResult {
   const boundary = new RegExp(
     `(?<![0-9A-Za-z_.-])${escapeRegExp(item.value ?? "")}(?![0-9A-Za-z_.-])`,
   );
+  const bound =
+    item.name !== undefined
+      ? new RegExp(
+          `(?<![0-9A-Za-z_.-])${escapeRegExp(item.name)}\\s*[=:]\\s*${escapeRegExp(item.value ?? "")}(?![0-9A-Za-z_.-])`,
+        )
+      : boundary;
   const items = extractItems(sentText, item.sections);
-  if (items.some((entry) => boundary.test(entry.text))) return { id: item.id, retained: true };
+  if (items.some((entry) => bound.test(entry.text))) return { id: item.id, retained: true };
   if ((item.markers ?? []).some((marker) => items.some((entry) => entry.text.includes(marker))))
     return { id: item.id, retained: null, reason: "needs_semantic_review" };
   return { id: item.id, retained: false, reason: "missing" };
@@ -387,15 +420,24 @@ function evaluateVerification(item: CheckpointRequirement, sentText: string): Ch
       return { id: item.id, retained: false, reason: "stale" };
     return { id: item.id, retained: true };
   }
-  const history = parsed && typeof parsed.history === "string" ? parsed.history : sentText;
+  // History mode: only actual test tool results count as verification events.
+  // A matching line inside an assistant explanation, a user message, or a
+  // file's contents is not a check record — the evidence must be the first
+  // line of a `tool_result test` message. Generation is likewise derived from
+  // tool results only.
+  const transcript = parsed && typeof parsed.history === "string" ? parsed.history : sentText;
+  const items = historyItems(transcript);
   const testLine = new RegExp(
-    `test ${escapeRegExp(testId)}: (passed|failed) check=\\S+ gen=(\\d+) seq=(\\d+)`,
+    `^test ${escapeRegExp(testId)}: (passed|failed) check=\\S+ gen=(\\d+) seq=(\\d+)`,
   );
   let latest: { readonly status: string; readonly gen: number; readonly seq: number } | undefined;
   let maxGen = -1;
-  for (const line of history.split("\n")) {
-    for (const match of line.matchAll(/gen=(\d+)/g)) maxGen = Math.max(maxGen, Number(match[1]));
-    const match = testLine.exec(line);
+  for (const entry of items) {
+    if (entry.role !== "tool_result") continue;
+    for (const match of entry.text.matchAll(/gen=(\d+)/g))
+      maxGen = Math.max(maxGen, Number(match[1]));
+    if (entry.toolName !== "test") continue;
+    const match = testLine.exec(entry.text);
     const gen = Number(match?.[2]);
     const seq = Number(match?.[3]);
     if (match?.[1] && (!latest || gen > latest.gen || (gen === latest.gen && seq > latest.seq)))

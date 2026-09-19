@@ -15,7 +15,8 @@
         {
           "id": "fallback-port-value",
           "kind": "exact_value",
-          "description": "The fallback port 8080 is retained as an exact value; a different digit string does not count.",
+          "description": "The fallback port is bound to its name (FALLBACK_PORT=8080); the same digits under a different name do not count.",
+          "name": "FALLBACK_PORT",
           "value": "8080",
           "markers": ["port", "8080"],
           "sections": ["memory", "latest_observation", "history"]
@@ -23,10 +24,10 @@
         {
           "id": "selection-condition",
           "kind": "verbatim",
-          "description": "The conditional rule (primary unless occupied, otherwise fallback) is retained verbatim from a trusted source.",
+          "description": "The conditional rule (primary unless occupied, otherwise fallback) is retained as the source clause, not as a loose conjunction of keywords.",
           "anyOf": [
-            ["unless", "occupied"],
-            ["occupied", "FALLBACK_PORT"]
+            ["use PRIMARY_PORT unless it is occupied", "use FALLBACK_PORT"],
+            ["when it is occupied, use FALLBACK_PORT"]
           ],
           "inverted": ["always use PRIMARY_PORT", "ignore occupancy", "despite the policy"],
           "scope": { "memoryKinds": ["findings", "constraints"], "roles": ["user", "tool_result"] },

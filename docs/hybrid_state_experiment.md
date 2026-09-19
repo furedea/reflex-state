@@ -90,11 +90,14 @@ reports the latest result per declared test id so one check's success cannot sta
 another's. This is an experiment boundary, not a general-purpose sandbox.
 
 Script oracles evaluate candidate workspace code through a trusted `loadModule` prelude: the
-candidate file is read as text and evaluated inside a fresh `vm.SourceTextModule` context with no
-`process`, no import machinery, and a captured console, so only the trusted script can emit the
-verdict line — candidate code cannot forge `oracle-result:`, terminate the run early, or import
-modules. Oracles that compare behavior (not file bytes) call the candidate's exports across
-several inputs and decide pass/fail on the trusted side.
+candidate file is read as text and evaluated inside a fresh `vm.SourceTextModule` context built
+from a null-prototype sandbox, and the console is constructed inside the candidate realm. No host
+value enters the context, so candidate code cannot reach a host-realm `Function`/`process`
+through a constructor chain, cannot import, and cannot emit the verdict line — only the trusted
+script emits `oracle-result:`. `node:vm` is not a general security boundary; what this design
+guarantees is narrower: candidate code only produces return values and exceptions, and pass/fail
+is decided by code it cannot reach. Oracles that compare behavior (not file bytes) call the
+candidate's exports across several inputs and decide pass/fail on the trusted side.
 
 ## Scoring
 
@@ -102,14 +105,19 @@ Checkpoint requirements are typed instead of free-text matching:
 
 - `verbatim` retains only when the canonical phrases appear together inside one
   provenance-eligible item (a memory item of a declared kind or trust, a history or observation
-  line of a declared role) that does not itself carry an inverting phrase; a canonical text found
+  line of a declared role) that does not itself carry an inverting phrase. Canonical phrases are
+  clause spans, not keyword sets, and an occurrence does not count when a negation immediately
+  precedes it in the same item — "do not use X" never satisfies "use X". A canonical text found
   only under the wrong provenance fails, and a recognizable paraphrase stays
   `needs_semantic_review` rather than passing.
 - `exact_value` requires the declared token with identifier/numeric boundaries, so `9377` never
-  matches inside `19377`.
+  matches inside `19377`. When a `name` is declared the value must also be bound to that name
+  (`FALLBACK_PORT=8080`), so the same digits under a different name do not count.
 - `verification` compares the structured latest check for the declared test id — status and
-  freshness in the state-first Facts view, generation and sequence ordering in the history
-  transcript — so a stale pass or a different check's success does not count.
+  freshness in the state-first Facts view. In a history transcript only real test evidence
+  counts: the check record must be the first line of a `tool_result test` message, ordered by
+  generation and sequence, so a pass quoted inside an assistant explanation or a read file's
+  contents is never adopted, and a stale pass or a different check's success does not count.
 
 Task constraints are scored independently of action policy: oracles may attach a `constraints`
 map of boolean verdicts to their result, verdicts are sticky-false across the trial, and

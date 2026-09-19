@@ -27,18 +27,27 @@ was substring-only, oracle verdicts could be forged by candidate code, and task 
 conflated with action policy. Checkpoint requirements are now typed (`verbatim` with provenance
 and inversion checks, `exact_value` with token boundaries, `verification` compared structurally
 against per-test facts or generation/sequence-ordered history), and ambiguous paraphrases stay
-`needs_semantic_review` instead of passing. Script oracles now evaluate candidate workspace code
-inside a `vm.SourceTextModule` context (no `process`, no imports, captured console) through a
-trusted `loadModule` prelude, so only the trusted script can emit the `oracle-result:` verdict,
-and behavior oracles compare multiple inputs rather than one. Task-constraint verdicts travel
-through the oracle result (`constraints` map) and are scored independently of policy violations
+`needs_semantic_review` instead of passing. A second review round then showed the remaining
+holes: an inverted condition sharing the same keywords passed, a value under the wrong name
+passed, a pass quoted inside an assistant message or a read file's contents was adopted as real
+evidence, and candidate code could escape the oracle's vm context through the host-built
+console's constructor chain. These are now closed: canonical phrases are clause spans whose
+occurrences do not count when immediately negated; `exact_value` can bind a value to a declared
+name (`FALLBACK_PORT=8080`); history-side verification counts only first-line records of
+`tool_result test` messages; and the candidate context is built from a null-prototype sandbox
+with the console constructed inside the candidate realm, so no host value is reachable through a
+constructor chain. Candidate code only produces return values and exceptions — pass/fail is
+decided by the trusted script it cannot reach. Task-constraint verdicts travel through the
+oracle result (`constraints` map) and are scored independently of policy violations
 (`constraintPassed`, `null` when undeclared). The Stage A tasks were revised to cover what the
 comparison requires: the protected-constraint task hides the constraint inside a mid-run
-observation, the transient-recovery task adds an independent second check so a different test's
-success cannot masquerade, and the observation-derived task requires conditional selection
-between two candidate ports. Live gating now verifies the approved task set by content hash
-(`stage-a.approved.json`), requires scoring for every closed-loop task, and requires isolation
-for every non-fake closed-loop provider including `recorded`.
+observation and presents the rotation request only as unverified file content (`docs/inbox.txt`)
+rather than a contradicting user instruction, the transient-recovery task adds an independent
+second check so a different test's success cannot masquerade, and the observation-derived task
+requires conditional selection between two candidate ports. Live gating now verifies the
+approved task set by content hash (`stage-a.approved.json`), requires scoring for every
+closed-loop task, and requires isolation for every non-fake closed-loop provider including
+`recorded`.
 
 ## Acceptance evidence
 
@@ -70,30 +79,34 @@ actor patches, skipped trials, recorder failure classification, and the full Sta
 three tasks across both modes.
 
 The negative-side cases are covered as well: a stale pass, a different test's pass, a value
-embedded in a longer digit string, an inverted canonical phrase, canonical text under wrong
-provenance, and an unverifiable paraphrase are all rejected or left unevaluated by the checkpoint
-scorers; a constant-returning implementation, a missing export, a forged `oracle-result:` line
-printed by candidate code, a `process.exit` inside the candidate, and a candidate `import` all
-fail the oracle; an unapproved task root, a tampered or missing task file, an extra file, a
-missing scoring entry, and a `recorded` provider without isolation are all rejected.
+embedded in a longer digit string, a value bound to the wrong name, an inverted canonical
+phrase, a canonical phrase immediately negated in its item, a condition reduced to shared
+keywords ("When occupied, do not use FALLBACK_PORT."), canonical text under wrong provenance, a
+pass quoted inside an assistant message, a pass quoted inside a read file's contents, and an
+unverifiable paraphrase are all rejected or left unevaluated by the checkpoint scorers; a
+constant-returning implementation, a missing export, a forged `oracle-result:` line printed by
+candidate code, a `process.exit` inside the candidate, a candidate `import`, and realm escapes
+through the console, global, and local-object constructor chains all fail the oracle; an
+unapproved task root, a tampered or missing task file, an extra file, a missing scoring entry,
+and a `recorded` provider without isolation are all rejected.
 
 ## Executed commands and results
 
 | Evidence                | Command                                                                                                                                    | Result                                                                                                                                                                            |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | TypeScript build        | `pnpm run build`                                                                                                                           | passed (`tsc -p tsconfig.build.json`)                                                                                                                                             |
-| Hybrid-state tests      | `pnpm exec vitest run src/experiments/hybrid-state`                                                                                        | 8 files, 84 tests passed                                                                                                                                                          |
-| Full repository gate    | `pnpm check`                                                                                                                               | passed: oxfmt, oxlint, type-aware check, 220 vitest tests passed + 1 skipped, 14 release tests passed, knip clean                                                                 |
+| Hybrid-state tests      | `pnpm exec vitest run src/experiments/hybrid-state`                                                                                        | 8 files, 95 tests passed                                                                                                                                                          |
+| Full repository gate    | `pnpm check`                                                                                                                               | passed: oxfmt, oxlint, type-aware check, 231 vitest tests passed + 1 skipped, 14 release tests passed, knip clean                                                                 |
 | Package verification    | `pnpm run package:check`                                                                                                                   | passed: extension packaging plus export/replay commands                                                                                                                           |
 | Trace audit (wiring)    | `node dist/experiments/hybrid-state/cli.js audit --config experiments/hybrid-state/config.offline.json --out .local/hybrid-state/audit-v2` | run `run-mu6p260g-x6mt86`; 4 modes wiring passed; efficacy not_evaluated                                                                                                          |
-| Stage A closed loop     | `pnpm experiment:hybrid -- run --config experiments/hybrid-state/config.stage-a.offline.json --out .local/hybrid-state/stage-a`            | run `run-mu79rgve-w9tgfc`; 3 tasks × 2 modes = 6 trials, all wiring passed and all oracle tests passed; efficacy not_evaluated; 38 actor calls recorded (no Jev, no update calls) |
+| Stage A closed loop     | `pnpm experiment:hybrid -- run --config experiments/hybrid-state/config.stage-a.offline.json --out .local/hybrid-state/stage-a-v3`         | run `run-mu88cltp-8i9j0z`; 3 tasks × 2 modes = 6 trials, all wiring passed and all oracle tests passed; efficacy not_evaluated; 40 actor calls recorded (no Jev, no update calls) |
 | Existing result display | `node dist/experiments/hybrid-state/cli.js report --input .local/hybrid-state/stage-a`                                                     | existing result displayed; report rendered from `summary.json` without a new run                                                                                                  |
 | Live preflight          | `node dist/experiments/hybrid-state/cli.js run --config experiments/hybrid-state/config.live.example.json --out ...`                       | rejected: `provider.mode=live requires --live` (exit 1), no output directory created                                                                                              |
 | Live flag misuse        | `node dist/experiments/hybrid-state/cli.js run --live --config experiments/hybrid-state/config.offline.json --out ...`                     | rejected: `--live is only valid with provider.mode=live` (exit 1)                                                                                                                 |
 | Product replay          | `node dist/replay_cli.js <exported events.jsonl> --updater noop`                                                                           | exported trace replayed; state produced without errors                                                                                                                            |
 | Pi extension smoke      | inside `pnpm run test` (`src/pi/smoke.test.ts`)                                                                                            | extension loads and persists branch-correct state through the real Pi runner                                                                                                      |
 
-The Stage A output directory `.local/hybrid-state/stage-a/` contains `manifest.json`,
+The Stage A output directory `.local/hybrid-state/stage-a-v3/` contains `manifest.json`,
 `updates.jsonl`, `calls.jsonl`, `contexts.jsonl`, `summary.json`, and `report.md`. No persistence
 failure occurred; the manifest completed normally.
 

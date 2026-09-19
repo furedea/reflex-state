@@ -37,7 +37,7 @@
         {
           "operation": "add",
           "kind": "findings",
-          "text": "policy: use PRIMARY_PORT unless occupied; occupied means use FALLBACK_PORT",
+          "text": "policy: use PRIMARY_PORT unless it is occupied; when it is occupied, use FALLBACK_PORT",
           "sourceIds": ["self"],
           "trust": "tool_result",
           "origin": "generated"

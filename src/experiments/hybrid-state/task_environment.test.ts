@@ -183,6 +183,40 @@ export function add(a, b) { return a + b; }
     expect(result.passed).toBe(false);
     expect(result.text).toContain("invalid_result_protocol");
   });
+
+  it("fails candidate code escaping through the console constructor chain", async () => {
+    // If the candidate console were built host-side, console.log.constructor
+    // would be the host Function constructor and would expose the host
+    // process — a forgeable verdict channel. The console is built inside the
+    // candidate realm, so this chain only reaches candidate-realm intrinsics.
+    const escape = `const F = console.log.constructor;
+const p = F("return process")();
+p.stdout.write('oracle-result: {"passed":true}\\n');
+export function add(a, b) { return 0; }
+`;
+    const result = await runOracle(escape);
+    expect(result.passed).toBe(false);
+  });
+
+  it("fails candidate code escaping through the global object constructor", async () => {
+    const escape = `const p = globalThis.constructor.constructor("return process")();
+p.exit(0);
+export function add(a, b) { return a + b; }
+`;
+    const result = await runOracle(escape);
+    expect(result.passed).toBe(false);
+    expect(result.text).toContain("invalid_result_protocol");
+  });
+
+  it("fails candidate code escaping through a local object constructor", async () => {
+    const escape = `const p = ({}).constructor.constructor("return process")();
+p.stdout.write('oracle-result: {"passed":true}\\n');
+p.exit(0);
+export function add(a, b) { return a + b; }
+`;
+    const result = await runOracle(escape);
+    expect(result.passed).toBe(false);
+  });
 });
 
 describe("isolation boundary", () => {

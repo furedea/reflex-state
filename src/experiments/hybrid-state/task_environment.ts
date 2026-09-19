@@ -374,16 +374,26 @@ function parseOracleResult(stdout: string): OracleVerdict | null {
 }
 
 /** Trusted prelude prepended to every script oracle. `loadModule` evaluates a
- * workspace module as untrusted code inside a fresh vm context: it has no
- * process, no import machinery, and a console that cannot reach stdout, so the
- * `oracle-result:` verdict can only be produced by the trusted script. */
+ * workspace module as untrusted code inside a fresh vm context. The context is
+ * created from a null-prototype sandbox and receives no host values — the
+ * console is built inside the candidate realm — so candidate code cannot reach
+ * a host-realm Function/process through a constructor chain, and only this
+ * trusted script can emit the `oracle-result:` verdict. Candidate code only
+ * produces return values and exceptions; pass/fail is decided outside it. */
 const TRUSTED_PRELUDE = `import { readFileSync as __oracleReadFileSync } from "node:fs";
 import vm from "node:vm";
 async function loadModule(path) {
   const source = __oracleReadFileSync(path, "utf8");
-  const logs = [];
-  const sink = new Proxy({}, { get: () => (...args) => void logs.push(args.map(String).join(" ")) });
-  const context = vm.createContext({ console: sink });
+  const context = vm.createContext(Object.create(null));
+  new vm.Script(
+    "globalThis.__oracleLogs = [];" +
+      "const __write = (level) => (...args) => {" +
+      "  if (globalThis.__oracleLogs.length < 100)" +
+      "    globalThis.__oracleLogs.push(level + \\": \\" + args.map(String).join(\\" \\"));" +
+      "};" +
+      "globalThis.console = { log: __write(\\"log\\"), info: __write(\\"info\\")," +
+      " warn: __write(\\"warn\\"), error: __write(\\"error\\"), debug: __write(\\"debug\\") };",
+  ).runInContext(context);
   const mod = new vm.SourceTextModule(source, { context, identifier: String(path) });
   await mod.link(() => {
     throw new Error("candidate imports are not allowed");

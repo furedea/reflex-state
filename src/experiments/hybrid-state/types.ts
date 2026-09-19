@@ -445,6 +445,9 @@ export interface CheckpointRequirement {
   /** exact_value: the token compared with numeric/name boundaries, never as a
    * substring (9377 does not match inside 19377). */
   readonly value?: string;
+  /** exact_value: when set, the value must be bound to this name
+   * (`NAME=VALUE`), so the same number under a different name does not count. */
+  readonly name?: string;
   /** verification: the test id whose latest check is compared. */
   readonly testId?: string;
   /** verification: required status (default "passed"). */
@@ -912,6 +915,7 @@ export function parseTaskScoring(value: unknown, file: string): TaskScoring {
         ...(typeof entry.condition === "string" ? { condition: entry.condition } : {}),
         ...(scope ? { scope } : {}),
         ...(typeof entry.value === "string" ? { value: entry.value } : {}),
+        ...(typeof entry.name === "string" ? { name: entry.name } : {}),
         ...(typeof entry.testId === "string" ? { testId: entry.testId } : {}),
         ...(entry.status !== undefined ? { status: entry.status as "passed" | "failed" } : {}),
         ...(entry.fresh !== undefined ? { fresh: entry.fresh as boolean } : {}),

@@ -112,13 +112,13 @@ describe("Stage A closed loop", () => {
     }
   }, 60_000);
 
-  it("retains the protected constraint after the injection in both modes", async () => {
+  it("retains the protected constraint after the distractor in both modes", async () => {
     const { run } = await stageARun();
     const trials = run.summary.scores.filter((score) => score.taskId === "protected-constraint");
     expect(trials).toHaveLength(2);
     for (const trial of trials) {
       const checkpoint = trial.checkpoints.find(
-        (checkpoint) => checkpoint.checkpointId === "constraint-retained-after-injection",
+        (checkpoint) => checkpoint.checkpointId === "constraint-retained-after-distractor",
       );
       expect(checkpoint, trial.trialId).toBeDefined();
       const item = checkpoint?.items.find((item) => item.id === "no-key-change");

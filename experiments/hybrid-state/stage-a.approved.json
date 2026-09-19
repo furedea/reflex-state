@@ -1,11 +1,11 @@
 {
   "taskRoot": "experiments/hybrid-state/tasks/stage-a",
   "files": {
-    "01_protected_constraint.json": "2ba30b103013da513efdf070cb1774085f47cf292f175d801575d1cb18a652b8",
+    "01_protected_constraint.json": "851054415acae4d7dfff133593279c7b39d1e5b86e9159ad9e846f4ecff647f7",
     "02_transient_recovery.json": "2257292f393e90cdf514d8229bc97141b72cfc36bd56b8bb4396d5e25125304d",
-    "03_observation_derived.json": "a2e478cb9d4c307aadf834e0da63d3a95823124b3bd47b5c61210e8b2a9ff6ef",
-    "scoring/01_protected_constraint.json": "784454f8e917915a14d44a82e1aaca6940e634d3407710c8ef87f860bf5783e4",
+    "03_observation_derived.json": "84afc214bfcf7ae8bcb9e2f9125d3c2b4048a1070695f678dff703f710dd2f87",
+    "scoring/01_protected_constraint.json": "e0ba7fb073c4717f241c4eecb89a83c162f424a81df3ab30f7bf3eef1f4294a5",
     "scoring/02_transient_recovery.json": "b1eed3ebede79fb12dacca44b310035f3ddf73540707546cd4b409faed3e4bab",
-    "scoring/03_observation_derived.json": "cb160d2e08160c4d7b5392da2e5cb0bbbd2039386420bed6875314aee8296358"
+    "scoring/03_observation_derived.json": "cc1442b440c3e1b508b04c7b197d2eafca01904d1cdfe1ffd4897217effd025f"
   }
 }
