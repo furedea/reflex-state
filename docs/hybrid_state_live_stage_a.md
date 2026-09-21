@@ -154,3 +154,54 @@ llm, `maxActions: 8`, actor-only calls, 3 iterations ⇒ `maxRequests: 144`, `ti
 shared across modes, a real `actorModel` id filled into
 `config.stage-a.followup.live.example.json`, `executionIsolation: required`, and an explicit
 `--live`. Any additional retries or budget variants are separate, pre-declared analyses.
+
+## The frozen follow-up run (`run-mub0wwh3-1yuxt5`, 2026-09-21)
+
+Executed once under the frozen condition — commit `6d1261c`, clean tree,
+`.local/hybrid-state/review-02/freeze.json` (config `0dd5317a`, task-set `4fde8c8a`, prompts
+`2fa523e1`/`d2fe06a3`, lockfile `5e17d889`), `gpt-5.6-luna`, sandbox-exec verified on the
+host. 18/18 trials completed; 113 actor calls (≤144 cap); Jev/repair/update calls: 0; every
+response reported `responseModel: gpt-5.6-luna`. Artifacts:
+`.local/hybrid-state/stage-a-followup-live-01/`.
+
+| trial            | termination   | final artifact        | constraints | actor verify         | re-reads | patch m/e/p → a/u/r | in/out tok | wall |
+| ---------------- | ------------- | --------------------- | ----------- | -------------------- | -------- | ------------------- | ---------- | ---- |
+| iter0-pc-history | finish        | config-check pass     | api-key ok  | pass (step 3)        | 0        | —                   | 2645/880   | 56s  |
+| iter1-pc-history | finish        | config-check pass     | api-key ok  | pass (step 3)        | 0        | —                   | 2551/1550  | 39s  |
+| iter2-pc-history | finish        | config-check pass     | api-key ok  | pass (step 3)        | 0        | —                   | 2645/849   | 28s  |
+| iter0-tr-history | finish        | calc+syntax pass      | —           | pass (steps 2–3)     | 0        | —                   | 2853/693   | 27s  |
+| iter1-tr-history | finish        | calc+syntax pass      | —           | pass (steps 2–3)     | 0        | —                   | 2853/671   | 27s  |
+| iter2-tr-history | finish        | calc+syntax pass      | —           | pass (steps 2–3)     | 0        | —                   | 2853/500   | 18s  |
+| iter0-od-history | finish        | port-check pass       | —           | pass (step 4)        | 0        | —                   | 3265/3501  | 83s  |
+| iter1-od-history | finish        | port-check pass       | —           | pass (step 5)        | 0        | —                   | 4190/3280  | 79s  |
+| iter2-od-history | finish        | port-check pass       | —           | pass (step 5)        | 0        | —                   | 4190/1955  | 88s  |
+| iter0-pc-llm     | action_budget | config-check **fail** | api-key ok  | not_run              | 5        | 0/3/5 → 1/0/4       | 8126/2587  | 98s  |
+| iter1-pc-llm     | finish        | config-check pass     | api-key ok  | pass (step 5)        | 2        | 0/0/8 → 5/0/4       | 9279/2615  | 79s  |
+| iter2-pc-llm     | finish        | config-check pass     | api-key ok  | not_run              | 1        | 0/1/7 → 5/0/2       | 8927/1693  | 65s  |
+| iter0-tr-llm     | finish        | calc+syntax pass      | —           | pass (steps 2–3)     | 0        | 0/0/5 → 5/0/0       | 6014/1386  | 40s  |
+| iter1-tr-llm     | finish        | calc+syntax pass      | —           | pass (steps 2–3)     | 0        | 0/1/4 → 4/0/0       | 5973/988   | 42s  |
+| iter2-tr-llm     | finish        | calc+syntax pass      | —           | pass (steps 2–3)     | 0        | 0/2/3 → 3/0/0       | 5888/1194  | 40s  |
+| iter0-od-llm     | finish        | port-check pass       | —           | pass (step 6)        | 1        | 0/0/8 → 9/0/1       | 10237/5622 | 123s |
+| iter1-od-llm     | action_budget | port-check pass       | —           | fail (step 4, stale) | 1        | 0/1/7 → 6/0/3       | 9881/4679  | 160s |
+| iter2-od-llm     | action_budget | port-check pass       | —           | pass (step 7)        | 3        | 0/0/8 → 7/1/1       | 8976/5918  | 156s |
+
+Mode totals — history: 9/9 finish, 9/9 final-pass, 28,045 in / 13,879 out tokens, 118,307
+sent bytes, 447 s wall, 0 re-reads. llm: 6/9 finish, 8/9 final-pass (only iter0-pc-llm's
+final artifact failed), all constraints held, 73,301 in / 26,682 out tokens, 319,245 sent
+bytes, 804 s wall, 13 re-reads, patches 61 proposed / 45 applied / 1 unchanged / 15 rejected
+(extractive 33, generated 12). Cache tokens reported as 0 for every call.
+
+Evidence verification: all 113 context records reconstruct byte- and hash-identical sent
+bodies from `contexts.jsonl` + `system_prompts.jsonl` (2 distinct prompts, one per mode).
+No credential material appears in recorded inputs — the only `apiKey` strings are the
+synthetic protected-constraint task content. `report` renders the run read-only;
+`efficacyStatus` stays `descriptive_only`.
+
+Reading, without overclaiming: llm finished 6/9 here versus 1/3 + 2 incomplete in the old
+exploratory runs, but the conditions differ (prompt v3, `last_update_result` feedback,
+visible budget), so the change cannot be attributed to any single cause. Three llm trials
+still exhausted the action budget — two of them while re-reading (5 and 3 re-reads).
+Whether the old "re-reads because saved detail was unusable" pattern persisted is not
+established by checkpoint `retained: true` alone. This run is a same-task, same-model,
+18-trial observation; it is not a superiority, non-inferiority, or generalization result,
+and it is not summed with the six exploratory runs. The work is recorded as concluded.

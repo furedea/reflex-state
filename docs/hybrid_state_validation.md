@@ -155,12 +155,13 @@ failure occurred; the manifest completed normally.
 
 ### Condition-freeze round (request evidence + safe evaluation + freeze)
 
-| Evidence                     | Command                                                                                                                                                                      | Result                                                                                                                                                        |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Full repository gate         | `pnpm check`                                                                                                                                                                 | passed: format, lint, typecheck, 270 vitest tests passed + 1 skipped, 14 release tests passed, knip clean                                                     |
-| Package verification         | `pnpm run package:check`                                                                                                                                                     | passed                                                                                                                                                        |
-| Evidence-capture offline run | `node dist/experiments/hybrid-state/cli.js run --config experiments/hybrid-state/config.stage-a.followup.offline.json --out .local/hybrid-state/stage-a-followup-offline-02` | run `run-muavng6b-6aury1`; `system_prompts.jsonl` written (one record per mode); all 40 context records reconstructed to byte- and hash-identical sent bodies |
-| Re-read re-analysis          | `node .local/hybrid-state/review-02/analyze_rereads.mjs .local/hybrid-state/stage-a-live6 .local/hybrid-state/review-02`                                                     | corrected output at `review-02/reread-cases-stage-a-live6.json`; no `necessary_detail_missing` is asserted without a named missing requirement                |
+| Evidence                     | Command                                                                                                                                                                                                                               | Result                                                                                                                                                                   |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Full repository gate         | `pnpm check`                                                                                                                                                                                                                          | passed: format, lint, typecheck, 270 vitest tests passed + 1 skipped, 14 release tests passed, knip clean                                                                |
+| Package verification         | `pnpm run package:check`                                                                                                                                                                                                              | passed                                                                                                                                                                   |
+| Evidence-capture offline run | `node dist/experiments/hybrid-state/cli.js run --config experiments/hybrid-state/config.stage-a.followup.offline.json --out .local/hybrid-state/stage-a-followup-offline-02`                                                          | run `run-muavng6b-6aury1`; `system_prompts.jsonl` written (one record per mode); all 40 context records reconstructed to byte- and hash-identical sent bodies            |
+| Re-read re-analysis          | `node .local/hybrid-state/review-02/analyze_rereads.mjs .local/hybrid-state/stage-a-live6 .local/hybrid-state/review-02`                                                                                                              | corrected output at `review-02/reread-cases-stage-a-live6.json`; no `necessary_detail_missing` is asserted without a named missing requirement                           |
+| Frozen live Stage A run      | `node dist/experiments/hybrid-state/cli.js run --config .local/hybrid-state/review-02/config.stage-a.followup.live.json --freeze .local/hybrid-state/review-02/freeze.json --live --out .local/hybrid-state/stage-a-followup-live-01` | run `run-mub0wwh3-1yuxt5`; freeze check passed; 18/18 trials completed; 113 actor calls, 0 Jev/repair/update; all 113 sent bodies reconstructed hash- and byte-identical |
 
 New evidence fields added this round: `ContextRecord.systemHash` + `system_prompts.jsonl`
 (prompt body once per distinct hash, gated by the existing `recordContextText`), and
@@ -176,24 +177,18 @@ mismatch. No historical artifacts were modified; no live request was made.
 ## Not performed
 
 As of the previous revision no live request had been made. Since then, six live Stage A runs
-were executed and are recorded in `docs/hybrid_state_live_stage_a.md`. **During this follow-up
-revision no new live Jev, actor, repair, or update request was made** — all API-facing paths were
-exercised only through fake providers, stubbed clients, and read-only log analysis. No private
-session data was supplied. No human review of the synthetic labels was performed. No claim about
-real task success, cost, latency, statistical non-inferiority, or state-first superiority is
-supported by this evidence, and the new protocol's efficacy has not been evaluated at all.
+were executed and are recorded in `docs/hybrid_state_live_stage_a.md`. During the follow-up
+revision itself no live request was made — all API-facing paths were exercised only through
+fake providers, stubbed clients, and read-only log analysis. After that revision was frozen,
+one authorized live run (`run-mub0wwh3-1yuxt5`) executed the frozen condition once; its
+results are descriptive only and are recorded in the same document. No private session data
+was supplied. No human review of the synthetic labels was performed. No claim about real task
+success, cost, latency, statistical non-inferiority, or state-first superiority is supported
+by this evidence.
 
-Before a follow-up live Stage A run, the remaining requirements are: fill `actorModel` with a
-real provider/model id in `config.stage-a.followup.live.example.json` (it ships empty so a
-verbatim copy fails config validation), credentials resolvable through the existing Pi/TypeSafe
-paths, the `--live` flag, and a decision about how live efficacy will be scored, since live
-output is only `descriptive_only` today. The fixed comparison conditions are: the three approved
-Stage A tasks, modes `history` and `llm`, `maxActions: 8`, actor calls only, 3 iterations
-(`maxRequests: 144` as the actor-call budget), and `timeoutMs: 120000` identical across modes.
-The approved task set is already enforced: the checked-in sha256 manifest
-`experiments/hybrid-state/stage-a.approved.json` pins every task and scoring file, scoring is
-mandatory for closed-loop tasks, and the isolation mechanism is verified on macOS through the
-deny-default `sandbox-exec` profile probes (workspace write allowed, outside read denied,
-symlink escape denied, inherited environment removed, network denied, timeout enforced).
-`live_ready` therefore depends on live credentials and the run preflight rather than on
-additional code.
+The frozen Stage A comparison ran once under authorization: the three approved tasks, modes
+`history` and `llm`, `maxActions: 8`, actor calls only, 3 iterations (`maxRequests: 144` as the
+actor-call budget), and `timeoutMs: 120000` identical across modes. Live output remains
+`descriptive_only` — how live efficacy would be scored was never decided, and no further runs
+are planned. Any hypothetical future run would still need a filled `actorModel`, resolvable
+credentials, `--live`, and a freeze match; none of that is scheduled.
