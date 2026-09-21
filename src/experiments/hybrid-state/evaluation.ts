@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
 
 import type {
+  ActionForm,
+  ActorVerificationEntry,
   AuditLabel,
   Candidate,
   CallRecord,
@@ -13,14 +15,18 @@ import type {
   ExperimentManifest,
   ExperimentMode,
   ExperimentSummary,
+  FinalArtifactEvaluation,
   LabelKind,
   ModeMetrics,
+  PatchStats,
   ProviderMode,
   SkippedTrial,
   TaskCheckpoint,
+  TerminationReason,
   TrialScore,
   UsageFieldSummary,
 } from "./types.js";
+import { PROTOCOL_ID, RESULT_SCHEMA_VERSION } from "./types.js";
 
 export interface AuditResult {
   readonly labels: readonly AuditLabel[];
@@ -105,16 +111,23 @@ export interface TrialOutcome {
   readonly completed: boolean;
   readonly cancelled: boolean;
   readonly error?: string;
+  readonly terminationReason: TerminationReason;
   readonly policyViolations: readonly string[];
   /** Oracle-reported task-constraint verdicts; a false is sticky across the
    * trial and is scored independently of action-policy violations. */
   readonly constraints: Readonly<Record<string, boolean>>;
   readonly testResults: Readonly<Record<string, "passed" | "failed" | "not_run">>;
+  readonly finalArtifact: FinalArtifactEvaluation;
+  readonly finalConstraintVerdicts: Readonly<Record<string, boolean>> | null;
+  readonly actorVerificationAtStop: Readonly<Record<string, ActorVerificationEntry>>;
   readonly actorTests: readonly {
     readonly testId: string;
     readonly step: number;
     readonly passed: boolean;
+    readonly generation?: number;
   }[];
+  readonly patchStats: PatchStats;
+  readonly actionForms: Readonly<Record<ActionForm, number>>;
   readonly sentTexts: readonly string[];
   readonly checkpoints: readonly TaskCheckpoint[];
   readonly failureObserved: boolean;
@@ -181,13 +194,20 @@ export function scoreTrial(outcome: TrialOutcome): TrialScore {
     finishedAt: outcome.finishedAt,
     wallMs: Math.max(0, Date.parse(outcome.finishedAt) - Date.parse(outcome.startedAt)),
     completed: outcome.completed,
+    terminationReason: outcome.terminationReason,
+    finishedWithinBudget: outcome.completed,
     testPassed,
     constraintPassed: Object.keys(outcome.constraints).length
       ? Object.values(outcome.constraints).every(Boolean)
       : null,
     constraints: outcome.constraints,
     tests: outcome.testResults,
+    finalArtifact: outcome.finalArtifact,
+    finalConstraintVerdicts: outcome.finalConstraintVerdicts,
+    actorVerificationAtStop: outcome.actorVerificationAtStop,
     actorTests: outcome.actorTests,
+    patchStats: outcome.patchStats,
+    actionForms: outcome.actionForms,
     checkpoints: scoreCheckpoints(outcome),
     rereads: outcome.rereads,
     retries: outcome.retries,
@@ -522,7 +542,8 @@ export function summarize(options: {
   ) as Record<ExperimentMode, ModeMetrics>;
   const scores = options.scores;
   return {
-    schemaVersion: 2,
+    schemaVersion: RESULT_SCHEMA_VERSION,
+    protocolId: PROTOCOL_ID,
     runId: options.runId,
     evaluation: options.evaluation,
     provider: options.provider,
@@ -566,7 +587,8 @@ function defaultLimitations(options: {
 
 export function reportMarkdown(value: unknown, manifest?: ExperimentManifest | null): string {
   const summary = value as ExperimentSummary;
-  if (!summary || summary.schemaVersion !== 2) {
+  const schemaVersion = (summary as { schemaVersion?: unknown }).schemaVersion;
+  if (!summary || (schemaVersion !== 2 && schemaVersion !== RESULT_SCHEMA_VERSION)) {
     return [
       "# Hybrid-state experiment report",
       "",
@@ -587,6 +609,7 @@ export function reportMarkdown(value: unknown, manifest?: ExperimentManifest | n
     `- run: \`${summary.runId}\``,
     `- evaluation: ${summary.evaluation}`,
     `- provider: ${summary.provider}`,
+    ...(summary.protocolId ? [`- protocol: \`${summary.protocolId}\``] : []),
     ...(manifest
       ? [
           `- manifest: started ${manifest.startedAt}, status ${manifest.status}${manifest.finishedAt ? `, finished ${manifest.finishedAt}` : ""}${manifest.failedStage ? ` (failed stage: ${manifest.failedStage})` : ""}`,
@@ -616,12 +639,17 @@ export function reportMarkdown(value: unknown, manifest?: ExperimentManifest | n
     );
   }
   if (summary.scores.length) {
+    const v3 = summary.schemaVersion === RESULT_SCHEMA_VERSION;
     lines.push(
       "",
       "## Trials",
       "",
-      "| trial | task | mode | status | wiring | completed | tests | actor tests | checkpoints |",
-      "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+      v3
+        ? "| trial | task | mode | status | wiring | termination | finished | final artifact | actor verify | patch a/u/r | checkpoints |"
+        : "| trial | task | mode | status | wiring | completed | tests | actor tests | checkpoints |",
+      v3
+        ? "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        : "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     );
     for (const score of summary.scores) {
       const checkpoints = score.checkpoints
@@ -640,10 +668,38 @@ export function reportMarkdown(value: unknown, manifest?: ExperimentManifest | n
       const actorTests = score.actorTests
         .map((test) => `${test.testId}@${test.step}:${test.passed ? "pass" : "fail"}`)
         .join(",");
-      lines.push(
-        `| ${score.trialId} | ${score.taskId} | ${score.mode} | ${score.executionStatus} | ${score.wiringStatus} | ${score.completed} | ${tests || "-"} | ${actorTests || "-"} | ${checkpoints || "-"} |`,
-      );
+      if (v3) {
+        const finalTests = score.finalArtifact
+          ? Object.entries(score.finalArtifact.tests)
+              .map(([id, status]) => `${id}:${status}`)
+              .join(",") || score.finalArtifact.status
+          : "-";
+        const actorVerify = score.actorVerificationAtStop
+          ? Object.entries(score.actorVerificationAtStop)
+              .map(
+                ([id, entry]) =>
+                  `${id}:${entry.status}${entry.freshness === "stale" ? "(stale)" : ""}`,
+              )
+              .join(",")
+          : "-";
+        const patch = score.patchStats
+          ? `${score.patchStats.applied}/${score.patchStats.unchanged}/${score.patchStats.rejected}`
+          : "-";
+        lines.push(
+          `| ${score.trialId} | ${score.taskId} | ${score.mode} | ${score.executionStatus} | ${score.wiringStatus} | ${score.terminationReason ?? "-"} | ${score.finishedWithinBudget ?? "-"} | ${finalTests || "-"} | ${actorVerify || "-"} | ${patch} | ${checkpoints || "-"} |`,
+        );
+      } else {
+        lines.push(
+          `| ${score.trialId} | ${score.taskId} | ${score.mode} | ${score.executionStatus} | ${score.wiringStatus} | ${score.completed} | ${tests || "-"} | ${actorTests || "-"} | ${checkpoints || "-"} |`,
+        );
+      }
     }
+    if (!v3)
+      lines.push(
+        "",
+        "> schema v2 result: termination, final-artifact, and update-feedback fields",
+        "> did not exist yet; missing values are shown as `-` and never inferred.",
+      );
   }
   if (summary.skippedTrials.length) {
     lines.push("", "## Skipped trials", "");

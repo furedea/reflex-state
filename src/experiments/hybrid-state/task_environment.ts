@@ -213,7 +213,9 @@ export class TaskEnvironment {
         const run = await runScriptOracle(this.workspace, oracle.script, this.options);
         results.push({
           testId,
-          status: run.passed ? "passed" : "failed",
+          // An oracle that never executed is "not_run", not a failure of the
+          // artifact (e.g. required sandbox unavailable on this host).
+          status: run.ran === false ? "not_run" : run.passed ? "passed" : "failed",
           output: run.output,
           ...(run.constraints ? { constraints: run.constraints } : {}),
         });
@@ -517,6 +519,9 @@ async function runScriptOracle(
 ): Promise<{
   readonly passed: boolean;
   readonly output: string;
+  /** False when the oracle never ran (sandbox unavailable); the caller must
+   * not count that as an artifact failure. */
+  readonly ran?: boolean;
   readonly constraints?: Readonly<Record<string, boolean>>;
 }> {
   const directory = await mkdtemp(join(tmpdir(), "hybrid-oracle-"));
@@ -538,7 +543,11 @@ async function runScriptOracle(
     if (options.isolated) {
       const launcher = resolvedLauncher();
       if (!launcher)
-        return { passed: false, output: "sandbox-exec unavailable on this host; oracle not run" };
+        return {
+          passed: false,
+          ran: false,
+          output: "sandbox-exec unavailable on this host; oracle not run",
+        };
       command = launcher.sandbox;
       argv = [
         "-p",

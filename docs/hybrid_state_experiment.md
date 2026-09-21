@@ -49,6 +49,15 @@ local metadata such as trial ids never leaks into the wire payload. Usage is rec
 the provider reports it: missing usage stays absent and is never written as a measured zero.
 Recorded providers replay only the response bound to the call kind, trial, step, and request hash.
 
+Under protocol `stage-a-followup-1` (prompt `hybrid-state-prompt-v3`, result schema 3) both modes
+receive an identical `action_budget` object (`limit`, `used`, `remaining_including_next`,
+`finish_counts_as_action`) in every request, and llm additionally receives `last_update_result`:
+the previous step's patch outcome (`patch_input` missing/empty/present, applied/unchanged/
+rejected indexes and counts, capped at 2 KiB of detail with an `omitted_detail_count`). The
+feedback covers the previous step only and never accumulates. The actor responds with one JSON
+object carrying `action` plus, in llm mode, an optional `statePatch`; canonical, shorthand, and
+bare action spellings are normalized and the observed form is recorded per trial.
+
 ## Offline commands
 
 ```sh
@@ -60,6 +69,10 @@ pnpm experiment:hybrid -- run \
   --config experiments/hybrid-state/config.stage-a.offline.json \
   --out .local/hybrid-state/stage-a
 
+pnpm experiment:hybrid -- run \
+  --config experiments/hybrid-state/config.stage-a.followup.offline.json \
+  --out .local/hybrid-state/stage-a-followup-offline
+
 pnpm experiment:hybrid -- report --input .local/hybrid-state/stage-a
 ```
 
@@ -70,6 +83,17 @@ crash mid-call is distinguishable from a call never made. The manifest moves thr
 `completed`/`failed`, so a persistence failure after execution stays distinguishable from an
 execution failure. `report` displays an existing result without starting a new run and verifies
 that the summary's run id and schema match the manifest.
+
+When `recordContextText` is on, the system prompt body is also persisted — once per distinct
+hash in `system_prompts.jsonl`, referenced by `systemHash` on each context record — so every
+call's exact sent body `{system, messages:[{role:"user", content}]}` can be reconstructed from
+the saved data and checked against the recorded `requestHash`/`requestBytes`. Auth material and
+local metadata never enter the sent body, so none appears in this evidence. Each call record may
+additionally carry `responseModel`: the model id the provider reported answering with, which is
+never assumed equal to the requested model. The completed manifest pins the executed condition:
+`head` plus a `dirty` flag for the working tree, `taskSetHash` over the task and scoring files,
+per-mode `promptHashes`, and `runtime` (node, platform, lockfile hash, and whether generation
+options were sent explicitly or left to provider defaults).
 
 ## Evaluation honesty
 
@@ -125,6 +149,23 @@ map of boolean verdicts to their result, verdicts are sticky-false across the tr
 escape) fails wiring without changing `constraintPassed`, and a broken task constraint fails
 `constraintPassed` without needing any policy violation.
 
+Completion, artifact quality, and the actor's own verification are scored as separate facts:
+`finishedWithinBudget` records only that the actor chose `finish` inside the action budget;
+`finalArtifact` runs the task oracles on the final workspace even when the budget ran out —
+but only when the workspace is intact and required isolation was actually verified; a corrupt
+workspace, unverified isolation, a recording failure, or cancellation runs zero additional
+candidate code and reports the reason (`environment_error`, `isolation_unverified`,
+`cancelled`) instead of a verdict;
+`finalConstraintVerdicts` reports the constraint verdicts from that final pass without erasing
+sticky mid-run violations; `actorVerificationAtStop` keeps the actor's latest self-check per test
+id with `current`/`stale` freshness so a pass taken before a later edit is never presented as
+current; and `terminationReason` distinguishes `finish`, `action_budget`, `request_budget`,
+`policy_violation`, `contract_error`, `provider_error`, `persistence_error`,
+`environment_error`, `cancelled`, and `state_unavailable`. Result artifacts carry
+`schemaVersion: 3` and
+`protocolId` on both manifest and summary; the report reader cross-checks them and renders older
+schema v2 results read-only instead of filling missing fields with defaults.
+
 ## Live execution
 
 Live execution requires a live configuration and an explicit `--live` flag; the flag is rejected
@@ -148,6 +189,12 @@ network denial, and timeout enforcement, and reports each failed check. Live run
 `--session` inputs. Authentication uses the existing Pi and TypeSafe credential paths; keys are
 not written to configuration or output. Live execution is intentionally not part of the default
 checks.
+
+A fixed comparison can be pinned with a `FreezeRecord` (commit, dirty flag, effective-config
+hash, task-set hash, prompt hashes, lockfile hash, runtime) captured via
+`captureFreeze()`/`verifyFreeze()` in `freeze.ts`, and re-checked at run time with
+`--freeze <path>`: any drift in code, config, tasks, scoring, or prompts aborts the run as a
+different condition rather than executing under the frozen name.
 
 ## What this prototype does not claim
 

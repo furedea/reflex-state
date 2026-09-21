@@ -1,12 +1,14 @@
 import { Buffer } from "node:buffer";
 
 import type {
+  ActionBudgetView,
   ExperimentMode,
   FactsView,
   HybridBudgets,
   InputBundle,
   MemoryItem,
   TraceMessage,
+  UpdateFeedback,
   WorkMemory,
 } from "./types.js";
 
@@ -17,6 +19,11 @@ export interface ProjectionInput {
   readonly memory: WorkMemory;
   readonly latest: readonly TraceMessage[];
   readonly history: readonly TraceMessage[];
+  /** Shared action-budget view sent identically to both modes. */
+  readonly actionBudget: ActionBudgetView;
+  /** llm mode only: the previous step's patch outcome; null is explicit at
+   * step 0 and never accumulates older results. */
+  readonly lastUpdateResult?: UpdateFeedback | null;
   readonly fixedTools?: readonly string[];
   readonly allowedTests?: readonly string[];
   readonly budgets: HybridBudgets;
@@ -30,6 +37,7 @@ export interface ProjectedInput {
 export function buildProjection(input: ProjectionInput): ProjectedInput {
   const fixedTools = input.fixedTools ?? ["read", "write", "edit", "test", "finish"];
   const allowedTests = input.allowedTests ?? [];
+  const feedback = feedbackBytes(input);
   if (input.mode === "history") {
     const history = renderMessages(input.history);
     const userText = sentText({
@@ -37,9 +45,10 @@ export function buildProjection(input: ProjectionInput): ProjectedInput {
       tools: fixedTools,
       tests: allowedTests,
       history,
+      action_budget: input.actionBudget,
     });
     const bytes = {
-      ...sizes("", "", "", history),
+      ...sizes("", "", "", history, feedback),
       total: byteLength(userText),
     };
     return {
@@ -88,6 +97,10 @@ export function buildProjection(input: ProjectionInput): ProjectedInput {
     facts: JSON.parse(facts) as unknown,
     memory: JSON.parse(memoryResult.text) as unknown,
     latest_observation: JSON.parse(latestText) as unknown,
+    action_budget: input.actionBudget,
+    last_update_result: input.lastUpdateResult
+      ? serializeUpdateFeedback(input.lastUpdateResult)
+      : null,
   });
   const truncated = memoryResult.truncated;
   if (byteLength(userText) > input.budgets.requestBytes)
@@ -109,7 +122,10 @@ export function buildProjection(input: ProjectionInput): ProjectedInput {
       facts,
       memory: memoryResult.text,
       latest: latestText,
-      bytes: { ...sizes(facts, memoryResult.text, latestText, ""), total: byteLength(userText) },
+      bytes: {
+        ...sizes(facts, memoryResult.text, latestText, "", feedback),
+        total: byteLength(userText),
+      },
       truncated,
     },
     userText,
@@ -118,6 +134,27 @@ export function buildProjection(input: ProjectionInput): ProjectedInput {
 
 export function sentText(sections: Record<string, unknown>): string {
   return JSON.stringify(sections);
+}
+
+/** Wire shape of the previous step's patch outcome. Snake_case matches the
+ * rest of the actor input contract; internal records keep the full detail. */
+export function serializeUpdateFeedback(feedback: UpdateFeedback): Record<string, unknown> {
+  return {
+    patch_input: feedback.patchInput,
+    applied: feedback.applied.map((entry) => ({
+      index: entry.index,
+      memory_id: entry.memoryId,
+    })),
+    unchanged: [...feedback.unchanged],
+    rejected: feedback.rejected.map((entry) => ({
+      index: entry.index,
+      reason: entry.reason,
+    })),
+    applied_count: feedback.appliedCount,
+    unchanged_count: feedback.unchangedCount,
+    rejected_count: feedback.rejectedCount,
+    omitted_detail_count: feedback.omittedDetailCount,
+  };
 }
 
 export function renderMessages(messages: readonly TraceMessage[]): string {
@@ -222,8 +259,16 @@ function unavailable(
     tests: allowedTests,
     unavailable: reason,
     facts: facts ? (JSON.parse(facts) as unknown) : undefined,
+    action_budget: input.actionBudget,
+    ...(input.mode !== "history"
+      ? {
+          last_update_result: input.lastUpdateResult
+            ? serializeUpdateFeedback(input.lastUpdateResult)
+            : null,
+        }
+      : {}),
   });
-  const bytes = sizes(facts, memory, latest, "");
+  const bytes = sizes(facts, memory, latest, "", feedbackBytes(input));
   return {
     bundle: {
       mode: input.mode,
@@ -240,11 +285,28 @@ function unavailable(
   };
 }
 
+/** Serialized size of the shared protocol fields (action_budget and, in llm
+ * mode, last_update_result) so their cost is visible in per-field bytes. */
+function feedbackBytes(input: ProjectionInput): number {
+  return byteLength(
+    JSON.stringify({
+      action_budget: input.actionBudget,
+      last_update_result:
+        input.mode === "history"
+          ? null
+          : input.lastUpdateResult
+            ? serializeUpdateFeedback(input.lastUpdateResult)
+            : null,
+    }),
+  );
+}
+
 function sizes(
   facts: string,
   memory: string,
   latest: string,
   history: string,
+  feedback: number,
 ): InputBundle["bytes"] {
   return {
     total: 0,
@@ -252,6 +314,7 @@ function sizes(
     memory: byteLength(memory),
     latest: byteLength(latest),
     history: byteLength(history),
+    feedback,
   };
 }
 

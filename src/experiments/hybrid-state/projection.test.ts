@@ -14,6 +14,13 @@ const budgets: HybridBudgets = {
   maxActions: 8,
 };
 
+const actionBudget = {
+  limit: 8,
+  used: 0,
+  remaining_including_next: 8,
+  finish_counts_as_action: true,
+} as const;
+
 function messages(count: number): TraceMessage[] {
   return Array.from({ length: count }, (_, index) => ({
     id: `m-${index}`,
@@ -35,6 +42,7 @@ describe("hybrid projection", () => {
       memory: emptyMemory(),
       latest: history.slice(-2),
       history,
+      actionBudget,
       budgets,
     });
     expect(input.bundle.unavailable).toBeUndefined();
@@ -53,6 +61,7 @@ describe("hybrid projection", () => {
       memory: emptyMemory(),
       latest: history.slice(-2),
       history,
+      actionBudget,
       budgets,
     });
     expect(input.bundle.unavailable).toBeUndefined();
@@ -96,6 +105,7 @@ describe("hybrid projection", () => {
       memory,
       latest: [],
       history: [],
+      actionBudget,
       budgets: { ...budgets, memoryBytes: 2048 },
     });
     expect(input.bundle.unavailable).toBeUndefined();
@@ -111,6 +121,7 @@ describe("hybrid projection", () => {
       memory: emptyMemory(),
       latest: [],
       history: [],
+      actionBudget,
       budgets: { ...budgets, factsBytes: 10 },
     });
     expect(input.bundle.unavailable).toBe("facts_metadata_exceeds_budget");

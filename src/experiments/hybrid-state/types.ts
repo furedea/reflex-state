@@ -1,7 +1,13 @@
 import type { AgentEvent, EventId, HotState } from "../../core/types.js";
 
 export const HYBRID_SCHEMA_VERSION = 2 as const;
-export const PROMPT_VERSION = "hybrid-state-prompt-v2" as const;
+/** Result artifacts (manifest/summary) move independently of the config
+ * schema: v3 adds termination, final-artifact, and update-feedback fields. */
+export const RESULT_SCHEMA_VERSION = 3 as const;
+export const PROMPT_VERSION = "hybrid-state-prompt-v3" as const;
+/** Identifies the comparison protocol (prompts + input fields) a run used, so
+ * results are never mixed across protocol revisions. */
+export const PROTOCOL_ID = "stage-a-followup-1" as const;
 
 export type ExperimentMode = "history" | "llm" | "rules" | "jev";
 export type EvaluationKind = "trace_audit" | "closed_loop";
@@ -281,13 +287,87 @@ export interface ActorRequest {
   readonly model: string;
 }
 
+/** Whether the actor emitted a patch key at all: "missing" (absent),
+ * "empty" (present and empty), or "present" (one or more operations). A
+ * structurally invalid patch never reaches this tri-state; it is a decode
+ * error instead. */
+export type PatchInputKind = "missing" | "empty" | "present";
+
+/** Which surface form the action arrived in; all normalize to the same
+ * validated action but are counted so contract friction stays visible. */
+export type ActionForm = "canonical" | "shorthand" | "bare";
+
+/** Per-step feedback about the previous state patch, returned to the actor on
+ * the next input only (never accumulated across steps). Reasons are short
+ * enumerable codes; full detail stays in the local update records. */
+export interface UpdateFeedback {
+  readonly patchInput: PatchInputKind;
+  readonly applied: readonly { readonly index: number; readonly memoryId: string }[];
+  readonly unchanged: readonly number[];
+  readonly rejected: readonly { readonly index: number; readonly reason: string }[];
+  readonly appliedCount: number;
+  readonly unchangedCount: number;
+  readonly rejectedCount: number;
+  readonly omittedDetailCount: number;
+}
+
+/** The shared action-budget view sent to the actor in both modes. */
+export interface ActionBudgetView {
+  readonly limit: number;
+  readonly used: number;
+  readonly remaining_including_next: number;
+  readonly finish_counts_as_action: boolean;
+}
+
+export type TerminationReason =
+  | "finish"
+  | "action_budget"
+  | "request_budget"
+  | "policy_violation"
+  | "contract_error"
+  | "provider_error"
+  | "state_unavailable"
+  | "persistence_error"
+  | "environment_error"
+  | "cancelled";
+
+/** Independent evaluation of the final workspace by the evaluator's oracles,
+ * run regardless of whether the actor finished within budget. */
+export interface FinalArtifactEvaluation {
+  readonly status: "evaluated" | "not_evaluated";
+  readonly reason?: string;
+  readonly tests: Readonly<Record<string, "passed" | "failed" | "not_run">>;
+}
+
+/** The actor's own latest test run per declared test id at trial stop;
+ * "stale" means the workspace changed after that run. */
+export interface ActorVerificationEntry {
+  readonly status: "passed" | "failed" | "not_run";
+  readonly step?: number;
+  readonly freshness?: "current" | "stale";
+}
+
+/** Per-trial patch accounting: how many steps emitted which patch shape and
+ * how the proposed operations resolved. */
+export interface PatchStats {
+  readonly input: { readonly missing: number; readonly empty: number; readonly present: number };
+  readonly proposed: number;
+  readonly applied: number;
+  readonly unchanged: number;
+  readonly rejected: number;
+}
+
 export interface ActorResponse {
   readonly action?: ActorAction;
   readonly statePatch?: readonly PatchOperation[];
+  readonly patchInput?: PatchInputKind;
+  readonly actionForm?: ActionForm;
   readonly text?: string;
   /** Raw provider text when decoding failed; recorded only when the run opts
    * into response logging so contract failures stay inspectable. */
   readonly rawText?: string;
+  /** The model id the provider reports having answered with, when available. */
+  readonly responseModel?: string;
   readonly usage?: Usage;
   readonly latencyMs?: number;
   readonly error?: string;
@@ -314,6 +394,9 @@ export interface InputBundle {
     readonly memory: number;
     readonly latest: number;
     readonly history: number;
+    /** Protocol fields shared by both modes: action_budget plus the llm
+     * last_update_result notification. */
+    readonly feedback: number;
   };
   readonly truncated: readonly string[];
   readonly unavailable?: string;
@@ -356,6 +439,9 @@ export interface CallRecord {
   /** Raw provider text for a failed decode, present only when the run opted
    * into response logging (`recordResponseText`). */
   readonly responseText?: string;
+  /** The model id the provider actually answered with, when reported; never
+   * assumed equal to the requested model. */
+  readonly responseModel?: string;
   readonly attempts: number;
 }
 
@@ -369,7 +455,19 @@ export interface ContextRecord {
   readonly sentBytes: number;
   readonly included: readonly string[];
   readonly truncated: readonly string[];
+  /** Hash of the system prompt sent with this step; the body is stored once
+   * per run in system_prompts.jsonl when recordContextText is on. */
+  readonly systemHash: string;
   readonly text?: string;
+}
+
+/** The system prompt body, stored once per distinct hash inside a run so the
+ * full sent input stays reconstructible without duplicating static text. */
+export interface SystemPromptRecord {
+  readonly record: "system_prompt";
+  readonly runId: string;
+  readonly hash: string;
+  readonly text: string;
 }
 
 export interface UpdateRecord {
@@ -517,6 +615,11 @@ export interface TrialScore {
   readonly finishedAt: string;
   readonly wallMs: number;
   readonly completed: boolean;
+  /** Why the trial stopped: finish, a budget, or an error class. */
+  readonly terminationReason: TerminationReason;
+  /** The actor chose finish within the action budget; a correct final
+   * artifact alone never sets this. */
+  readonly finishedWithinBudget: boolean;
   readonly testPassed: boolean;
   /** Independent task-constraint score from oracle-reported verdicts; null when
    * the task declared no constraints. Never derived from policy violations. */
@@ -524,11 +627,23 @@ export interface TrialScore {
   /** Per-constraint verdicts reported by oracles across the trial. */
   readonly constraints: Readonly<Record<string, boolean>>;
   readonly tests: Readonly<Record<string, "passed" | "failed" | "not_run">>;
+  /** Evaluator-side oracle results on the final workspace, separate from the
+   * actor's own test runs; "not_evaluated" keeps an explicit reason. */
+  readonly finalArtifact: FinalArtifactEvaluation;
+  /** Constraint verdicts from the final artifact evaluation only; null when no
+   * constraint verdicts were produced at all. Mid-run violations recorded in
+   * `constraints` stay sticky and are never cleared by this field. */
+  readonly finalConstraintVerdicts: Readonly<Record<string, boolean>> | null;
+  readonly actorVerificationAtStop: Readonly<Record<string, ActorVerificationEntry>>;
   readonly actorTests: readonly {
     readonly testId: string;
     readonly step: number;
     readonly passed: boolean;
+    readonly generation?: number;
   }[];
+  /** llm-mode patch accounting; zero in history mode. */
+  readonly patchStats: PatchStats;
+  readonly actionForms: Readonly<Record<ActionForm, number>>;
   readonly checkpoints: readonly CheckpointResult[];
   readonly rereads: number;
   readonly retries: number;
@@ -542,7 +657,7 @@ export interface SkippedTrial {
   readonly taskId: string;
   readonly mode: ExperimentMode;
   readonly iteration: number;
-  readonly reason: "not_run_global_budget" | "persistence_failed";
+  readonly reason: "not_run_global_budget" | "persistence_failed" | "cancelled";
 }
 
 /** Per-usage-field totals that distinguish "not measured" from "measured zero". */
@@ -581,11 +696,29 @@ export interface ExperimentEnvironment {
 }
 
 export interface ExperimentManifest {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: typeof RESULT_SCHEMA_VERSION;
+  /** Comparison protocol (prompt + input contract) the run was produced
+   * under; results are only comparable within the same protocolId. */
+  readonly protocolId: typeof PROTOCOL_ID;
   readonly runId: string;
   readonly status: ManifestStatus;
   readonly head: string | null;
+  /** True when the working tree had uncommitted changes at run start; a dirty
+   * tree means `head` alone does not identify the executed code. */
+  readonly dirty?: boolean;
   readonly inputHash: string;
+  /** Content hash of the task root's task + scoring files (closed_loop only). */
+  readonly taskSetHash?: string;
+  /** sha256 of each mode's system prompt text. */
+  readonly promptHashes?: Readonly<Record<string, string>>;
+  /** Runtime evidence for reproduction: interpreter, lockfile, and whether
+   * generation options were sent explicitly or left to provider defaults. */
+  readonly runtime?: {
+    readonly node: string;
+    readonly platform: string;
+    readonly lockfileHash?: string;
+    readonly generationOptions: string;
+  };
   readonly config: HybridConfig;
   readonly modes: readonly ExperimentMode[];
   readonly provider: ProviderMode;
@@ -606,7 +739,8 @@ export interface ExperimentManifest {
 }
 
 export interface ExperimentSummary {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: typeof RESULT_SCHEMA_VERSION;
+  readonly protocolId: typeof PROTOCOL_ID;
   readonly runId: string;
   readonly evaluation: EvaluationKind;
   readonly provider: ProviderMode;

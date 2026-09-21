@@ -8,6 +8,7 @@ import { createTypeSafeClient } from "../../typesafe/client.js";
 import type { TypeSafeSystemOneClient } from "../../typesafe/client.js";
 import { repairSystemPrompt, updateSystemPrompt } from "./prompts.js";
 import type {
+  ActionForm,
   ActorAction,
   ActorRequest,
   ActorResponse,
@@ -19,6 +20,7 @@ import type {
   JevRequest,
   JevResponse,
   MemoryKind,
+  PatchInputKind,
   PatchOperation,
   RepairRequest,
   RepairResponse,
@@ -545,6 +547,7 @@ export class LiveActorProvider implements ActorProvider {
       return { latencyMs: performance.now() - started, error: errorMessage(error) };
     }
     const usage = response.usage ? sanitizeUsage(response.usage) : undefined;
+    const responseModel = response.model ? { responseModel: response.model } : {};
     let decoded;
     try {
       decoded = decodeActorResponse(response.text, request.mode);
@@ -553,15 +556,19 @@ export class LiveActorProvider implements ActorProvider {
         latencyMs: performance.now() - started,
         error: errorMessage(error),
         rawText: response.text,
+        ...responseModel,
         ...(usage ? { usage } : {}),
       };
     }
     return {
       action: decoded.action,
+      actionForm: decoded.actionForm,
       ...(decoded.statePatch ? { statePatch: decoded.statePatch } : {}),
+      ...(decoded.patchInput ? { patchInput: decoded.patchInput } : {}),
       ...(decoded.text ? { text: decoded.text } : {}),
       latencyMs: performance.now() - started,
       rawText: response.text,
+      ...responseModel,
       ...(usage ? { usage } : {}),
     };
   }
@@ -720,20 +727,38 @@ export function decodeActorResponse(
   mode: ActorRequest["mode"],
 ): {
   readonly action: ActorAction;
+  readonly actionForm: ActionForm;
   readonly statePatch?: readonly PatchOperation[];
+  readonly patchInput?: PatchInputKind;
   readonly text?: string;
 } {
   const value = parseJsonObject(text);
-  const action = normalizeAction(value);
-  if (!action) throw new Error("actor_action_invalid");
+  const normalized = normalizeAction(value);
+  if (!normalized) throw new Error("actor_action_invalid");
   const visible = typeof value.text === "string" && value.text.trim() ? value.text : undefined;
   if (mode === "llm") {
     // A missing patch means "no memory update this step"; an invalid patch
-    // still fails so malformed operations are never silently dropped.
+    // still fails so malformed operations are never silently dropped. The
+    // tri-state keeps "missing" distinct from an explicit empty array.
+    const patchInput: PatchInputKind = !("statePatch" in value)
+      ? "missing"
+      : Array.isArray(value.statePatch) && value.statePatch.length === 0
+        ? "empty"
+        : "present";
     const operations = "statePatch" in value ? decodeOperationsArray(value.statePatch) : [];
-    return { action, statePatch: operations, ...(visible ? { text: visible } : {}) };
+    return {
+      action: normalized.action,
+      actionForm: normalized.form,
+      statePatch: operations,
+      patchInput,
+      ...(visible ? { text: visible } : {}),
+    };
   }
-  return { action, ...(visible ? { text: visible } : {}) };
+  return {
+    action: normalized.action,
+    actionForm: normalized.form,
+    ...(visible ? { text: visible } : {}),
+  };
 }
 
 export function decodeOperationsEnvelope(text: string): PatchOperation[] {
@@ -803,11 +828,19 @@ export function decodeOperationsArray(value: unknown): PatchOperation[] {
  * envelope level `{"action":"read","path":"x"}`, or as a bare tool object
  * `{"tool":"read","path":"x"}`; all decode to the same validated action.
  * Anything else is invalid. */
-function normalizeAction(value: Record<string, unknown>): ActorAction | undefined {
-  if (typeof value.action === "string" && ACTION_TOOLS.has(value.action))
-    return decodeAction(pickActionFields(value, value.action));
-  if (typeof value.tool === "string") return decodeAction(pickActionFields(value, value.tool));
-  return decodeAction(value.action);
+function normalizeAction(
+  value: Record<string, unknown>,
+): { readonly action: ActorAction; readonly form: ActionForm } | undefined {
+  if (typeof value.action === "string" && ACTION_TOOLS.has(value.action)) {
+    const action = decodeAction(pickActionFields(value, value.action));
+    return action ? { action, form: "shorthand" } : undefined;
+  }
+  if (typeof value.tool === "string") {
+    const action = decodeAction(pickActionFields(value, value.tool));
+    return action ? { action, form: "bare" } : undefined;
+  }
+  const action = decodeAction(value.action);
+  return action ? { action, form: "canonical" } : undefined;
 }
 
 function pickActionFields(value: Record<string, unknown>, tool: string) {

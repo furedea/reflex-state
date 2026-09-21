@@ -5,7 +5,8 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { loadHybridConfig, ResultWriter } from "./cli.js";
+import { loadHybridConfig, parseManifest, ResultWriter } from "./cli.js";
+import { reportMarkdown } from "./evaluation.js";
 import { buildProjection } from "./projection.js";
 import { buildActorRequest } from "./prompts.js";
 import {
@@ -221,6 +222,85 @@ describe("acceptance: provider communication contract", () => {
     expect(response.rawText).toBe("```json\n{}\n```\nextra");
   });
 
+  it("L-01: the llm system prompt carries no task-specific answers or policies", () => {
+    const system = buildActorRequest({
+      mode: "llm",
+      taskId: "any",
+      trialId: "t",
+      step: 0,
+      userText: "{}",
+      allowedTests: [],
+      model: "fake",
+    }).system;
+    for (const leaked of [
+      "FALLBACK_PORT",
+      "PRIMARY_PORT",
+      "8080",
+      "9377",
+      "apiKey",
+      "maxRetries",
+      "src/calc.js",
+      "src/config.js",
+      "src/server.js",
+      "net-policy",
+      "ports.conf",
+    ])
+      expect(system).not.toContain(leaked);
+    // The prompt still explains the patch contract without task content.
+    expect(system).toContain("statePatch");
+    // Real observed values still flow through the per-step input as usual.
+    const observed = buildProjection({
+      mode: "llm",
+      instruction: "task",
+      facts: initialFacts(),
+      memory: emptyMemory(),
+      latest: [message("obs-1", "PRIMARY_PORT=9377")],
+      history: [],
+      actionBudget: {
+        limit: 8,
+        used: 0,
+        remaining_including_next: 8,
+        finish_counts_as_action: true,
+      },
+      budgets,
+    });
+    expect(observed.userText).toContain("PRIMARY_PORT=9377");
+  });
+
+  it("L-02: missing, empty, and present patches stay distinct; malformed ones fail", () => {
+    const missing = decodeActorResponse('{"action":{"tool":"finish"}}', "llm");
+    expect(missing.patchInput).toBe("missing");
+    expect(missing.statePatch).toEqual([]);
+    const empty = decodeActorResponse('{"action":{"tool":"finish"},"statePatch":[]}', "llm");
+    expect(empty.patchInput).toBe("empty");
+    const present = decodeActorResponse(
+      JSON.stringify({
+        action: { tool: "finish" },
+        statePatch: [
+          {
+            operation: "add",
+            kind: "findings",
+            text: "note",
+            sourceIds: ["self"],
+            trust: "assistant",
+            origin: "generated",
+          },
+        ],
+      }),
+      "llm",
+    );
+    expect(present.patchInput).toBe("present");
+    expect(present.statePatch).toHaveLength(1);
+    // A malformed patch is an error, never a silent empty patch.
+    expect(() =>
+      decodeActorResponse('{"action":{"tool":"finish"},"statePatch":"oops"}', "llm"),
+    ).toThrow("operations_not_array");
+    // Action surface forms are recorded, not silently normalized away.
+    expect(decodeActorResponse('{"action":{"tool":"finish"}}', "llm").actionForm).toBe("canonical");
+    expect(decodeActorResponse('{"action":"read","path":"x"}', "llm").actionForm).toBe("shorthand");
+    expect(decodeActorResponse('{"tool":"read","path":"x"}', "llm").actionForm).toBe("bare");
+  });
+
   it("C4: Jev answers decode per question with invalid entries marked, never fabricated", () => {
     const questions: JevQuestion[] = [
       {
@@ -387,6 +467,12 @@ describe("acceptance: state, environment, and evaluation", () => {
       memory: emptyMemory(),
       latest: group,
       history: [],
+      actionBudget: {
+        limit: 8,
+        used: 0,
+        remaining_including_next: 8,
+        finish_counts_as_action: true,
+      },
       budgets: { ...budgets, latestObservationBytes: 500 },
     });
     expect(projected.bundle.unavailable).toBe("latest_observation_exceeds_budget");
@@ -485,5 +571,79 @@ describe("acceptance: state, environment, and evaluation", () => {
     const present = await provider.act(actorRequest({ user: "please update the file now" }));
     expect(present.action).toEqual(task.steps?.[0]?.action);
     expect(present.text).toBeUndefined();
+  });
+
+  it("L-13: a schema v2 result renders read-only and never gains v3 fields", () => {
+    const usageField = { observedSubtotal: null, completeTotal: null, coverage: 0 };
+    const usage = {
+      inputTokens: usageField,
+      outputTokens: usageField,
+      cacheReadTokens: usageField,
+      cacheWriteTokens: usageField,
+    };
+    const metric = {
+      uniqueCandidates: 0,
+      decisionCount: 0,
+      appliedExtractive: 0,
+      appliedGenerated: 0,
+      invocations: { actor: 1, jev: 0, repair: 0, update: 0 },
+      sentBytes: 10,
+      usage,
+      wallMs: 1,
+      contextBytes: { history: 0, state: 0, memory: 0, observations: 0, feedback: 0 },
+    };
+    // A v2-shaped score has no termination/final-artifact/patch fields at all.
+    const v2Score = {
+      trialId: "iter0-a-history",
+      taskId: "a",
+      mode: "history",
+      iteration: 0,
+      executionStatus: "completed",
+      wiringStatus: "passed",
+      efficacyStatus: "descriptive_only",
+      startedAt: "2025-01-01T00:00:00.000Z",
+      finishedAt: "2025-01-01T00:00:01.000Z",
+      wallMs: 1,
+      completed: true,
+      testPassed: true,
+      constraintPassed: null,
+      constraints: {},
+      tests: { t: "passed" },
+      actorTests: [],
+      checkpoints: [],
+      rereads: 0,
+      retries: 0,
+      appliedExtractive: 0,
+      appliedGenerated: 0,
+      activeMemoryItems: 0,
+    };
+    const v2Summary = {
+      schemaVersion: 2,
+      runId: "old-run",
+      evaluation: "closed_loop",
+      provider: "live",
+      modes: ["history"],
+      efficacyStatus: "descriptive_only",
+      wiring: { passed: 1, failed: 0, notEvaluated: 0 },
+      plannedTrials: 1,
+      skippedTrials: [],
+      scores: [v2Score],
+      metrics: { history: metric },
+      limitations: [],
+    };
+    const report = reportMarkdown(v2Summary as never);
+    // The report labels the old schema and keeps new-protocol columns absent.
+    expect(report).toContain("schema v2 result");
+    expect(report).not.toContain("| termination |");
+    expect(report).not.toContain("last_update_result");
+    // A v2 manifest parses read-only: it is returned as stored, not upgraded.
+    const manifest = parseManifest({
+      schemaVersion: 2,
+      runId: "old-run",
+      status: "completed",
+      summaryFile: "summary.json",
+      reportFile: "report.md",
+    });
+    expect(manifest.schemaVersion).toBe(2);
   });
 });

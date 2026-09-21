@@ -90,6 +90,9 @@ export interface ApplySuccess {
   readonly ok: true;
   readonly memory: WorkMemory;
   readonly applied: readonly PatchOperation[];
+  /** Indices into the operations array this call received, so callers can
+   * report exactly which submitted operations changed memory. */
+  readonly appliedIndices: readonly number[];
 }
 
 export interface ApplyFailure {
@@ -314,7 +317,8 @@ export function applyOperations(
     Object.entries(memory).map(([kind, items]) => [kind as MemoryKind, [...items]]),
   ) as Record<MemoryKind, MemoryItem[]>;
   const applied: PatchOperation[] = [];
-  for (const operation of validation.valid) {
+  const appliedIndices: number[] = [];
+  for (const [validIndex, operation] of validation.valid.entries()) {
     const bucket = next[operation.kind];
     const id = operation.itemId ?? memoryId(operation);
     const item: MemoryItem = {
@@ -333,13 +337,15 @@ export function applyOperations(
       if (!sameItem(bucket[index]!, item)) {
         bucket[index] = item;
         applied.push(operation);
+        appliedIndices.push(validIndex);
       }
     } else if (!bucket.some((existing) => existing.text === item.text)) {
       bucket.push(item);
       applied.push(operation);
+      appliedIndices.push(validIndex);
     }
   }
-  return { ok: true, memory: next, applied };
+  return { ok: true, memory: next, applied, appliedIndices };
 }
 
 function sameItem(existing: MemoryItem, next: MemoryItem): boolean {
@@ -356,10 +362,17 @@ export function validateOperations(
   memory: WorkMemory,
   operations: readonly PatchOperation[],
   context: ApplyContext,
-): { readonly valid: readonly PatchOperation[]; readonly errors: readonly string[] } {
+): {
+  readonly valid: readonly PatchOperation[];
+  /** Original index of each entry in `valid` inside the submitted operations,
+   * so applied/unchanged/rejected accounting can name patch positions. */
+  readonly validIndices: readonly number[];
+  readonly errors: readonly string[];
+} {
   const sources = validSources(context, memory);
   const errors: string[] = [];
   const valid: PatchOperation[] = [];
+  const validIndices: number[] = [];
   const candidates = context.candidates;
   const items = Object.values(memory).flat();
   const claimedIds = new Set(items.map((item) => item.id));
@@ -453,8 +466,9 @@ export function validateOperations(
       claimedIds.add(effectiveId);
     }
     valid.push(normalized);
+    validIndices.push(index);
   }
-  return { valid, errors };
+  return { valid, validIndices, errors };
 }
 
 export function deriveTrust(
@@ -710,7 +724,7 @@ function toOperation(candidate: Candidate): PatchOperation {
   };
 }
 
-function memoryId(operation: PatchOperation): string {
+export function memoryId(operation: PatchOperation): string {
   return `memory-${createHash("sha256").update(JSON.stringify(operation)).digest("hex").slice(0, 12)}`;
 }
 

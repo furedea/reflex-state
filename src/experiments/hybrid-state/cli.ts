@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
 import { reportMarkdown, loadLabels } from "./evaluation.js";
+import { captureFreeze, verifyFreeze, type FreezeRecord } from "./freeze.js";
 import {
   createLiveProviders,
   FakeActorProvider,
@@ -34,11 +35,12 @@ import type {
   TraceData,
 } from "./types.js";
 import {
-  HYBRID_SCHEMA_VERSION,
   parseHybridConfig,
   parseHybridTask,
   parseTaskScoring,
   PROMPT_VERSION,
+  PROTOCOL_ID,
+  RESULT_SCHEMA_VERSION,
 } from "./types.js";
 
 interface CliOptions {
@@ -50,6 +52,7 @@ interface CliOptions {
   readonly case?: string;
   readonly labels?: string;
   readonly recorded?: string;
+  readonly freeze?: string;
   readonly live: boolean;
 }
 
@@ -109,6 +112,7 @@ async function main(): Promise<void> {
       case: { type: "string" },
       labels: { type: "string" },
       recorded: { type: "string" },
+      freeze: { type: "string" },
       live: { type: "boolean", default: false },
     },
   });
@@ -124,6 +128,7 @@ async function execute(command: "audit" | "run", values: CliOptions): Promise<vo
   // Preflight completes before the output directory is reserved or any record
   // is written, so a rejected run leaves no partial result.
   await enforceLivePolicy(config, values);
+  let isolationVerified = true;
   if (command === "run" && requiresIsolation(config)) {
     const isolation = await checkIsolation();
     if (!isolation.available)
@@ -137,6 +142,17 @@ async function execute(command: "audit" | "run", values: CliOptions): Promise<vo
             : ""
         }`,
       );
+    isolationVerified = true;
+  } else if (requiresIsolation(config)) {
+    isolationVerified = false;
+  }
+  // A frozen run must reproduce the recorded condition exactly; any drift in
+  // code, config, tasks, scoring, or prompts is a new condition, not the
+  // frozen experiment.
+  if (values.freeze) {
+    const frozen = JSON.parse(await readFile(values.freeze, "utf8")) as FreezeRecord;
+    const check = verifyFreeze(frozen, await captureFreeze(config));
+    if (!check.ok) throw new Error(`frozen_condition_mismatch: ${check.mismatches.join("; ")}`);
   }
   // Task and scoring validation belongs to preflight: a rejected run must not
   // reserve or leave a partial result directory.
@@ -183,6 +199,7 @@ async function execute(command: "audit" | "run", values: CliOptions): Promise<vo
         providers,
         runId,
         recorder: recorderFor(writer),
+        isolationVerified,
       });
       await finalize(writer, manifest, result);
     }
@@ -239,6 +256,7 @@ export function recorderFor(writer: ResultWriter): RunRecorder {
     call: (record) => enqueue("calls.jsonl", record),
     context: (record) => enqueue("contexts.jsonl", record),
     update: (record) => enqueue("updates.jsonl", record),
+    prompt: (record) => enqueue("system_prompts.jsonl", record),
   };
 }
 
@@ -280,6 +298,14 @@ function parseSummaryForManifest(value: unknown, manifest: ExperimentManifest): 
     throw new Error(
       `summary.json schemaVersion ${String(record.schemaVersion)} does not match manifest schemaVersion ${manifest.schemaVersion}`,
     );
+  if (
+    record.protocolId !== undefined &&
+    manifest.protocolId !== undefined &&
+    record.protocolId !== manifest.protocolId
+  )
+    throw new Error(
+      `summary.json protocolId ${String(record.protocolId)} does not match manifest protocolId ${manifest.protocolId}`,
+    );
   return value;
 }
 
@@ -289,7 +315,7 @@ export function parseManifest(value: unknown): ExperimentManifest {
   const record = value as Record<string, unknown>;
   if (typeof record.runId !== "string" || typeof record.status !== "string")
     throw new Error("Invalid manifest.json: missing runId/status");
-  if (record.schemaVersion !== HYBRID_SCHEMA_VERSION)
+  if (record.schemaVersion !== RESULT_SCHEMA_VERSION)
     console.log("note: legacy result schema; metrics may be untrusted");
   return record as unknown as ExperimentManifest;
 }
@@ -521,7 +547,8 @@ function startManifest(
   input: string,
 ): ExperimentManifest {
   return {
-    schemaVersion: HYBRID_SCHEMA_VERSION,
+    schemaVersion: RESULT_SCHEMA_VERSION,
+    protocolId: PROTOCOL_ID,
     runId,
     status: "running",
     head: null,

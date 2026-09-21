@@ -99,10 +99,27 @@ const PATCH_CONTRACT = [
   '"statePatch" is an array of memory operations (an empty array is valid):',
   '  {"operation":"add","kind":"<constraints|decisions|findings|attempts|open_questions>","text":"...","sourceIds":["<source id>"],"origin":"extracted|generated"}',
   '  {"operation":"replace","itemId":"<existing memory id>","kind":"...","text":"...","sourceIds":["..."],"origin":"extracted|generated"}',
-  'Example: {"action":{"tool":"read","path":"src/config.ts"},"statePatch":[{"operation":"add","kind":"findings","text":"FALLBACK_PORT=8080","sourceIds":["E0003"],"origin":"extracted"}]}',
+  'Format example (illustrative only — always cite ids that actually appear in your input): {"action":{"tool":"read","path":"<path>"},"statePatch":[{"operation":"add","kind":"findings","text":"<verbatim text from the cited source>","sourceIds":["<id>"],"origin":"extracted"}]}',
   'sourceIds must cite ids from the latest observation, existing memory items, or the string "self" for this response\'s visible text.',
   'An "extracted" text must equal the cited source verbatim; use "generated" whenever you summarize, infer, or are unsure of the exact wording. Distinguish evidence from inference and never fabricate observations.',
   "Record what you learned from the latest observation now; later steps see only your memory, not this response. Do not record the action's result before it happens.",
+].join("\n");
+
+/** Shared stopping rule and budget semantics; identical for both modes so
+ * neither condition is coached differently. */
+const STOPPING_CONTRACT = [
+  'When the requested work and its verification are done, use the "finish" action.',
+  '"action_budget" in the input shows your remaining actions; "finish" itself also counts as one action.',
+  "Do not repeat a read or a check without a concrete reason; re-reading or re-checking is allowed when the detail you need is missing, stale, contradicted, or must be verified after a change.",
+].join("\n");
+
+/** llm mode only: how the memory mechanism actually behaves in this harness,
+ * so the actor can rely on it without being told to trust it unconditionally. */
+const STATE_USE_CONTRACT = [
+  'Earlier observations are kept in "memory"; the full history is not resent each step.',
+  "Use memory, facts, and the latest observation while they still hold.",
+  'A memory item with origin "generated" is your own earlier judgment, not a verified fact.',
+  '"last_update_result" reports which of your previous patch operations were applied, unchanged, or rejected; rejected items are absent from memory.',
 ].join("\n");
 
 export function actorSystemPrompt(mode: ExperimentMode): string {
@@ -116,8 +133,9 @@ export function actorSystemPrompt(mode: ExperimentMode): string {
     ACTION_CONTRACT,
     "Use only the allowed tools, workspace paths, and test ids.",
     '"text" is an optional visible explanation; it must not contain the JSON action or patch.',
+    STOPPING_CONTRACT,
   ];
-  if (mode === "llm") lines.push(PATCH_CONTRACT);
+  if (mode === "llm") lines.push(STATE_USE_CONTRACT, PATCH_CONTRACT);
   return lines.join("\n");
 }
 

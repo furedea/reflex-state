@@ -1,14 +1,13 @@
-import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
-import { promisify } from "node:util";
 
 import { defaultConfig } from "../../core/config.js";
 import { StateEngine } from "../../core/engine.js";
 import { NoopStateUpdater } from "../../core/updater.js";
 import { PiEventNormalizer } from "../../pi/normalization.js";
 import { evaluateAudit, scoreTrial, summarize, type LabelsFile } from "./evaluation.js";
+import { snapshotForRun } from "./freeze.js";
 import { buildProjection, renderMemoryProjection, type ProjectedInput } from "./projection.js";
-import { buildActorRequest } from "./prompts.js";
+import { actorSystemPrompt, buildActorRequest } from "./prompts.js";
 import {
   FakeActorProvider,
   FakeJevProvider,
@@ -25,7 +24,9 @@ import {
 import { TaskEnvironment } from "./task_environment.js";
 import { eventsForMessages, generateCandidates, latestGroup } from "./trace.js";
 import type {
+  ActionForm,
   ActorAction,
+  ActorVerificationEntry,
   CallRecord,
   CallStartRecord,
   Candidate,
@@ -34,34 +35,39 @@ import type {
   ExperimentManifest,
   ExperimentMode,
   ExperimentSummary,
+  FinalArtifactEvaluation,
   GenerativeUpdateRequest,
   HybridConfig,
   HybridTask,
   JevRequest,
   ObservationGroup,
+  PatchInputKind,
   PatchOperation,
+  PatchStats,
   RepairRequest,
   SkippedTrial,
+  SystemPromptRecord,
   TaskScoring,
+  TerminationReason,
   TraceData,
   TraceMessage,
   TrialScore,
+  UpdateFeedback,
   UpdateRecord,
   UpdateResult,
   WorkMemory,
 } from "./types.js";
-import { emptyMemory, HYBRID_SCHEMA_VERSION, PROMPT_VERSION } from "./types.js";
+import { emptyMemory, PROMPT_VERSION, PROTOCOL_ID, RESULT_SCHEMA_VERSION } from "./types.js";
 import {
   applyContext,
   applyOperations,
   factsFromState,
+  memoryId,
   memoryItems,
   updateMemory,
   validateOperations,
   type ApplyContext,
 } from "./update.js";
-
-const execFile = promisify(execFileCallback);
 
 export interface ExperimentRun {
   readonly manifest: ExperimentManifest;
@@ -76,6 +82,7 @@ export interface RunRecorder {
   call(record: CallRecord): Promise<void>;
   context(record: ContextRecord): Promise<void>;
   update(record: UpdateRecord): Promise<void>;
+  prompt?(record: SystemPromptRecord): Promise<void>;
 }
 
 export class PersistenceError extends Error {
@@ -95,6 +102,8 @@ export interface RunContext {
   readonly appliedCounts: Map<ExperimentMode, { extractive: number; generated: number }>;
   readonly budget: RequestBudget;
   readonly trialSent: Map<string, number>;
+  /** System prompt hashes already persisted this run; bodies are stored once. */
+  readonly systemPrompts: Set<string>;
   callSeq: number;
   readonly recorder?: RunRecorder;
 }
@@ -121,6 +130,7 @@ function newRunContext(runId: string, config: HybridConfig, recorder?: RunRecord
     appliedCounts: new Map(),
     budget: { sent: 0, limit: config.provider.maxRequests },
     trialSent: new Map(),
+    systemPrompts: new Set(),
     callSeq: 0,
     ...(recorder ? { recorder } : {}),
   };
@@ -236,6 +246,13 @@ export async function runAudit(options: {
           memory,
           latest: group.messages,
           history,
+          actionBudget: {
+            limit: options.config.budgets.maxActions,
+            used: step,
+            remaining_including_next: Math.max(0, options.config.budgets.maxActions - step),
+            finish_counts_as_action: true,
+          },
+          ...(mode === "llm" ? { lastUpdateResult: null } : {}),
           allowedTests: [],
           budgets: options.config.budgets,
         });
@@ -245,6 +262,7 @@ export async function runAudit(options: {
           mode,
           step,
           projected,
+          system: "",
           config: options.config,
         });
         const input = {
@@ -300,10 +318,25 @@ export async function runAudit(options: {
         completed: endReason === "completed",
         cancelled: false,
         ...(endReason === "completed" ? {} : { error: endReason }),
+        terminationReason:
+          endReason === "completed"
+            ? "finish"
+            : endReason === "not_run_global_budget"
+              ? "request_budget"
+              : "state_unavailable",
         policyViolations: [],
         constraints: {},
         testResults: {},
+        finalArtifact: {
+          status: "not_evaluated",
+          reason: "audit_mode",
+          tests: {},
+        },
+        finalConstraintVerdicts: null,
+        actorVerificationAtStop: {},
         actorTests: [],
+        patchStats: emptyPatchStats(),
+        actionForms: { canonical: 0, shorthand: 0, bare: 0 },
         sentTexts: [],
         checkpoints: [],
         failureObserved: false,
@@ -366,6 +399,20 @@ export async function runClosedLoop(options: {
   readonly providers?: ProviderSet;
   readonly runId?: string;
   readonly recorder?: RunRecorder;
+  /** True only after the host's isolation mechanism was actually verified;
+   * when isolation is required and unverified, final candidate execution is
+   * skipped rather than run unsandboxed. */
+  readonly isolationVerified?: boolean;
+  /** Aborting skips every not-yet-started trial and stops the in-flight one;
+   * a cancelled trial never runs its final oracle pass. */
+  readonly signal?: AbortSignal;
+  /** Environment construction seam for safety tests; production callers use
+   * the default TaskEnvironment. */
+  readonly environmentFor?: (
+    task: HybridTask,
+    scoring: TaskScoring | undefined,
+    isolated: boolean,
+  ) => TaskEnvironment;
 }): Promise<ExperimentRun> {
   const runId = options.runId ?? newRunId();
   const providers = options.providers ?? fakeProviders(options.tasks);
@@ -377,6 +424,16 @@ export async function runClosedLoop(options: {
     options.config.seed,
   );
   for (const plan of trials) {
+    if (options.signal?.aborted) {
+      skipped.push({
+        trialId: plan.trialId,
+        taskId: plan.task.id,
+        mode: plan.mode,
+        iteration: plan.iteration,
+        reason: "cancelled",
+      });
+      continue;
+    }
     if (ctx.budget.sent >= ctx.budget.limit) {
       skipped.push({
         trialId: plan.trialId,
@@ -387,13 +444,18 @@ export async function runClosedLoop(options: {
       });
       continue;
     }
-    const score = await runTrial(plan, options.config, providers, ctx).catch(
-      (error): TrialScore => {
-        if (error instanceof BudgetExhausted)
-          return unfinishedTrial(plan, "request_limit", options.config.provider.mode);
-        throw error;
-      },
-    );
+    const score = await runTrial(
+      plan,
+      options.config,
+      options.isolationVerified ?? !requiresIsolation(options.config),
+      providers,
+      ctx,
+      options,
+    ).catch((error): TrialScore => {
+      if (error instanceof BudgetExhausted)
+        return unfinishedTrial(plan, "request_limit", options.config.provider.mode);
+      throw error;
+    });
     scores.push(score);
   }
   const summary = summarize({
@@ -483,6 +545,16 @@ function mergeCandidates(
   return [...fresh, ...[...held.values()].filter((candidate) => !freshIds.has(candidate.id))];
 }
 
+function emptyPatchStats(): PatchStats {
+  return {
+    input: { missing: 0, empty: 0, present: 0 },
+    proposed: 0,
+    applied: 0,
+    unchanged: 0,
+    rejected: 0,
+  };
+}
+
 function unfinishedTrial(
   plan: TrialPlan,
   reason: string,
@@ -498,10 +570,20 @@ function unfinishedTrial(
     completed: false,
     cancelled: false,
     error: reason,
+    terminationReason: "request_budget",
     policyViolations: [],
     constraints: {},
     testResults: {},
+    finalArtifact: {
+      status: "not_evaluated",
+      reason: "trial_interrupted",
+      tests: {},
+    },
+    finalConstraintVerdicts: null,
+    actorVerificationAtStop: {},
     actorTests: [],
+    patchStats: emptyPatchStats(),
+    actionForms: { canonical: 0, shorthand: 0, bare: 0 },
     sentTexts: [],
     checkpoints: [],
     failureObserved: false,
@@ -517,13 +599,23 @@ function unfinishedTrial(
 async function runTrial(
   plan: TrialPlan,
   config: HybridConfig,
+  isolationVerified: boolean,
   providers: ProviderSet,
   ctx: RunContext,
+  options: {
+    readonly signal?: AbortSignal;
+    readonly environmentFor?: (
+      task: HybridTask,
+      scoring: TaskScoring | undefined,
+      isolated: boolean,
+    ) => TaskEnvironment;
+  } = {},
 ): Promise<TrialScore> {
   const { task, mode, trialId, iteration, scoring } = plan;
-  const env = new TaskEnvironment(task, scoring, {
-    isolated: requiresIsolation(config),
-  });
+  const isolated = requiresIsolation(config);
+  const env = options.environmentFor
+    ? options.environmentFor(task, scoring, isolated)
+    : new TaskEnvironment(task, scoring, { isolated });
   const normalizer = new PiEventNormalizer({
     eventCount: 0,
     turnIndex: 0,
@@ -549,6 +641,7 @@ async function runTrial(
   ];
   let memory = emptyMemory();
   let completed = false;
+  let cancelled = false;
   let error: string | undefined;
   const policyViolations: string[] = [];
   const constraintVerdicts = new Map<string, boolean>();
@@ -556,8 +649,15 @@ async function runTrial(
     for (const [key, verdict] of Object.entries(verdicts ?? {}))
       constraintVerdicts.set(key, (constraintVerdicts.get(key) ?? true) && verdict);
   };
-  const actorTests: { testId: string; step: number; passed: boolean }[] = [];
+  const actorTests: { testId: string; step: number; passed: boolean; generation: number }[] = [];
   const sentTexts: string[] = [];
+  const patchInputCounts = { missing: 0, empty: 0, present: 0 };
+  let patchProposed = 0;
+  let patchApplied = 0;
+  let patchUnchanged = 0;
+  let patchRejected = 0;
+  const actionForms: Record<ActionForm, number> = { canonical: 0, shorthand: 0, bare: 0 };
+  let lastUpdateResult: UpdateFeedback | null = null;
   const readKeys = new Set<string>();
   let rereads = 0;
   let retries = 0;
@@ -565,12 +665,22 @@ async function runTrial(
   let failureObserved = false;
   let appliedExtractive = 0;
   let appliedGenerated = 0;
+  /** Set when the workspace itself can no longer be trusted; no further
+   * candidate code may run, including the final oracle pass. */
+  let envFailed = false;
   const held: TraceMessage[] = [];
   const heldCandidates = new Map<string, Candidate>();
   const startedAt = new Date().toISOString();
   let groupStart = 0;
 
   for (let step = 0; step < config.budgets.maxActions; step++) {
+    if (options.signal?.aborted) {
+      // Cancellation is a stop request: no more actions and no final oracle
+      // pass over candidate code.
+      cancelled = true;
+      error = "cancelled";
+      break;
+    }
     const consumed = held.splice(0, held.length);
     for (const message of consumed) {
       const prompt = normalizer.prompt(message.text);
@@ -659,10 +769,25 @@ async function runTrial(
       memory,
       latest: group.messages,
       history,
+      actionBudget: {
+        limit: config.budgets.maxActions,
+        used: step,
+        remaining_including_next: config.budgets.maxActions - step,
+        finish_counts_as_action: true,
+      },
+      ...(mode === "llm" ? { lastUpdateResult } : {}),
       allowedTests: task.allowedTests,
       budgets: config.budgets,
     });
-    await recordContext(ctx, { trialId, taskId: task.id, mode, step, projected, config });
+    await recordContext(ctx, {
+      trialId,
+      taskId: task.id,
+      mode,
+      step,
+      projected,
+      system: actorSystemPrompt(mode),
+      config,
+    });
     if (projected.bundle.unavailable) {
       error = `state_first_unavailable:${projected.bundle.unavailable}`;
       break;
@@ -692,6 +817,7 @@ async function runTrial(
       error = response.error ?? "actor_action_missing";
       break;
     }
+    actionForms[response.actionForm ?? "canonical"] += 1;
     const responseId = `resp-${trialId}-${step}`;
     if (response.text)
       history.push({
@@ -705,6 +831,13 @@ async function runTrial(
     if (mode === "llm") {
       // The state patch is optional: an absent or empty patch leaves memory
       // unchanged; the actor still commits through the same validation path.
+      const patchInput: PatchInputKind =
+        response.patchInput ??
+        (response.statePatch === undefined
+          ? "missing"
+          : response.statePatch.length
+            ? "present"
+            : "empty");
       const patch = (response.statePatch ?? []).map((operation) =>
         substituteSelf(operation, responseId),
       );
@@ -733,6 +866,7 @@ async function runTrial(
           ctx,
           trialRecord(ctx, trialId, task.id, mode, step, "update", {
             source: "actor_patch",
+            patchInput,
             rejected: "memory_exceeds_budget",
             memoryHash: memoryHash(memory),
           }),
@@ -741,6 +875,30 @@ async function runTrial(
         break;
       }
       memory = apply.memory;
+      // Valid operations that committed nothing (duplicates, no-op replaces)
+      // are "unchanged": they were accepted but produced no state change.
+      // Indices translate back through validation.validIndices to the
+      // submitted patch positions.
+      const appliedPatchIndices = apply.appliedIndices.map(
+        (index) => validation.validIndices[index]!,
+      );
+      const unchanged = validation.validIndices.filter(
+        (index) => !appliedPatchIndices.includes(index),
+      );
+      lastUpdateResult = updateFeedback(
+        patchInput,
+        apply.appliedIndices.map((index) => ({
+          index: validation.validIndices[index]!,
+          memoryId: apply.applied[index]!.itemId ?? memoryId(apply.applied[index]!),
+        })),
+        unchanged,
+        validation.errors,
+      );
+      patchInputCounts[patchInput] += 1;
+      patchProposed += patch.length;
+      patchApplied += apply.applied.length;
+      patchUnchanged += unchanged.length;
+      patchRejected += validation.errors.length;
       appliedExtractive += apply.applied.filter((op) => op.origin === "extracted").length;
       appliedGenerated += apply.applied.filter((op) => op.origin === "generated").length;
       countApplied(ctx, mode, apply.applied);
@@ -748,14 +906,24 @@ async function runTrial(
         ctx,
         trialRecord(ctx, trialId, task.id, mode, step, "update", {
           source: "actor_patch",
+          patchInput,
           operations: apply.applied.map(operationView),
+          ...(unchanged.length ? { unchanged } : {}),
           ...(validation.errors.length ? { dropped: validation.errors } : {}),
           memoryHash: memoryHash(memory),
         }),
       );
     }
     const evidenceId = `call-${trialId}-${step}`;
-    const execution = await env.execute(response.action, evidenceId);
+    let execution;
+    try {
+      execution = await env.execute(response.action, evidenceId);
+    } catch (cause) {
+      // A corrupt or unusable workspace ends the trial; nothing else may run.
+      envFailed = true;
+      error = `environment_error:${cause instanceof Error ? cause.message : "workspace_failed"}`;
+      break;
+    }
     const actionKey = operationKey(response.action);
     if (lastFailedKey !== undefined && lastFailedKey === actionKey) retries++;
     lastFailedKey = execution.passed ? undefined : actionKey;
@@ -813,6 +981,7 @@ async function runTrial(
         testId: execution.verification.testId,
         step,
         passed: execution.passed,
+        generation: execution.verification.generation,
       });
       mergeConstraints(execution.verification.constraints);
     }
@@ -832,13 +1001,45 @@ async function runTrial(
         });
   }
   if (!completed && !error) error = "action_budget_exhausted";
+  // The final workspace is scored by the evaluator's own oracles — a
+  // budget-exhausted trial still gets an independent artifact verdict, and an
+  // oracles-never-ran outcome is "not_run", never counted as a failure. But
+  // when the workspace is corrupt or required isolation was never confirmed,
+  // no additional candidate code may execute at all.
+  const evalBlockReason = envFailed
+    ? "environment_error"
+    : cancelled
+      ? "cancelled"
+      : requiresIsolation(config) && !isolationVerified
+        ? "isolation_unverified"
+        : null;
   const testResults: Record<string, "passed" | "failed" | "not_run"> = {};
-  if (completed)
+  const finalConstraints: Record<string, boolean> = {};
+  let sawFinalConstraints = false;
+  if (!evalBlockReason) {
     for (const result of await env.evaluateFinal()) {
       testResults[result.testId] = result.status;
-      mergeConstraints(result.constraints);
+      if (result.constraints) {
+        sawFinalConstraints = true;
+        Object.assign(finalConstraints, result.constraints);
+        mergeConstraints(result.constraints);
+      }
     }
-  else for (const testId of task.allowedTests) testResults[testId] = "not_run";
+  }
+  for (const testId of task.allowedTests)
+    if (!(testId in testResults)) testResults[testId] = "not_run";
+  const evaluated = Object.values(testResults).some((status) => status !== "not_run");
+  const finalArtifact: FinalArtifactEvaluation = {
+    status: evaluated ? "evaluated" : "not_evaluated",
+    ...(evaluated
+      ? {}
+      : {
+          reason:
+            evalBlockReason ??
+            (task.allowedTests.length ? "no_oracle_verdict" : "no_tests_declared"),
+        }),
+    tests: testResults,
+  };
   const finishedAt = new Date().toISOString();
   return scoreTrial({
     trialId,
@@ -848,12 +1049,28 @@ async function runTrial(
     startedAt,
     finishedAt,
     completed,
-    cancelled: false,
+    cancelled,
     ...(error ? { error } : {}),
+    terminationReason: terminationFor(completed, error),
     policyViolations,
     constraints: Object.fromEntries(constraintVerdicts),
     testResults,
+    finalArtifact,
+    finalConstraintVerdicts: sawFinalConstraints ? finalConstraints : null,
+    actorVerificationAtStop: actorVerificationAtStop(
+      task.allowedTests,
+      actorTests,
+      env.observationGeneration,
+    ),
     actorTests,
+    patchStats: {
+      input: patchInputCounts,
+      proposed: patchProposed,
+      applied: patchApplied,
+      unchanged: patchUnchanged,
+      rejected: patchRejected,
+    },
+    actionForms,
     sentTexts,
     checkpoints: scoring?.checkpoints ?? [],
     failureObserved,
@@ -864,6 +1081,102 @@ async function runTrial(
     activeMemoryItems: memoryItems(memory).length,
     providerMode: config.provider.mode,
   });
+}
+
+/** Error strings produced by the environment's policy gate; a violation ends
+ * the trial but is classified separately from provider/contract failures. */
+const POLICY_ERRORS = new Set([
+  "path_escape",
+  "invalid_action",
+  "test_not_allowed",
+  "test_no_oracle",
+]);
+
+function terminationFor(completed: boolean, error: string | undefined): TerminationReason {
+  if (completed) return "finish";
+  if (error === "cancelled") return "cancelled";
+  if (!error || error === "action_budget_exhausted") return "action_budget";
+  if (error === "request_limit" || error === "not_run_global_budget") return "request_budget";
+  if (error.startsWith("persistence_failed")) return "persistence_error";
+  if (error.startsWith("environment_error")) return "environment_error";
+  if (POLICY_ERRORS.has(error)) return "policy_violation";
+  if (error.startsWith("state_first_unavailable")) return "state_unavailable";
+  if (
+    error.startsWith("invalid_update") ||
+    error.startsWith("actor_") ||
+    error.startsWith("operations_") ||
+    error.startsWith("response_")
+  )
+    return "contract_error";
+  return "provider_error";
+}
+
+/** Per declared test: the actor's latest own run at stop time and whether the
+ * workspace still matched the generation that run verified. */
+function actorVerificationAtStop(
+  allowedTests: readonly string[],
+  actorTests: readonly { testId: string; step: number; passed: boolean; generation: number }[],
+  finalGeneration: number,
+): Record<string, ActorVerificationEntry> {
+  const result: Record<string, ActorVerificationEntry> = {};
+  for (const testId of allowedTests) {
+    const latest = [...actorTests].reverse().find((run) => run.testId === testId);
+    if (!latest) {
+      result[testId] = { status: "not_run" };
+      continue;
+    }
+    result[testId] = {
+      status: latest.passed ? "passed" : "failed",
+      step: latest.step,
+      freshness: latest.generation === finalGeneration ? "current" : "stale",
+    };
+  }
+  return result;
+}
+
+/** Cap on the next-step update notification; counts are always exact while
+ * detail entries are dropped oldest-last when the payload would exceed it. */
+const UPDATE_FEEDBACK_LIMIT = 2048;
+
+function updateFeedback(
+  patchInput: PatchInputKind,
+  applied: readonly { readonly index: number; readonly memoryId: string }[],
+  unchanged: readonly number[],
+  errors: readonly string[],
+): UpdateFeedback {
+  const appliedDetails = applied;
+  const rejectedDetails = errors.map((error) => {
+    const hash = error.lastIndexOf("#");
+    const index = hash < 0 ? -1 : Number(error.slice(hash + 1));
+    return {
+      index: Number.isInteger(index) ? index : -1,
+      reason: hash < 0 ? error : error.slice(0, hash),
+    };
+  });
+  let appliedList = appliedDetails;
+  let unchangedList = [...unchanged];
+  let rejectedList = rejectedDetails;
+  let omitted = 0;
+  const build = (): UpdateFeedback => ({
+    patchInput,
+    applied: appliedList,
+    unchanged: unchangedList,
+    rejected: rejectedList,
+    appliedCount: appliedDetails.length,
+    unchangedCount: unchanged.length,
+    rejectedCount: rejectedDetails.length,
+    omittedDetailCount: omitted,
+  });
+  // Least-informative details drop first; counts stay exact so the actor can
+  // tell "saved nothing" apart from "saved but detail omitted".
+  while (Buffer.byteLength(JSON.stringify(build())) > UPDATE_FEEDBACK_LIMIT) {
+    if (unchangedList.length) unchangedList = unchangedList.slice(0, -1);
+    else if (appliedList.length) appliedList = appliedList.slice(0, -1);
+    else if (rejectedList.length) rejectedList = rejectedList.slice(0, -1);
+    else break;
+    omitted += 1;
+  }
+  return build();
 }
 
 function actorPatchContext(
@@ -1043,6 +1356,7 @@ async function instrumented<
     usage?: CallRecord["usage"];
     error?: string;
     rawText?: string;
+    responseModel?: string;
   },
 >(
   ctx: RunContext,
@@ -1119,6 +1433,7 @@ async function instrumented<
       latencyMs: response.latencyMs ?? performance.now() - started,
       ...(response.usage ? { usage: response.usage } : {}),
       ...(response.error ? { error: response.error } : {}),
+      ...(response.responseModel ? { responseModel: response.responseModel } : {}),
       ...(config.recordResponseText && typeof response.rawText === "string"
         ? { responseText: response.rawText }
         : {}),
@@ -1202,10 +1517,27 @@ async function recordContext(
     mode: ExperimentMode;
     step: number;
     projected: ProjectedInput;
+    system: string;
     config: HybridConfig;
   },
 ): Promise<void> {
   const { projected } = args;
+  const systemHash = createHash("sha256").update(args.system).digest("hex");
+  // The static system body is persisted once per distinct hash; each step's
+  // context record references it so the sent request stays reconstructible.
+  if (args.config.recordContextText && !ctx.systemPrompts.has(systemHash)) {
+    ctx.systemPrompts.add(systemHash);
+    await writeRecord(ctx, "system_prompts.jsonl", (recorder) =>
+      recorder.prompt
+        ? recorder.prompt({
+            record: "system_prompt",
+            runId: ctx.runId,
+            hash: systemHash,
+            text: args.system,
+          })
+        : Promise.resolve(),
+    );
+  }
   await pushContext(ctx, {
     runId: ctx.runId,
     trialId: args.trialId,
@@ -1223,6 +1555,7 @@ async function recordContext(
       ...(projected.bundle.history === undefined ? [] : ["history"]),
     ],
     truncated: projected.bundle.truncated,
+    systemHash,
     ...(args.config.recordContextText ? { text: projected.userText } : {}),
   });
 }
@@ -1331,18 +1664,23 @@ async function createManifest(
   evaluation: "trace_audit" | "closed_loop",
   runId: string,
 ): Promise<ExperimentManifest> {
-  let head: string | null = null;
-  try {
-    head = (await execFile("git", ["rev-parse", "HEAD"])).stdout.trim() || null;
-  } catch {
-    head = null;
-  }
+  const snapshot = await snapshotForRun(config);
   return {
-    schemaVersion: HYBRID_SCHEMA_VERSION,
+    schemaVersion: RESULT_SCHEMA_VERSION,
+    protocolId: PROTOCOL_ID,
     runId,
     status: "completed",
-    head,
+    head: snapshot.head,
+    dirty: snapshot.dirty,
     inputHash: createHash("sha256").update(input).digest("hex"),
+    ...(snapshot.taskSetHash ? { taskSetHash: snapshot.taskSetHash } : {}),
+    promptHashes: snapshot.promptHashes,
+    runtime: {
+      node: snapshot.node,
+      platform: snapshot.platform,
+      ...(snapshot.lockfileHash ? { lockfileHash: snapshot.lockfileHash } : {}),
+      generationOptions: "provider_defaults",
+    },
     config,
     modes: config.modes,
     provider: config.provider.mode,

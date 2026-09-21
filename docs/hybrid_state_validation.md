@@ -69,6 +69,39 @@ Acceptance tests live in `src/experiments/hybrid-state/acceptance.test.ts` and r
 | E6  | live preflight and output reservation fail before any execution                              |
 | F1  | the input-dependent fake detects providers that ignore the sent input                        |
 
+Follow-up acceptance tests (protocol `stage-a-followup-1`, result schema 3) live in the same
+files:
+
+| ID   | Test name and file                                                                                            |
+| ---- | ------------------------------------------------------------------------------------------------------------- |
+| L-01 | the llm system prompt carries no task-specific answers or policies (acceptance.test.ts)                       |
+| L-02 | missing, empty, and present patches stay distinct; malformed ones fail (acceptance.test.ts)                   |
+| L-03 | a partially invalid patch applies the valid op, records the drop, and notifies the next step (runner.test.ts) |
+| L-04 | a valid-but-duplicate op is unchanged, never counted as applied (runner.test.ts)                              |
+| L-05 | the update notification covers only the previous step and stays under its 2 KiB cap (runner.test.ts)          |
+| L-06 | both modes see identical remaining budgets and no ninth actor call happens (runner.test.ts)                   |
+| L-07 | Stage A runs actor calls only; jev/update/repair invocations are zero (stage_a.test.ts)                       |
+| L-08 | verified-but-unfinished scores the artifact without crediting a finish (runner.test.ts)                       |
+| L-09 | a correct artifact without actor verification keeps actor not_run (runner.test.ts)                            |
+| L-10 | a change after the actor's passing test keeps the stale flag (runner.test.ts)                                 |
+| L-11 | a wrong artifact fails the final oracle and an oracle-less task reports not evaluated (runner.test.ts)        |
+| L-12 | fake runs keep efficacy not_evaluated while patch and artifact fields stay separate (runner.test.ts)          |
+| L-13 | a schema v2 result renders read-only and never gains v3 fields (acceptance.test.ts)                           |
+| L-14 | re-read analysis uses only inputs at or before the step and degrades to unknown (reread.test.ts, reread.ts)   |
+| L-15 | the sent request carries feedback and budget but never scoring internals (runner.test.ts)                     |
+| L-16 | the actor can read the rejection and correct its patch on the next step (runner.test.ts)                      |
+
+Condition-freeze round tests (same protocol and schema; the comparison's meaning is unchanged):
+
+| ID   | Test name and file                                                                                                                                                            |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| G-01 | verbatim absence with needed values present is not `necessary_detail_missing`; a missing concrete edit detail and unclear planned work are distinguished (reread.test.ts)     |
+| G-02 | user-only records scope claims to the recorded portion, and JSON-escaped newlines never fake verbatim absence (reread.test.ts)                                                |
+| G-03 | persisted context + system_prompts records reconstruct the exact sent body with matching hash and bytes; scoring fields and auth material stay out (runner.test.ts)           |
+| G-04 | the frozen snapshot identifies code, effective config, task/scoring content, and prompts; content drift and a dirty tree are different conditions (freeze.test.ts, freeze.ts) |
+| G-05 | unverified isolation, a corrupt workspace, a writer failure, and cancellation each stop candidate execution with zero additional oracle runs (runner.test.ts)                 |
+| G-06 | the frozen plan is 3 tasks × 2 modes × 3 iterations = 18 trials at ≤144 actor calls, identical budgets across modes, zero jev/repair/update calls (runner.test.ts)            |
+
 Regression tests live in `update.test.ts`, `task_environment.test.ts`, `stage_a.test.ts`,
 `evaluation.test.ts`, `projection.test.ts`, `runner.test.ts`, and `trace.test.ts`. They cover
 protected-constraint updates, actually-applied operation counts, oracle result protocol
@@ -110,20 +143,57 @@ The Stage A output directory `.local/hybrid-state/stage-a-v3/` contains `manifes
 `updates.jsonl`, `calls.jsonl`, `contexts.jsonl`, `summary.json`, and `report.md`. No persistence
 failure occurred; the manifest completed normally.
 
+### Follow-up round (protocol `stage-a-followup-1`)
+
+| Evidence               | Command                                                                                                                                                      | Result                                                                                                           |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| Full repository gate   | `pnpm check`                                                                                                                                                 | passed: format, lint, typecheck, 254 vitest tests passed + 1 skipped, 14 release tests passed, knip clean        |
+| Package verification   | `pnpm run package:check`                                                                                                                                     | passed                                                                                                           |
+| Follow-up offline run  | `pnpm experiment:hybrid -- run --config experiments/hybrid-state/config.stage-a.followup.offline.json --out .local/hybrid-state/stage-a-followup-offline-01` | run `run-mua5nib6-ptecrf`; 6/6 trials completed, wiring passed; new fields populated; efficacy not_evaluated     |
+| Report of that result  | `pnpm experiment:hybrid -- report --input .local/hybrid-state/stage-a-followup-offline-01`                                                                   | rendered with protocol id, termination, final artifact, actor verify, and patch columns                          |
+| Existing live evidence | `.local/hybrid-state/stage-a-live{,2..6}/` read-only analysis                                                                                                | six manifests/summaries verified; see `docs/hybrid_state_live_stage_a.md` for the run table and re-read analysis |
+
+### Condition-freeze round (request evidence + safe evaluation + freeze)
+
+| Evidence                     | Command                                                                                                                                                                      | Result                                                                                                                                                        |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Full repository gate         | `pnpm check`                                                                                                                                                                 | passed: format, lint, typecheck, 270 vitest tests passed + 1 skipped, 14 release tests passed, knip clean                                                     |
+| Package verification         | `pnpm run package:check`                                                                                                                                                     | passed                                                                                                                                                        |
+| Evidence-capture offline run | `node dist/experiments/hybrid-state/cli.js run --config experiments/hybrid-state/config.stage-a.followup.offline.json --out .local/hybrid-state/stage-a-followup-offline-02` | run `run-muavng6b-6aury1`; `system_prompts.jsonl` written (one record per mode); all 40 context records reconstructed to byte- and hash-identical sent bodies |
+| Re-read re-analysis          | `node .local/hybrid-state/review-02/analyze_rereads.mjs .local/hybrid-state/stage-a-live6 .local/hybrid-state/review-02`                                                     | corrected output at `review-02/reread-cases-stage-a-live6.json`; no `necessary_detail_missing` is asserted without a named missing requirement                |
+
+New evidence fields added this round: `ContextRecord.systemHash` + `system_prompts.jsonl`
+(prompt body once per distinct hash, gated by the existing `recordContextText`), and
+`CallRecord.responseModel` (the model the provider actually answered with, never assumed).
+Manifests now carry `dirty`, `taskSetHash`, `promptHashes`, and `runtime` (node, platform,
+lockfile hash, generation-option provenance). `runClosedLoop` accepts `isolationVerified`,
+`signal`, and a test-only `environmentFor` seam; a cancelled or corrupt workspace runs zero
+final oracle passes and reports the reason (`cancelled`, `environment_error`,
+`isolation_unverified`) instead of a verdict. `--freeze <file>` replays a captured
+`FreezeRecord` against the current code/config/tasks/prompts and refuses to run on any
+mismatch. No historical artifacts were modified; no live request was made.
+
 ## Not performed
 
-No live Jev, actor, repair, or update request was made; every live path was exercised only up to
-the preflight boundary. No private session data was supplied. No human review of the synthetic
-labels was performed (`reviewed: false`). No claim about real task success, cost, latency,
-statistical non-inferiority, or state-first superiority is supported by this evidence.
+As of the previous revision no live request had been made. Since then, six live Stage A runs
+were executed and are recorded in `docs/hybrid_state_live_stage_a.md`. **During this follow-up
+revision no new live Jev, actor, repair, or update request was made** — all API-facing paths were
+exercised only through fake providers, stubbed clients, and read-only log analysis. No private
+session data was supplied. No human review of the synthetic labels was performed. No claim about
+real task success, cost, latency, statistical non-inferiority, or state-first superiority is
+supported by this evidence, and the new protocol's efficacy has not been evaluated at all.
 
-Before a live Stage A run, the remaining requirements are: a live configuration with real model
-IDs (`config.live.example.json` shape), credentials resolvable through the existing Pi/TypeSafe
-paths, the `--live` flag, and a decision about how live efficacy will be scored, since live output
-is only `descriptive_only` today. The approved task set is already enforced: the checked-in
-sha256 manifest `experiments/hybrid-state/stage-a.approved.json` pins every task and scoring
-file, scoring is mandatory for closed-loop tasks, and the isolation mechanism is verified on
-macOS through the deny-default `sandbox-exec` profile probes (workspace write allowed, outside
-read denied, symlink escape denied, inherited environment removed, network denied, timeout
-enforced). `live_ready` therefore depends on live credentials and the run preflight rather than
-on additional code.
+Before a follow-up live Stage A run, the remaining requirements are: fill `actorModel` with a
+real provider/model id in `config.stage-a.followup.live.example.json` (it ships empty so a
+verbatim copy fails config validation), credentials resolvable through the existing Pi/TypeSafe
+paths, the `--live` flag, and a decision about how live efficacy will be scored, since live
+output is only `descriptive_only` today. The fixed comparison conditions are: the three approved
+Stage A tasks, modes `history` and `llm`, `maxActions: 8`, actor calls only, 3 iterations
+(`maxRequests: 144` as the actor-call budget), and `timeoutMs: 120000` identical across modes.
+The approved task set is already enforced: the checked-in sha256 manifest
+`experiments/hybrid-state/stage-a.approved.json` pins every task and scoring file, scoring is
+mandatory for closed-loop tasks, and the isolation mechanism is verified on macOS through the
+deny-default `sandbox-exec` profile probes (workspace write allowed, outside read denied,
+symlink escape denied, inherited environment removed, network denied, timeout enforced).
+`live_ready` therefore depends on live credentials and the run preflight rather than on
+additional code.
