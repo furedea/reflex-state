@@ -251,3 +251,5 @@ Pi のスモークテストは，モデルへのネットワーク通信を無�
   投影を無効にしてください．`run-start` はプロンプトキャッシュの再利用を減らす可能性があります．
 
 [ADR-0001](https://github.com/furedea/reflex-state/blob/main/docs/adr/0001_compose_adapters_at_entry_points.md) にアダプターの組み立て方針を記載しています．
+
+[hybrid-state 実験の説明](docs/hybrid_state_experiment.md) では，履歴，ルール，Jev，同一応答での状態更新を隔離したオフライン実験として比較します．

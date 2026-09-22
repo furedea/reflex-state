@@ -252,4 +252,32 @@ Current limitations:
 projection, budget, and legacy rules. [Validation notes](docs/state_safety_validation.md) map those
 rules to regression tests and offline verification.
 
+[The hybrid-state experiment](docs/hybrid_state_experiment.md) describes the isolated offline
+comparison of history, rules, Jev, and same-response state updates.
+
+## Stage A experiment: concluded
+
+A frozen 18-trial comparison (3 tasks × `history`/`llm` × 3 iterations, 8 actions per trial,
+113 actor calls against a 144 cap, `gpt-5.6-luna`, protocol `stage-a-followup-1`) ran to
+completion. Each trial's verdict comes from an independent final evaluation of the workspace,
+not from the actor's own claims.
+
+| task                 | history (3 iters)        | llm (3 iters)                                |
+| -------------------- | ------------------------ | -------------------------------------------- |
+| protected-constraint | finish + pass ×3         | finish + pass ×2, budget-out + final fail ×1 |
+| transient-recovery   | finish + pass ×3         | finish + pass ×3                             |
+| observation-derived  | finish + pass ×3         | finish + pass ×1, budget-out + final pass ×2 |
+| **totals**           | **9/9 finish, 9/9 pass** | **6/9 finish, 8/9 pass**                     |
+
+Same-response patch updates in `llm` mode: 61 proposed, 45 applied, 15 rejected. Zero
+Jev/repair/update calls. `llm` sent ~2.7× the input bytes (319 KB vs 118 KB) and used ~2.6×
+the input tokens (73,301 vs 28,045) for fewer in-budget finishes.
+
+This is a descriptive result only. The two modes ran the same tasks under different prompt
+and feedback paths, so the gap does not isolate the effect of replacing history with current
+state, and these trials are not comparable to the earlier exploratory runs. No
+decision-grade evidence for or against state-first context was produced. This line of work
+is recorded for completeness and is not continuing. Per-trial numbers and the evidence
+chain are in [the live Stage A notes](docs/hybrid_state_live_stage_a.md).
+
 [ADR-0001](https://github.com/furedea/reflex-state/blob/main/docs/adr/0001_compose_adapters_at_entry_points.md) explains composition.

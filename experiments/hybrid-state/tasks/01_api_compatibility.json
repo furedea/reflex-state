@@ -1,0 +1,19 @@
+{
+  "id": "api-compatibility",
+  "instruction": "Keep the public API compatible and do not add a dependency. Update src/api.ts and run the predefined test.",
+  "files": { "src/api.ts": "export function value(): string { return 'old'; }" },
+  "expectedFiles": { "src/api.ts": "export function value(): string { return 'compatible'; }" },
+  "tests": ["api-compatibility"],
+  "steps": [
+    {
+      "action": {
+        "tool": "write",
+        "path": "src/api.ts",
+        "content": "export function value(): string { return 'compatible'; }"
+      },
+      "result": "write"
+    },
+    { "action": { "tool": "test", "command": "api-compatibility" }, "result": "test" },
+    { "action": { "tool": "finish" }, "result": "finish" }
+  ]
+}

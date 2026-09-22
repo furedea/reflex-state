@@ -1,0 +1,20 @@
+{
+  "id": "choose-option",
+  "instruction": "Two designs were proposed. Use the wrapper only when it preserves the API; otherwise keep the adapter. Apply the selected compatible design.",
+  "files": { "src/design.ts": "export const design = 'adapter';" },
+  "expectedFiles": { "src/design.ts": "export const design = 'wrapper';" },
+  "tests": ["choose-option"],
+  "steps": [
+    {
+      "observation": "Option one is an adapter; option two is a wrapper that preserves the API.",
+      "action": {
+        "tool": "write",
+        "path": "src/design.ts",
+        "content": "export const design = 'wrapper';"
+      },
+      "result": "write"
+    },
+    { "action": { "tool": "test", "command": "choose-option" }, "result": "test" },
+    { "action": { "tool": "finish" }, "result": "finish" }
+  ]
+}

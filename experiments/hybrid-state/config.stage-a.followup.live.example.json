@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 2,
+  "evaluation": "closed_loop",
+  "provider": {
+    "mode": "live",
+    "actorModel": "",
+    "maxRequests": 144,
+    "trialMaxRequests": 8,
+    "timeoutMs": 120000,
+    "executionIsolation": "required"
+  },
+  "budgets": {
+    "memoryBytes": 8192,
+    "factsBytes": 4096,
+    "latestObservationBytes": 8192,
+    "requestBytes": 24000,
+    "maxQuestions": 8,
+    "maxRepairCalls": 0,
+    "maxActions": 8
+  },
+  "modes": ["history", "llm"],
+  "seed": 17,
+  "iterations": 3,
+  "recordContextText": true,
+  "candidateMaxBytes": 4096,
+  "taskRoot": "experiments/hybrid-state/tasks/stage-a"
+}

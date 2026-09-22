@@ -1,0 +1,21 @@
+{
+  "id": "failed-attempt",
+  "instruction": "Remember the failed approach and fix the code without treating another test's success as resolving the original issue.",
+  "files": { "src/bug.ts": "export const fixed = false;" },
+  "expectedFiles": { "src/bug.ts": "export const fixed = true;" },
+  "tests": ["failed-attempt"],
+  "steps": [
+    {
+      "observation": "The first edit failed because the flag stayed false.",
+      "action": { "tool": "read", "path": "src/bug.ts" },
+      "result": "read"
+    },
+    {
+      "observation": "The corrected edit changes only the flag.",
+      "action": { "tool": "write", "path": "src/bug.ts", "content": "export const fixed = true;" },
+      "result": "write"
+    },
+    { "action": { "tool": "test", "command": "failed-attempt" }, "result": "test" },
+    { "action": { "tool": "finish" }, "result": "finish" }
+  ]
+}
