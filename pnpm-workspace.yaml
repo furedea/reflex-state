@@ -8,6 +8,8 @@ overrides:
   "@earendil-works/pi-coding-agent@0.83.0>undici": 8.10.2
   # Exclude the affected Vite 8 range from Vitest's peer resolution.
   "vite@>=8.0.0 <8.0.16": 8.0.16
+  # oxfmt 0.45.0 pins tinypool 2.1.0; 2.1.2 fixes the advisory.
+  "oxfmt>tinypool": 2.1.2
 
 auditConfig:
   ignoreCves: []
