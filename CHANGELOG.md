@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.0-alpha.2](https://github.com/furedea/reflex-state/compare/v0.1.0-alpha.1...v0.1.0-alpha.2) (2026-10-17)
+
+
+### Features
+
+* add hybrid state experiment ([#5](https://github.com/furedea/reflex-state/issues/5)) ([726cbf2](https://github.com/furedea/reflex-state/commit/726cbf2efac5f554676abbeabd24d538a7a0bcdf))
+
+
+### Bug Fixes
+
+* **deps:** resolve known dependency vulnerabilities ([#17](https://github.com/furedea/reflex-state/issues/17)) ([b8b48b2](https://github.com/furedea/reflex-state/commit/b8b48b240c29e01589c41edaf8e0c905af2650de))
+
 ## 0.1.0-alpha.1 (2026-09-17)
 
 ### Features
