@@ -21,7 +21,7 @@ export type Question =
       readonly criteria: Record<string, string>;
     };
 
-export interface SystemOneRequest {
+interface SystemOneRequest {
   readonly state: string;
   readonly questions: Record<string, Question>;
   readonly model: string;
