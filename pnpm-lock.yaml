@@ -5,7 +5,6 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
-  '@earendil-works/pi-coding-agent@0.83.0>undici': 8.11.2
   vite@>=8.0.0 <8.0.16: 8.0.16
   oxfmt>tinypool: 2.1.2
 
