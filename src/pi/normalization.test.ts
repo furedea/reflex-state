@@ -61,6 +61,25 @@ test("normalization records command truncation and session resume as events", ()
   expect(normalizer.resume("branch_switch").reason).toBe("branch_switch");
 });
 
+test("an agent end whose final assistant turn is deferred records an aborted stop", () => {
+  const normalizer = new PiEventNormalizer({
+    eventCount: 0,
+    turnIndex: 0,
+    config: defaultConfig(),
+    now: () => 1000,
+  });
+  const deferred = {
+    role: "assistant",
+    content: [{ type: "text", text: "Queued" }],
+    stopReason: "deferred",
+    timestamp: 2000,
+  } as unknown as Parameters<PiEventNormalizer["end"]>[0][number];
+  expect(normalizer.end([deferred])).toMatchObject({
+    type: "agent_end",
+    stopReason: "aborted",
+  });
+});
+
 test("each delivered user message advances the goal turn and preserves bounded verbatim text", () => {
   const normalizer = new PiEventNormalizer({
     eventCount: 0,

@@ -78,7 +78,7 @@ export class PiEventNormalizer {
         last?.role === "assistant" ? textContent(last.content) : "",
         this.options.config.limits,
       ),
-      stopReason: stopReason === "toolUse" || stopReason === "pending" ? "aborted" : stopReason,
+      stopReason: isFinalStop(stopReason) ? stopReason : "aborted",
     };
   }
 
@@ -102,4 +102,11 @@ export class PiEventNormalizer {
   private now(): number {
     return (this.options.now ?? Date.now)();
   }
+}
+
+const finalStopReasons = new Set<string>(["stop", "length", "error", "aborted"]);
+
+// Pi also reports non-final turns (toolUse, pending, deferred); the trace records them as aborted.
+function isFinalStop(stopReason: string): stopReason is AgentEndEvent["stopReason"] {
+  return finalStopReasons.has(stopReason);
 }

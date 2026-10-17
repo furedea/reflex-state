@@ -87,7 +87,7 @@ test.each(["src/pi/index.ts", ".pi/extensions/reflex_state.ts"])(
         await runner.emitToolCall({ type: "tool_call", toolCallId, toolName, input });
         let result: Pick<ToolResultEvent, "content" | "details" | "isError">;
         try {
-          result = { ...(await tool.execute(toolCallId, input)), isError: false };
+          result = { isError: false, ...(await tool.execute(toolCallId, input)) };
         } catch (error) {
           result = {
             content: [{ type: "text", text: error instanceof Error ? error.message : "failed" }],
@@ -117,12 +117,7 @@ test.each(["src/pi/index.ts", ".pi/extensions/reflex_state.ts"])(
       const ctx = runner.createCommandContext();
       const command = runner.getCommand("state");
       expect(command).toBeDefined();
-      await runner.emitBeforeAgentStart(
-        "Fix the tests",
-        undefined,
-        "",
-        ctx.getSystemPromptOptions(),
-      );
+      await runner.emitBeforeAgentStart("Fix the tests", undefined, ctx.getSystemPromptOptions());
       expect(
         (
           await runTool("write", {
