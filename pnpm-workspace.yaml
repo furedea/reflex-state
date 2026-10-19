@@ -7,7 +7,7 @@ overrides:
   # Exclude the affected Vite 8 range from Vitest's peer resolution.
   "vite@>=8.0.0 <8.0.16": 8.0.16
   # oxfmt 0.45.0 pins tinypool 2.1.0; 2.1.2 fixes the advisory.
-  "oxfmt>tinypool": 2.1.2
+  "oxfmt>tinypool": 2.2.0
 
 auditConfig:
   ignoreCves: []
