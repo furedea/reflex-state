@@ -35,7 +35,7 @@ export class JevStateUpdater implements StateUpdater {
     const ids = Object.keys(questions);
     if (!ids.length) return emptyDecisions();
     const started = performance.now();
-    const outcome = await this.request(context, { ids, questions }, signal);
+    const outcome = await this.request(context, questions, signal);
     return withCallTelemetry(outcome, ids, started);
   }
 
@@ -46,9 +46,10 @@ export class JevStateUpdater implements StateUpdater {
 
   private async request(
     context: StateUpdateContext,
-    { ids, questions }: { ids: string[]; questions: Record<string, Question> },
+    questions: Record<string, Question>,
     signal?: AbortSignal,
   ): Promise<RequestOutcome> {
+    const ids = Object.keys(questions);
     const attempt = { invoked: false };
     let response: unknown;
     try {

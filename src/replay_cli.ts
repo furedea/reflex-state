@@ -24,7 +24,7 @@ type ReplayResult = Awaited<ReturnType<typeof replay>>;
 
 async function main(): Promise<void> {
   const args = parseCliArguments();
-  const recordedPath = recordedPathFor(args);
+  const recordedPath = recordedPathFor(args.mode, args.input);
   const recording = recordedPath ? parseRecording(await readFile(recordedPath, "utf8")) : undefined;
   const metadata = await traceMetadata(join(dirname(args.input), "trace_meta.json"));
   const config = withEnvironment(await baseConfig(args.config, metadata.config));
@@ -37,7 +37,10 @@ async function main(): Promise<void> {
     updater,
     ...(recording ? { recording } : {}),
   });
-  await writeReplayArtifacts(args, recordedPath, result);
+  await writeArtifacts(args.out, artifactFiles(result), [
+    args.input,
+    ...(recordedPath ? [recordedPath] : []),
+  ]);
   console.log(JSON.stringify(result.state, null, 2));
   console.error(summarize(result) + " Artifacts: " + args.out);
 }
@@ -63,7 +66,7 @@ function parseCliArguments(): CliArguments {
   return { input, mode, config: values.config, cwd: values.cwd, out: values.out };
 }
 
-function recordedPathFor({ mode, input }: CliArguments): string | undefined {
+function recordedPathFor(mode: string, input: string): string | undefined {
   return mode.startsWith("recorded")
     ? mode.slice(9) || join(dirname(input), "transitions.jsonl")
     : undefined;
@@ -102,21 +105,13 @@ function summarize(result: ReplayResult): string {
   );
 }
 
-async function writeReplayArtifacts(
-  args: CliArguments,
-  recordedPath: string | undefined,
-  result: ReplayResult,
-): Promise<void> {
-  await writeArtifacts(
-    args.out,
-    {
-      "final_state.json": JSON.stringify(result.state, null, 2) + "\n",
-      "transitions.jsonl": jsonLines(result.transitions),
-      "metrics.json": JSON.stringify(result.metrics, null, 2) + "\n",
-      "summary.txt": summarize(result) + "\n",
-    },
-    [args.input, ...(recordedPath ? [recordedPath] : [])],
-  );
+function artifactFiles(result: ReplayResult): Record<string, string> {
+  return {
+    "final_state.json": JSON.stringify(result.state, null, 2) + "\n",
+    "transitions.jsonl": jsonLines(result.transitions),
+    "metrics.json": JSON.stringify(result.metrics, null, 2) + "\n",
+    "summary.txt": summarize(result) + "\n",
+  };
 }
 
 await main().catch((error: unknown) => {

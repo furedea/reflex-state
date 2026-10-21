@@ -27,13 +27,11 @@ const MAX_QUESTIONS = 8;
 const MAX_INPUT_BYTES = 24_000;
 const INPUT_OVERHEAD_BYTES = 6_000;
 
-type SkippedItem = { id: string; reason: string };
-
 export function buildRequestPlan(context: StateUpdateContext): RequestPlan {
   const { event, evidence, config } = context;
   if (isReadEvent(event)) return { items: [], skipped: [], evidenceIds: [] };
   const latest = event.id;
-  const skipped: SkippedItem[] = [];
+  const skipped: { id: string; reason: string }[] = [];
   const available = candidateItems(context).filter((item) => {
     const missing = item.requiredEvidence.filter((id) => !evidence.has(id) && id !== latest);
     if (!missing.length) return true;
@@ -42,8 +40,15 @@ export function buildRequestPlan(context: StateUpdateContext): RequestPlan {
   });
   if (config.shadowQuestions.includes("phase") && available.length)
     available.push({ id: "phase_shadow", kind: "phase_shadow", requiredEvidence: [latest] });
-  const selected = withinInputBudget(available, context, skipped);
-  const items = withinQuestionLimit(available, selected, skipped);
+  const selected = withinInputBudget(available, context);
+  const items = selected.slice(0, MAX_QUESTIONS);
+  skipped.push(
+    ...skippedItems(
+      available.filter((item) => !selected.includes(item)),
+      "input_budget",
+    ),
+    ...skippedItems(selected.slice(MAX_QUESTIONS), "question_limit"),
+  );
   const evidenceIds = [...new Set(items.flatMap((item) => item.requiredEvidence))];
   return { items, skipped, evidenceIds };
 }
@@ -115,7 +120,6 @@ function relevanceCandidates({ event, facts, state, config }: StateUpdateContext
 function withinInputBudget(
   available: readonly RequestPlanItem[],
   { event, state, evidence }: StateUpdateContext,
-  skipped: SkippedItem[],
 ): RequestPlanItem[] {
   const selected: RequestPlanItem[] = [];
   let estimatedBytes = INPUT_OVERHEAD_BYTES + Buffer.byteLength(JSON.stringify({ state, event }));
@@ -125,31 +129,18 @@ function withinInputBudget(
       return total + (source ? Buffer.byteLength(JSON.stringify(source)) : 0);
     }, 0);
     const itemBytes = Buffer.byteLength(JSON.stringify(item)) + evidenceBytes;
-    if (estimatedBytes + itemBytes > MAX_INPUT_BYTES) {
-      skipped.push({ id: item.id, reason: "input_budget" });
-      continue;
-    }
+    if (estimatedBytes + itemBytes > MAX_INPUT_BYTES) continue;
     selected.push(item);
     estimatedBytes += itemBytes;
   }
   return selected;
 }
 
-function withinQuestionLimit(
-  available: readonly RequestPlanItem[],
-  selected: readonly RequestPlanItem[],
-  skipped: SkippedItem[],
-): RequestPlanItem[] {
-  const items: RequestPlanItem[] = [];
-  for (const item of available) {
-    if (!selected.includes(item)) continue;
-    if (items.length >= MAX_QUESTIONS) {
-      skipped.push({ id: item.id, reason: "question_limit" });
-      continue;
-    }
-    items.push(item);
-  }
-  return items;
+function skippedItems(
+  items: readonly RequestPlanItem[],
+  reason: string,
+): { id: string; reason: string }[] {
+  return items.map((item) => ({ id: item.id, reason }));
 }
 
 function completionEvidence(state: HotState, latest: EventId): EventId[] {

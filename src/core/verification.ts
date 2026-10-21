@@ -22,22 +22,10 @@ export interface VerificationClassification {
   readonly unknownReason?: string;
 }
 
-export interface VerificationInput {
-  readonly command: string;
-  readonly cwd: string;
-  readonly truncated?: boolean | undefined;
-}
-
-export interface VerificationContext {
-  readonly config: ReflexStateConfig;
-  readonly generation: number;
-  readonly pendingChanges: readonly EventId[];
-  readonly started?: StartedVerification | undefined;
-}
-
-interface StartedVerification {
+export interface StartedVerification {
   readonly eventId: EventId;
   readonly generation: number;
+  readonly current: boolean;
   readonly checkKey?: string;
 }
 
@@ -56,9 +44,9 @@ export function normalizeCwd(cwd: string): string {
 export function normalizeCommand(command: string): string {
   let result = "";
   let pendingSpace = false;
-  const state = initialScanState();
+  const scanner = new ShellScanner();
   for (const char of command.trim()) {
-    const kind = scanChar(state, char);
+    const kind = scanner.scan(char);
     if (kind === "plain" && /\s/.test(char)) {
       pendingSpace = result.length > 0;
       continue;
@@ -76,16 +64,16 @@ export function verificationCheckKey(kind: VerificationKind, cwd: string, comman
 }
 
 export function classifyVerification(
-  input: VerificationInput,
+  command: string,
+  cwd: string,
   config: ReflexStateConfig,
 ): VerificationClassification | undefined {
-  const { command, cwd } = input;
   const normalized = normalizeCommand(command);
   const kind = detectKind(normalized, config);
   if (!kind) return undefined;
   const shell = shellOperators(normalized);
   const compound = shell.length > 0 || hasUnclosedSyntax(normalized);
-  const unknownReason = unknownReasonFor(input.truncated ?? false, shell.length > 0, compound);
+  const unknownReason = unknownReasonFor(shell.length > 0, compound);
   return {
     kind,
     command,
@@ -97,49 +85,47 @@ export function classifyVerification(
   };
 }
 
-function unknownReasonFor(
-  truncated: boolean,
-  hasShellOperators: boolean,
-  compound: boolean,
-): string | undefined {
-  if (truncated) return "command_truncated";
+export function classifyToolCall(
+  call: ToolCallEvent | undefined,
+  config: ReflexStateConfig,
+): VerificationClassification | undefined {
+  if (!call || call.toolName !== "bash" || typeof call.input.command !== "string") return undefined;
+  const classification = classifyVerification(call.input.command, call.cwd ?? ".", config);
+  return classification && call.commandTruncated ? truncated(classification) : classification;
+}
+
+function truncated(classification: VerificationClassification): VerificationClassification {
+  const { checkKey: _checkKey, ...rest } = classification;
+  return { ...rest, attributable: false, unknownReason: "command_truncated" };
+}
+
+function unknownReasonFor(hasShellOperators: boolean, compound: boolean): string | undefined {
   if (hasShellOperators) return "compound_command";
   return compound ? "ambiguous_shell_syntax" : undefined;
 }
 
 export function verificationFact(
   event: AgentEvent,
-  call: ToolCallEvent | undefined,
-  context: VerificationContext,
+  classification: VerificationClassification | undefined,
+  started?: StartedVerification,
 ): VerificationFact | undefined {
-  if (!call || call.toolName !== "bash" || typeof call.input.command !== "string") return undefined;
-  const classification = classifyVerification(
-    { command: call.input.command, cwd: call.cwd ?? ".", truncated: call.commandTruncated },
-    context.config,
-  );
   if (!classification?.kind) return undefined;
-  const { started } = context;
   return {
     ...classification,
     kind: classification.kind,
     status: statusFor(event, classification),
     ...(started ? { startedEvent: started.eventId, observedGeneration: started.generation } : {}),
-    freshness: freshnessFor(event, classification, context),
+    freshness: freshnessFor(event, classification, started),
   };
 }
 
 function freshnessFor(
   event: AgentEvent,
   classification: VerificationClassification,
-  { started, generation, pendingChanges }: VerificationContext,
+  started: StartedVerification | undefined,
 ): VerificationFreshness {
   if (event.type === "tool_call" || !classification.attributable) return "unknown";
-  const current = Boolean(
-    started &&
-    started.generation === generation &&
-    pendingChanges.every((id) => id === started.eventId),
-  );
-  return current ? "current" : "stale";
+  return started?.current ? "current" : "stale";
 }
 
 function detectKind(command: string, config: ReflexStateConfig): VerificationKind | undefined {
@@ -166,9 +152,9 @@ function detectSingle(command: string, config: ReflexStateConfig): VerificationK
 function candidateSegments(command: string): string[] {
   const segments: string[] = [];
   let part = "";
-  const state = initialScanState();
+  const scanner = new ShellScanner();
   for (const char of command) {
-    const isSeparator = scanChar(state, char) === "plain" && ";|&<>\n".includes(char);
+    const isSeparator = scanner.scan(char) === "plain" && ";|&<>\n".includes(char);
     if (!isSeparator) {
       part += char;
       continue;
@@ -186,10 +172,10 @@ function pushSegment(segments: string[], part: string): void {
 
 function shellOperators(command: string): string[] {
   const operators: string[] = [];
-  const state = initialScanState();
+  const scanner = new ShellScanner();
   for (let index = 0; index < command.length; index++) {
     const char = command[index] ?? "";
-    if (scanChar(state, char) !== "plain") continue;
+    if (scanner.scan(char) !== "plain") continue;
     if (char === "$" && command[index + 1] === "(") operators.push("substitution");
     else if (char === "`" || ";|&<>\n".includes(char)) operators.push(char);
   }
@@ -197,40 +183,40 @@ function shellOperators(command: string): string[] {
 }
 
 function hasUnclosedSyntax(command: string): boolean {
-  const state = initialScanState();
-  for (const char of command) scanChar(state, char);
-  return Boolean(state.quote || state.escaped);
+  const scanner = new ShellScanner();
+  for (const char of command) scanner.scan(char);
+  return scanner.isUnclosed;
 }
 
 type CharKind = "escaped" | "escape" | "quoted" | "open-quote" | "plain";
 
-interface ScanState {
-  quote: "'" | '"' | "";
-  escaped: boolean;
-}
+class ShellScanner {
+  private quote: "'" | '"' | "" = "";
+  private escaped = false;
 
-function initialScanState(): ScanState {
-  return { quote: "", escaped: false };
-}
+  get isUnclosed(): boolean {
+    return Boolean(this.quote || this.escaped);
+  }
 
-function scanChar(state: ScanState, char: string): CharKind {
-  if (state.escaped) {
-    state.escaped = false;
-    return "escaped";
+  scan(char: string): CharKind {
+    if (this.escaped) {
+      this.escaped = false;
+      return "escaped";
+    }
+    if (char === "\\" && this.quote !== "'") {
+      this.escaped = true;
+      return "escape";
+    }
+    if (this.quote) {
+      if (char === this.quote) this.quote = "";
+      return "quoted";
+    }
+    if (char === "'" || char === '"') {
+      this.quote = char;
+      return "open-quote";
+    }
+    return "plain";
   }
-  if (char === "\\" && state.quote !== "'") {
-    state.escaped = true;
-    return "escape";
-  }
-  if (state.quote) {
-    if (char === state.quote) state.quote = "";
-    return "quoted";
-  }
-  if (char === "'" || char === '"') {
-    state.quote = char;
-    return "open-quote";
-  }
-  return "plain";
 }
 
 function statusFor(

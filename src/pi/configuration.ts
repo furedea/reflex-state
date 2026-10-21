@@ -15,15 +15,12 @@ interface ConfigOptions {
   readonly environment?: Readonly<Record<string, string | undefined>>;
 }
 
-type Environment = Readonly<Record<string, string | undefined>>;
-type ReadText = (path: string) => Promise<string>;
-
 export async function loadConfig(options: ConfigOptions) {
   const env = options.environment ?? process.env;
   const readText = options.readText ?? ((file: string) => readFile(file, "utf8"));
   let config = defaultConfig();
   const warnings: string[] = [];
-  for (const path of configPaths(options, env)) {
+  for (const path of configPaths(options)) {
     const result = await mergeConfigFile(config, path, readText);
     config = result.config;
     warnings.push(...result.warnings);
@@ -31,7 +28,8 @@ export async function loadConfig(options: ConfigOptions) {
   return { config: applyEnvironment(config, env), warnings };
 }
 
-function configPaths(options: ConfigOptions, env: Environment): string[] {
+function configPaths(options: ConfigOptions): string[] {
+  const env = options.environment ?? process.env;
   const files = [
     options.globalPath ??
       join(env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "reflex-state.json"),
@@ -43,7 +41,7 @@ function configPaths(options: ConfigOptions, env: Environment): string[] {
 async function mergeConfigFile(
   config: ReflexStateConfig,
   path: string,
-  readText: ReadText,
+  readText: (path: string) => Promise<string>,
 ): Promise<{ config: ReflexStateConfig; warnings: string[] }> {
   try {
     const raw: unknown = JSON.parse(await readText(path));
@@ -61,7 +59,10 @@ async function mergeConfigFile(
   }
 }
 
-function applyEnvironment(config: ReflexStateConfig, env: Environment): ReflexStateConfig {
+function applyEnvironment(
+  config: ReflexStateConfig,
+  env: Readonly<Record<string, string | undefined>>,
+): ReflexStateConfig {
   return {
     ...config,
     enabled: env.REFLEX_STATE_DISABLE === "1" ? false : config.enabled,

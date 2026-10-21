@@ -48,10 +48,9 @@ export function initialState(): HotState {
 export function reduce(context: ReductionContext): { state: HotState; changes: string[] } {
   const { state, event, facts, now } = context;
   const blockers = updatedBlockers(context);
-  const generation =
-    (state.observationGeneration ?? 0) + (mutationAdvancesGeneration(state, event, facts) ? 1 : 0);
+  const generation = nextGeneration(context);
   const pendingChanges = nextPendingChanges(state.pendingChanges ?? [], event, facts);
-  const verification = updatedVerification(context, generation, pendingChanges);
+  const verification = updatedVerification(context, pendingChanges);
   const completed = canComplete(context, blockers, pendingChanges);
   const next: HotState = {
     ...state,
@@ -75,6 +74,12 @@ export function reduce(context: ReductionContext): { state: HotState; changes: s
   };
   const changes = stateChanges(state, next);
   return { state: next, changes };
+}
+
+function nextGeneration({ state, event, facts }: ReductionContext): number {
+  return (
+    (state.observationGeneration ?? 0) + (mutationAdvancesGeneration(state, event, facts) ? 1 : 0)
+  );
 }
 
 function mutationAdvancesGeneration(
@@ -199,7 +204,6 @@ function nextPendingChanges(
 
 function updatedVerification(
   context: ReductionContext,
-  generation: number,
   pendingChanges: readonly EventId[],
 ): HotState["verification"] {
   const { state, event, facts } = context;
@@ -207,7 +211,7 @@ function updatedVerification(
   const next = facts.mutation ? markStale(cloned) : cloned;
   const fact = facts.verification;
   if (!fact) return event.type === "session_resume" ? markStale(next) : next;
-  const entry = verificationEntry(next[fact.kind], fact, { event, generation });
+  const entry = verificationEntry(next[fact.kind], fact, context);
   const staleBecausePending = event.type === "tool_result" && pendingChanges.length > 0;
   return {
     ...next,
@@ -237,7 +241,7 @@ function mapVerification(
 function verificationEntry(
   current: VerificationState,
   fact: VerificationFact,
-  { event, generation }: { event: AgentEvent; generation: number },
+  context: ReductionContext,
 ): VerificationState {
   const {
     checkKey: _previousCheckKey,
@@ -249,20 +253,22 @@ function verificationEntry(
     ...stable,
     status: fact.status,
     freshness: fact.freshness ?? (fact.status === "running" ? "unknown" : "current"),
-    evidence: event.id,
+    evidence: context.event.id,
     command: fact.command,
     cwd: fact.cwd,
     ...(fact.checkKey ? { checkKey: fact.checkKey } : {}),
     ...(fact.startedEvent ? { startedEvent: fact.startedEvent } : {}),
-    ...observedFields(fact, event, generation),
+    ...observedFields(fact, context),
     attributable: fact.attributable,
     ...(fact.unknownReason ? { unknownReason: fact.unknownReason } : {}),
   };
 }
 
-function observedFields(fact: VerificationFact, event: AgentEvent, generation: number) {
+function observedFields(fact: VerificationFact, context: ReductionContext) {
   if (fact.observedGeneration !== undefined) return { observedGeneration: fact.observedGeneration };
-  if (event.type === "tool_call") return { observedGeneration: generation, startedEvent: event.id };
+  const { event } = context;
+  if (event.type === "tool_call")
+    return { observedGeneration: nextGeneration(context), startedEvent: event.id };
   return {};
 }
 

@@ -23,10 +23,15 @@ type ProjectionPlan =
   | { readonly retained: Message[]; readonly target: PlacementTarget }
   | { readonly fallback: Fallback };
 
+interface Projection {
+  messages: Message[];
+  measurement: ProjectionMeasurement;
+}
+
 export function projectContext(
   messages: Message[],
   context: StateBlockContext & { compacting?: boolean },
-) {
+): Projection {
   const preflight = preflightFallback(context);
   if (preflight) return fallbackResult(messages, preflight);
   const plan = planProjection(messages, context);
@@ -39,10 +44,11 @@ export function projectContext(
     messagesOmitted: messages.length - retained.length,
   });
   if (!block) return fallbackResult(messages, { reason: "state_block_budget", mode });
-  return projectionResult(messages, addBlock(retained, target, block), {
-    mode,
-    stateBlockChars: block.length,
-  });
+  const projected = addBlock(retained, target, block);
+  return {
+    messages: projected,
+    measurement: { ...measureProjection(messages, projected, mode), stateBlockChars: block.length },
+  };
 }
 
 function preflightFallback(
@@ -217,27 +223,24 @@ function closeToolCall(
   return true;
 }
 
-function fallbackResult(messages: Message[], { reason, mode }: Fallback) {
-  return projectionResult(messages, messages, { mode, fallback: reason });
-}
-
-function projectionResult(
-  before: Message[],
-  messages: Message[],
-  details: { mode: ProjectionMode; fallback?: string; stateBlockChars?: number },
-): { messages: Message[]; measurement: ProjectionMeasurement } {
-  const { mode, fallback, stateBlockChars } = details;
+function fallbackResult(messages: Message[], { reason, mode }: Fallback): Projection {
   return {
     messages,
-    measurement: {
-      mode,
-      messagesBefore: before.length,
-      messagesAfter: messages.length,
-      messagesOmitted: before.length - messages.length,
-      charsBefore: JSON.stringify(before).length,
-      charsAfter: JSON.stringify(messages).length,
-      ...(stateBlockChars === undefined ? {} : { stateBlockChars }),
-      ...(fallback ? { fallback } : {}),
-    },
+    measurement: { ...measureProjection(messages, messages, mode), fallback: reason },
+  };
+}
+
+function measureProjection(
+  before: Message[],
+  messages: Message[],
+  mode: ProjectionMode,
+): ProjectionMeasurement {
+  return {
+    mode,
+    messagesBefore: before.length,
+    messagesAfter: messages.length,
+    messagesOmitted: before.length - messages.length,
+    charsBefore: JSON.stringify(before).length,
+    charsAfter: JSON.stringify(messages).length,
   };
 }
