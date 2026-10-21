@@ -1,16 +1,13 @@
 import type { CommittedPatch } from "./runner_patch.js";
 import type { ActorTestRun } from "./runner_scoring.js";
-import type { TaskEnvironment } from "./task_environment.js";
 import type {
   ActionForm,
   ActorAction,
+  ActorVerificationEntry,
   PatchOperation,
   PatchStats,
   UpdateFeedback,
 } from "./types.js";
-
-type Execution = Awaited<ReturnType<TaskEnvironment["execute"]>>;
-type ConstraintVerdicts = Readonly<Record<string, boolean>>;
 
 /** Per-trial counters and observations that feed the final score. */
 export class TrialTally {
@@ -47,6 +44,28 @@ export class TrialTally {
     return Object.fromEntries(this.constraintVerdicts);
   }
 
+  /** Per declared test: the actor's latest own run at stop time and whether the
+   * workspace still matched the generation that run verified. */
+  actorVerificationAtStop(
+    allowedTests: readonly string[],
+    finalGeneration: number,
+  ): Record<string, ActorVerificationEntry> {
+    const result: Record<string, ActorVerificationEntry> = {};
+    for (const testId of allowedTests) {
+      const latest = [...this.actorTests].reverse().find((run) => run.testId === testId);
+      if (!latest) {
+        result[testId] = { status: "not_run" };
+        continue;
+      }
+      result[testId] = {
+        status: latest.passed ? "passed" : "failed",
+        step: latest.step,
+        freshness: latest.generation === finalGeneration ? "current" : "stale",
+      };
+    }
+    return result;
+  }
+
   tallyApplied(applied: readonly PatchOperation[]): void {
     this.appliedExtractive += applied.filter((op) => op.origin === "extracted").length;
     this.appliedGenerated += applied.filter((op) => op.origin === "generated").length;
@@ -62,10 +81,10 @@ export class TrialTally {
     this.tallyApplied(patch.applied);
   }
 
-  trackExecution(actionKey: string, execution: Execution): void {
+  trackExecution(actionKey: string, passed: boolean): void {
     if (this.lastFailedKey !== undefined && this.lastFailedKey === actionKey) this.retries++;
-    this.lastFailedKey = execution.passed ? undefined : actionKey;
-    if (!execution.passed) this.failureObserved = true;
+    this.lastFailedKey = passed ? undefined : actionKey;
+    if (!passed) this.failureObserved = true;
   }
 
   trackRead(action: ActorAction, generation: number): void {
@@ -75,18 +94,12 @@ export class TrialTally {
     this.readKeys.add(key);
   }
 
-  trackVerification(step: number, execution: Execution): void {
-    if (!execution.verification) return;
-    this.actorTests.push({
-      testId: execution.verification.testId,
-      step,
-      passed: execution.passed,
-      generation: execution.verification.generation,
-    });
-    this.mergeConstraints(execution.verification.constraints);
+  trackVerification(run: ActorTestRun, constraints?: Readonly<Record<string, boolean>>): void {
+    this.actorTests.push(run);
+    this.mergeConstraints(constraints);
   }
 
-  mergeConstraints(verdicts?: ConstraintVerdicts): void {
+  mergeConstraints(verdicts?: Readonly<Record<string, boolean>>): void {
     for (const [key, verdict] of Object.entries(verdicts ?? {}))
       this.constraintVerdicts.set(key, (this.constraintVerdicts.get(key) ?? true) && verdict);
   }

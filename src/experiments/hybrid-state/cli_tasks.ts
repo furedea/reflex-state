@@ -4,6 +4,11 @@ import { join } from "node:path";
 import { parseHybridTask, parseTaskScoring } from "./config_parsing.js";
 import type { HybridTask, TaskScoring } from "./types.js";
 
+export interface ScoredTasks {
+  readonly tasks: readonly HybridTask[];
+  readonly scoring: ReadonlyMap<string, TaskScoring>;
+}
+
 export async function loadTasks(root: string): Promise<HybridTask[]> {
   const files = (await readdir(root)).filter((file) => file.endsWith(".json")).sort();
   const tasks: HybridTask[] = [];

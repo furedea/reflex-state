@@ -22,22 +22,26 @@ export async function providerSet(
   values: CliOptions,
   tasks: readonly HybridTask[] = [],
 ): Promise<ProviderSet> {
-  const needs: ProviderNeeds = {
-    actor: config.evaluation === "closed_loop",
-    jev: config.modes.includes("jev"),
-    repair: config.modes.some((mode) => mode === "rules" || mode === "jev"),
-    update: config.evaluation === "trace_audit" && config.modes.includes("llm"),
-  };
-  if (config.provider.mode === "fake") return fakeProviders(needs, tasks);
+  if (config.provider.mode === "fake") return fakeProviders(config, tasks);
   if (config.provider.mode === "recorded") {
     if (typeof values.recorded !== "string")
       throw new Error("Recorded provider requires --recorded <file>");
     return readRecordedProviders(values.recorded);
   }
-  return liveProviders(config, needs);
+  return liveProviders(config);
 }
 
-function fakeProviders(needs: ProviderNeeds, tasks: readonly HybridTask[]): ProviderSet {
+function providerNeeds(config: HybridConfig): ProviderNeeds {
+  return {
+    actor: config.evaluation === "closed_loop",
+    jev: config.modes.includes("jev"),
+    repair: config.modes.some((mode) => mode === "rules" || mode === "jev"),
+    update: config.evaluation === "trace_audit" && config.modes.includes("llm"),
+  };
+}
+
+function fakeProviders(config: HybridConfig, tasks: readonly HybridTask[]): ProviderSet {
+  const needs = providerNeeds(config);
   return {
     ...(needs.jev ? { jev: new FakeJevProvider() } : {}),
     ...(needs.repair ? { repair: new FakeRepairProvider() } : {}),
@@ -46,7 +50,8 @@ function fakeProviders(needs: ProviderNeeds, tasks: readonly HybridTask[]): Prov
   };
 }
 
-async function liveProviders(config: HybridConfig, needs: ProviderNeeds): Promise<ProviderSet> {
+async function liveProviders(config: HybridConfig): Promise<ProviderSet> {
+  const needs = providerNeeds(config);
   const providers = await createLiveProviders({
     ...(config.provider.actorModel ? { actorModel: config.provider.actorModel } : {}),
     ...(config.provider.jevModel ? { jevModel: config.provider.jevModel } : {}),

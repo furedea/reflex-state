@@ -5,21 +5,13 @@ import { PiEventNormalizer } from "../../pi/normalization.js";
 import { evaluateAudit, summarize, type LabelsFile } from "./evaluation.js";
 import { buildProjection, type ProjectedInput } from "./projection.js";
 import type { ProviderSet } from "./providers.js";
+import { callOptions, fakeProviders, TrialSession, type TrialStep } from "./runner_calls.js";
 import {
-  callOptions,
-  fakeProviders,
-  instrumented,
-  updateWithProviders,
-  type UpdateScope,
-} from "./runner_calls.js";
-import {
-  auditRecord,
   BudgetExhausted,
   countApplied,
   countDecisions,
   newRunContext,
   pushUpdate,
-  recordContext,
   rememberCandidates,
   type ExperimentRun,
   type RunContext,
@@ -30,6 +22,7 @@ import { idleTrialScore } from "./runner_scoring.js";
 import { eventsForMessages, generateCandidates } from "./trace.js";
 import type {
   ExperimentMode,
+  ExperimentSummary,
   GenerativeUpdateRequest,
   HybridConfig,
   ObservationGroup,
@@ -51,130 +44,320 @@ import {
   type updateMemory,
 } from "./update.js";
 
-export interface AuditOptions {
+type UpdateInput = Parameters<typeof updateMemory>[0];
+
+export async function runAudit(options: {
   readonly config: HybridConfig;
   readonly trace: TraceData;
   readonly labels?: LabelsFile;
   readonly providers?: ProviderSet;
   readonly runId?: string;
   readonly recorder?: RunRecorder;
+}): Promise<ExperimentRun> {
+  const ctx = newRunContext(options.runId ?? newRunId(), options.config, options.recorder);
+  const providers = options.providers ?? fakeProviders([]);
+  return new TraceAudit(ctx, options.trace, providers).run(options.labels);
 }
 
-interface AuditRun {
-  readonly ctx: RunContext;
-  readonly options: AuditOptions;
-  readonly providers: ProviderSet;
-  readonly selected: Record<ExperimentMode, string[]>;
+class TraceAudit {
+  readonly selected: Record<ExperimentMode, string[]> = {
+    history: [],
+    llm: [],
+    rules: [],
+    jev: [],
+  };
+
+  constructor(
+    readonly ctx: RunContext,
+    readonly trace: TraceData,
+    readonly providers: ProviderSet,
+  ) {}
+
+  async run(labels?: LabelsFile): Promise<ExperimentRun> {
+    const { ctx, trace } = this;
+    if (labels && !this.labelsUsable(labels)) await this.recordRejectedLabels(labels);
+    const scores: TrialScore[] = [];
+    const skipped: SkippedTrial[] = [];
+    for (const mode of ctx.config.modes) {
+      if (ctx.budget.sent >= ctx.budget.limit) {
+        skipped.push(skippedAuditTrial(mode));
+        continue;
+      }
+      scores.push(await new AuditTrial(this, mode).run());
+    }
+    await this.recordSummary(labels);
+    const summary = this.summarize(scores, skipped, this.labelsUsable(labels));
+    const manifest = await createManifest(ctx, trace.sourceHash, "trace_audit");
+    return { manifest, updates: ctx.updates, calls: ctx.calls, contexts: ctx.contexts, summary };
+  }
+
+  private labelsUsable(labels: LabelsFile | undefined): boolean {
+    return labels?.sourceHash === this.trace.sourceHash;
+  }
+
+  private async recordRejectedLabels(labels: LabelsFile): Promise<void> {
+    await pushAuditSummary(this.ctx, {
+      labels_rejected: "source_hash_mismatch",
+      expected: this.trace.sourceHash,
+      actual: labels.sourceHash,
+    });
+  }
+
+  private async recordSummary(labels: LabelsFile | undefined): Promise<void> {
+    const { ctx, trace, selected } = this;
+    const labelsUsable = this.labelsUsable(labels);
+    const allLabels = labels?.labels ?? [];
+    const allCandidates = generateCandidates(trace.messages, {
+      maxBytes: ctx.config.candidateMaxBytes,
+    });
+    const evaluation = labelsUsable ? evaluateAudit(allCandidates, allLabels) : undefined;
+    await pushAuditSummary(ctx, {
+      labelsUsable,
+      labelCount: allLabels.length,
+      selected,
+      distribution: evaluation?.distribution ?? {},
+      selectionAccuracy: "not_evaluated",
+      evaluated: evaluation?.total ?? 0,
+      coverage: evaluation?.coverage ?? 0,
+    });
+  }
+
+  private summarize(
+    scores: readonly TrialScore[],
+    skipped: readonly SkippedTrial[],
+    labelsUsable: boolean,
+  ): ExperimentSummary {
+    const { ctx } = this;
+    const { config } = ctx;
+    return summarize({
+      runId: ctx.runId,
+      evaluation: "trace_audit",
+      provider: config.provider.mode,
+      modes: config.modes,
+      scores,
+      plannedTrials: config.modes.length,
+      skipped,
+      calls: ctx.calls,
+      contexts: ctx.contexts,
+      uniqueCandidates: ctx.uniqueCandidates,
+      decisionCounts: ctx.decisionCounts,
+      appliedCounts: ctx.appliedCounts,
+      environment: experimentEnvironment(config),
+      limitations: auditLimitations(labelsUsable),
+    });
+  }
 }
 
 /** Trial-local state: each mode gets a fresh history, normalizer, engine, and memory. */
-interface AuditTrial {
-  memory: WorkMemory;
-  endReason: string;
-  readonly history: TraceMessage[];
-  readonly normalizer: PiEventNormalizer;
-  readonly engine: StateEngine;
-}
+class AuditTrial {
+  private memory: WorkMemory = emptyMemory();
+  private endReason = "completed";
+  private readonly history: TraceMessage[] = [];
+  private readonly normalizer = new PiEventNormalizer({
+    eventCount: 0,
+    turnIndex: 0,
+    config: defaultConfig(),
+    cwd: "/experiment",
+  });
+  private readonly engine = new StateEngine({
+    cwd: "/experiment",
+    config: defaultConfig(),
+    updater: new NoopStateUpdater(),
+  });
+  private readonly session: TrialSession;
 
-interface AuditStepContext {
-  readonly audit: AuditRun;
-  readonly trial: AuditTrial;
-  readonly mode: ExperimentMode;
-  readonly group: ObservationGroup;
-  readonly step: number;
-}
-
-type UpdateInput = Parameters<typeof updateMemory>[0];
-
-export async function runAudit(options: AuditOptions): Promise<ExperimentRun> {
-  const runId = options.runId ?? newRunId();
-  const providers = options.providers ?? fakeProviders([]);
-  const ctx = newRunContext(runId, options.config, options.recorder);
-  const labelsUsable = options.labels?.sourceHash === options.trace.sourceHash;
-  await recordRejectedLabels(ctx, options, labelsUsable);
-  const audit: AuditRun = {
-    ctx,
-    options,
-    providers,
-    selected: { history: [], llm: [], rules: [], jev: [] },
-  };
-  const scores: TrialScore[] = [];
-  const skipped: SkippedTrial[] = [];
-  for (const mode of options.config.modes) {
-    if (ctx.budget.sent >= ctx.budget.limit) {
-      skipped.push(skippedAuditTrial(mode));
-      continue;
-    }
-    scores.push(await runAuditMode(audit, mode));
+  constructor(
+    private readonly audit: TraceAudit,
+    private readonly mode: ExperimentMode,
+  ) {
+    this.session = new TrialSession(audit.ctx, audit.providers, {
+      trialId: `audit-${mode}`,
+      taskId: "audit",
+      mode,
+      iteration: 0,
+    });
   }
-  await recordAuditSummary(audit, labelsUsable);
-  const summary = summarize({
-    runId,
-    evaluation: "trace_audit",
-    provider: options.config.provider.mode,
-    modes: options.config.modes,
-    scores,
-    plannedTrials: options.config.modes.length,
-    skipped,
-    calls: ctx.calls,
-    contexts: ctx.contexts,
-    uniqueCandidates: ctx.uniqueCandidates,
-    decisionCounts: ctx.decisionCounts,
-    appliedCounts: ctx.appliedCounts,
-    environment: experimentEnvironment(options.config),
-    limitations: auditLimitations(labelsUsable),
-  });
-  const manifest = await createManifest(options.config, {
-    input: options.trace.sourceHash,
-    evaluation: "trace_audit",
-    runId,
-  });
-  return { manifest, updates: ctx.updates, calls: ctx.calls, contexts: ctx.contexts, summary };
+
+  async run(): Promise<TrialScore> {
+    try {
+      await this.runSteps();
+    } catch (error) {
+      if (!(error instanceof BudgetExhausted)) throw error;
+      this.endReason = "not_run_global_budget";
+    }
+    return this.score();
+  }
+
+  private async runSteps(): Promise<void> {
+    const groups = auditGroups(this.audit.trace.messages);
+    for (let step = 0; step < groups.length; step++) {
+      if (!(await this.auditStep(groups[step]!, step))) break;
+    }
+  }
+
+  /** Returns false when the mode's state-first update became unavailable. */
+  private async auditStep(group: ObservationGroup, step: number): Promise<boolean> {
+    const { ctx, trace } = this.audit;
+    const { mode } = this;
+    const at = this.session.step(step);
+    for (const event of eventsForMessages(group.messages, this.normalizer))
+      await this.engine.process(event);
+    this.history.push(...group.messages);
+    const facts = factsFromState(this.engine.state, defaultConfig());
+    const candidates = generateCandidates(group.messages, {
+      maxBytes: ctx.config.candidateMaxBytes,
+      observedAt: step,
+    });
+    rememberCandidates(ctx, mode, candidates);
+    await at.recordContext(this.project(group, step, facts), "");
+    const input = {
+      instruction: auditInstruction(trace),
+      mode,
+      state: this.engine.state,
+      facts,
+      memory: this.memory,
+      candidates,
+      observations: group.messages,
+      latest: group.messages,
+      step,
+      now: step,
+    } as const;
+    const result = await this.update(input, at);
+    this.memory = result.memory;
+    await this.recordStep(
+      at,
+      candidates.map((candidate) => candidate.id),
+      result,
+    );
+    if (result.unavailable) {
+      this.endReason = `state_first_unavailable:${result.unavailable}`;
+      return false;
+    }
+    return true;
+  }
+
+  private project(
+    group: ObservationGroup,
+    step: number,
+    facts: ReturnType<typeof factsFromState>,
+  ): ProjectedInput {
+    const { config } = this.audit.ctx;
+    const { mode } = this;
+    return buildProjection({
+      mode,
+      instruction: auditInstruction(this.audit.trace),
+      facts,
+      memory: this.memory,
+      latest: group.messages,
+      history: this.history,
+      actionBudget: {
+        limit: config.budgets.maxActions,
+        used: step,
+        remaining_including_next: Math.max(0, config.budgets.maxActions - step),
+        finish_counts_as_action: true,
+      },
+      ...(mode === "llm" ? { lastUpdateResult: null } : {}),
+      allowedTests: [],
+      budgets: config.budgets,
+    });
+  }
+
+  private async recordStep(
+    at: TrialStep,
+    candidateIds: readonly string[],
+    result: UpdateResult,
+  ): Promise<void> {
+    const { ctx, selected } = this.audit;
+    const { mode } = this;
+    selected[mode].push(
+      ...result.decisions
+        .filter((decision) => decision.disposition === "selected")
+        .map((decision) => decision.candidateId),
+    );
+    countDecisions(ctx, mode, result.decisions.length);
+    countApplied(ctx, mode, result.applied);
+    await at.recordUpdate("audit_step", {
+      candidates: candidateIds,
+      decisions: result.decisions,
+      applied: result.applied,
+      held: result.held.map((candidate) => candidate.id),
+      repairReasons: result.repairReasons,
+      memoryItems: memoryItems(this.memory).length,
+      ...(result.unavailable ? { unavailable: result.unavailable } : {}),
+    });
+  }
+
+  private score(): TrialScore {
+    const { ctx } = this.audit;
+    const { mode, endReason } = this;
+    return idleTrialScore(
+      { trialId: `audit-${mode}`, taskId: "audit", mode, iteration: 0 },
+      ctx.config.provider.mode,
+      {
+        completed: endReason === "completed",
+        ...(endReason === "completed" ? {} : { error: endReason }),
+        terminationReason: auditTermination(endReason),
+        finalArtifact: { status: "not_evaluated", reason: "audit_mode", tests: {} },
+        appliedExtractive: ctx.appliedCounts.get(mode)?.extractive ?? 0,
+        appliedGenerated: ctx.appliedCounts.get(mode)?.generated ?? 0,
+        activeMemoryItems: memoryItems(this.memory).length,
+      },
+    );
+  }
+
+  private async update(input: UpdateInput, at: TrialStep): Promise<UpdateResult> {
+    if (input.mode === "llm") return this.llmUpdate(input, at);
+    if (input.mode === "history") return stalledUpdate(input);
+    return at.updateMemory(input);
+  }
+
+  private async llmUpdate(input: UpdateInput, at: TrialStep): Promise<UpdateResult> {
+    const { config } = at;
+    const provider = this.audit.providers.update;
+    if (!provider) return stalledUpdate(input, [], "update_provider_missing");
+    const request: GenerativeUpdateRequest = {
+      mode: "llm",
+      instruction: input.instruction,
+      facts: JSON.stringify(input.facts),
+      memory: JSON.stringify(input.memory),
+      latest: JSON.stringify(groupView(input.latest)),
+      selfSourceId: `upd-audit-llm-${at.index}`,
+      model: config.provider.updateModel ?? config.provider.actorModel ?? "fake",
+      promptVersion: PROMPT_VERSION,
+    };
+    const response = await at.instrumented("update", request, () =>
+      provider.update(request, callOptions(config)),
+    );
+    if (response.error || !response.operations)
+      return stalledUpdate(input, ["invalid_update"], response.error ?? "invalid_update");
+    const apply = applyOperations(input.memory, response.operations, applyContext(input, true));
+    if (!apply.ok) return stalledUpdate(input, ["invalid_update"], apply.reason);
+    return {
+      memory: apply.memory,
+      candidates: input.candidates,
+      decisions: response.operations.map((operation, index) => ({
+        candidateId: operation.sourceIds[0] ?? `op-${index}`,
+        disposition: "selected" as const,
+        reason: "llm_update",
+      })),
+      held: [],
+      applied: apply.applied,
+      repairReasons: [],
+    };
+  }
 }
 
-async function recordRejectedLabels(
-  ctx: RunContext,
-  options: AuditOptions,
-  labelsUsable: boolean,
-): Promise<void> {
-  if (!options.labels || labelsUsable) return;
-  await pushUpdate(
-    ctx,
-    auditRecord(
-      ctx,
-      { kind: "audit_summary", step: -1, mode: "-" },
-      {
-        labels_rejected: "source_hash_mismatch",
-        expected: options.trace.sourceHash,
-        actual: options.labels.sourceHash,
-      },
-    ),
-  );
-}
-
-async function recordAuditSummary(audit: AuditRun, labelsUsable: boolean): Promise<void> {
-  const { ctx, options, selected } = audit;
-  const labels = options.labels?.labels ?? [];
-  const allCandidates = generateCandidates(options.trace.messages, {
-    maxBytes: options.config.candidateMaxBytes,
+/** The run-level summary record has no mode; "-" stands in for it. */
+function pushAuditSummary(ctx: RunContext, data: Record<string, unknown>): Promise<void> {
+  return pushUpdate(ctx, {
+    runId: ctx.runId,
+    trialId: "audit--",
+    taskId: "audit",
+    mode: "-" as ExperimentMode,
+    step: -1,
+    kind: "audit_summary",
+    ...data,
   });
-  const evaluation = labelsUsable ? evaluateAudit(allCandidates, labels) : undefined;
-  await pushUpdate(
-    ctx,
-    auditRecord(
-      ctx,
-      { kind: "audit_summary", step: -1, mode: "-" },
-      {
-        labelsUsable,
-        labelCount: labels.length,
-        selected,
-        distribution: evaluation?.distribution ?? {},
-        selectionAccuracy: "not_evaluated",
-        evaluated: evaluation?.total ?? 0,
-        coverage: evaluation?.coverage ?? 0,
-      },
-    ),
-  );
 }
 
 function auditLimitations(labelsUsable: boolean): string[] {
@@ -193,230 +376,9 @@ function skippedAuditTrial(mode: ExperimentMode): SkippedTrial {
   };
 }
 
-async function runAuditMode(audit: AuditRun, mode: ExperimentMode): Promise<TrialScore> {
-  const trial = newAuditTrial();
-  try {
-    await runAuditSteps(audit, trial, mode);
-  } catch (error) {
-    if (!(error instanceof BudgetExhausted)) throw error;
-    trial.endReason = "not_run_global_budget";
-  }
-  return auditScore(audit, trial, mode);
-}
-
-function newAuditTrial(): AuditTrial {
-  return {
-    memory: emptyMemory(),
-    endReason: "completed",
-    history: [],
-    normalizer: new PiEventNormalizer({
-      eventCount: 0,
-      turnIndex: 0,
-      config: defaultConfig(),
-      cwd: "/experiment",
-    }),
-    engine: new StateEngine({
-      cwd: "/experiment",
-      config: defaultConfig(),
-      updater: new NoopStateUpdater(),
-    }),
-  };
-}
-
-async function runAuditSteps(
-  audit: AuditRun,
-  trial: AuditTrial,
-  mode: ExperimentMode,
-): Promise<void> {
-  const groups = auditGroups(audit.options.trace.messages);
-  for (let step = 0; step < groups.length; step++) {
-    const group = groups[step]!;
-    if (!(await auditOneStep({ audit, trial, mode, group, step }))) break;
-  }
-}
-
-/** Returns false when the mode's state-first update became unavailable. */
-async function auditOneStep(stepContext: AuditStepContext): Promise<boolean> {
-  const { audit, trial, mode, group, step } = stepContext;
-  const { ctx, options } = audit;
-  for (const event of eventsForMessages(group.messages, trial.normalizer))
-    await trial.engine.process(event);
-  trial.history.push(...group.messages);
-  const facts = factsFromState(trial.engine.state, defaultConfig());
-  const candidates = generateCandidates(group.messages, {
-    maxBytes: options.config.candidateMaxBytes,
-    observedAt: step,
-  });
-  rememberCandidates(ctx, mode, candidates);
-  const projected = projectAuditStep(stepContext, facts);
-  await recordContext(ctx, {
-    trialId: `audit-${mode}`,
-    taskId: "audit",
-    mode,
-    step,
-    projected,
-    system: "",
-    config: options.config,
-  });
-  const input = {
-    instruction: auditInstruction(options.trace),
-    mode,
-    state: trial.engine.state,
-    facts,
-    memory: trial.memory,
-    candidates,
-    observations: group.messages,
-    latest: group.messages,
-    step,
-    now: step,
-  } as const;
-  const result = await auditStep(ctx, input, {
-    providers: audit.providers,
-    config: options.config,
-    trialId: `audit-${mode}`,
-    taskId: "audit",
-    step,
-  });
-  trial.memory = result.memory;
-  await recordAuditStep(
-    stepContext,
-    candidates.map((candidate) => candidate.id),
-    result,
-  );
-  if (result.unavailable) {
-    trial.endReason = `state_first_unavailable:${result.unavailable}`;
-    return false;
-  }
-  return true;
-}
-
-function projectAuditStep(
-  stepContext: AuditStepContext,
-  facts: ReturnType<typeof factsFromState>,
-): ProjectedInput {
-  const { audit, trial, mode, group, step } = stepContext;
-  const { config, trace } = audit.options;
-  return buildProjection({
-    mode,
-    instruction: auditInstruction(trace),
-    facts,
-    memory: trial.memory,
-    latest: group.messages,
-    history: trial.history,
-    actionBudget: {
-      limit: config.budgets.maxActions,
-      used: step,
-      remaining_including_next: Math.max(0, config.budgets.maxActions - step),
-      finish_counts_as_action: true,
-    },
-    ...(mode === "llm" ? { lastUpdateResult: null } : {}),
-    allowedTests: [],
-    budgets: config.budgets,
-  });
-}
-
-async function recordAuditStep(
-  stepContext: AuditStepContext,
-  candidateIds: readonly string[],
-  result: UpdateResult,
-): Promise<void> {
-  const { audit, trial, mode, step } = stepContext;
-  const { ctx } = audit;
-  audit.selected[mode].push(
-    ...result.decisions
-      .filter((decision) => decision.disposition === "selected")
-      .map((decision) => decision.candidateId),
-  );
-  countDecisions(ctx, mode, result.decisions.length);
-  countApplied(ctx, mode, result.applied);
-  await pushUpdate(
-    ctx,
-    auditRecord(
-      ctx,
-      { kind: "audit_step", step, mode },
-      {
-        candidates: candidateIds,
-        decisions: result.decisions,
-        applied: result.applied,
-        held: result.held.map((candidate) => candidate.id),
-        repairReasons: result.repairReasons,
-        memoryItems: memoryItems(trial.memory).length,
-        ...(result.unavailable ? { unavailable: result.unavailable } : {}),
-      },
-    ),
-  );
-}
-
-function auditScore(audit: AuditRun, trial: AuditTrial, mode: ExperimentMode): TrialScore {
-  const { ctx, options } = audit;
-  const { endReason } = trial;
-  return idleTrialScore(
-    { trialId: `audit-${mode}`, taskId: "audit", mode, iteration: 0 },
-    options.config.provider.mode,
-    {
-      completed: endReason === "completed",
-      ...(endReason === "completed" ? {} : { error: endReason }),
-      terminationReason: auditTermination(endReason),
-      finalArtifact: { status: "not_evaluated", reason: "audit_mode", tests: {} },
-      appliedExtractive: ctx.appliedCounts.get(mode)?.extractive ?? 0,
-      appliedGenerated: ctx.appliedCounts.get(mode)?.generated ?? 0,
-      activeMemoryItems: memoryItems(trial.memory).length,
-    },
-  );
-}
-
 function auditTermination(endReason: string): TerminationReason {
   if (endReason === "completed") return "finish";
   return endReason === "not_run_global_budget" ? "request_budget" : "state_unavailable";
-}
-
-async function auditStep(
-  ctx: RunContext,
-  input: UpdateInput,
-  scope: UpdateScope,
-): Promise<UpdateResult> {
-  if (input.mode === "llm") return auditLlmUpdate(ctx, input, scope);
-  if (input.mode === "history") return stalledUpdate(input);
-  return updateWithProviders(ctx, input, scope);
-}
-
-async function auditLlmUpdate(
-  ctx: RunContext,
-  input: UpdateInput,
-  scope: UpdateScope,
-): Promise<UpdateResult> {
-  const { config, step } = scope;
-  const provider = scope.providers.update;
-  if (!provider) return stalledUpdate(input, [], "update_provider_missing");
-  const request: GenerativeUpdateRequest = {
-    mode: "llm",
-    instruction: input.instruction,
-    facts: JSON.stringify(input.facts),
-    memory: JSON.stringify(input.memory),
-    latest: JSON.stringify(groupView(input.latest)),
-    selfSourceId: `upd-audit-llm-${step}`,
-    model: config.provider.updateModel ?? config.provider.actorModel ?? "fake",
-    promptVersion: PROMPT_VERSION,
-  };
-  const response = await instrumented(ctx, { kind: "update", mode: "llm", request, ...scope }, () =>
-    provider.update(request, callOptions(config)),
-  );
-  if (response.error || !response.operations)
-    return stalledUpdate(input, ["invalid_update"], response.error ?? "invalid_update");
-  const apply = applyOperations(input.memory, response.operations, applyContext(input, true));
-  if (!apply.ok) return stalledUpdate(input, ["invalid_update"], apply.reason);
-  return {
-    memory: apply.memory,
-    candidates: input.candidates,
-    decisions: response.operations.map((operation, index) => ({
-      candidateId: operation.sourceIds[0] ?? `op-${index}`,
-      disposition: "selected" as const,
-      reason: "llm_update",
-    })),
-    held: [],
-    applied: apply.applied,
-    repairReasons: [],
-  };
 }
 
 function stalledUpdate(

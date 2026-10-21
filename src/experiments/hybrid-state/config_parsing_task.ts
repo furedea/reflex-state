@@ -121,24 +121,17 @@ function isValidCheckpointPosition(position: unknown): boolean {
   return position === "final" || (Number.isInteger(position) && (position as number) >= 0);
 }
 
-interface RequirementContext {
-  readonly entry: Record<string, unknown>;
-  readonly id: string;
-  readonly file: string;
-}
-
 function parseRequirement(item: unknown, file: string): CheckpointRequirement {
   const entry = object(item, `required item in ${file}`);
   if (!isNonBlankString(entry.id)) throw new Error(`Invalid required item id in ${file}`);
-  const context: RequirementContext = { entry, id: entry.id, file };
-  const kind = requirementKind(context);
-  const anyOf = parseAnyOf(context);
-  checkKindFields(context, kind, anyOf);
-  checkOptionalTypes(context);
-  const scope = parseScope(context);
-  const lists = listFields(context);
+  const kind = requirementKind(entry, file);
+  const anyOf = parseAnyOf(entry, file);
+  checkKindFields(entry, kind, file);
+  checkOptionalTypes(entry, file);
+  const scope = parseScope(entry, file);
+  const lists = listFields(entry, file);
   return {
-    id: context.id,
+    id: entry.id,
     ...optionalField("description", stringOf(entry.description)),
     kind,
     ...optionalField("anyOf", anyOf),
@@ -155,18 +148,23 @@ function parseRequirement(item: unknown, file: string): CheckpointRequirement {
   };
 }
 
-function requirementKind(context: RequirementContext): RequirementKind {
-  const kind = context.entry.kind === undefined ? "verbatim" : context.entry.kind;
+/** The id of a required item that has already passed the non-blank check. */
+function requirementId(entry: Record<string, unknown>): string {
+  return entry.id as string;
+}
+
+function requirementKind(entry: Record<string, unknown>, file: string): RequirementKind {
+  const kind = entry.kind === undefined ? "verbatim" : entry.kind;
   if (kind !== "verbatim" && kind !== "exact_value" && kind !== "verification")
-    throw new Error(`Invalid kind for required item ${context.id} in ${context.file}`);
+    throw new Error(`Invalid kind for required item ${requirementId(entry)} in ${file}`);
   return kind;
 }
 
-function parseAnyOf(context: RequirementContext): string[][] | undefined {
-  const anyOf = context.entry.anyOf;
+function parseAnyOf(entry: Record<string, unknown>, file: string): string[][] | undefined {
+  const anyOf = entry.anyOf;
   if (anyOf === undefined) return undefined;
   if (!Array.isArray(anyOf) || !anyOf.length || !anyOf.every(isPhraseGroup))
-    throw new Error(`Invalid anyOf for required item ${context.id} in ${context.file}`);
+    throw new Error(`Invalid anyOf for required item ${requirementId(entry)} in ${file}`);
   return (anyOf as string[][]).map((group) => [...group]);
 }
 
@@ -174,13 +172,9 @@ function isPhraseGroup(group: unknown): boolean {
   return Array.isArray(group) && group.length > 0 && group.every(isNonBlankString);
 }
 
-function checkKindFields(
-  context: RequirementContext,
-  kind: RequirementKind,
-  anyOf: string[][] | undefined,
-) {
-  const { entry, id, file } = context;
-  if (kind === "verbatim" && !anyOf)
+function checkKindFields(entry: Record<string, unknown>, kind: RequirementKind, file: string) {
+  const id = requirementId(entry);
+  if (kind === "verbatim" && entry.anyOf === undefined)
     throw new Error(`verbatim required item ${id} in ${file} needs anyOf`);
   if (kind === "exact_value" && !isNonBlankString(entry.value))
     throw new Error(`exact_value required item ${id} in ${file} needs a value`);
@@ -188,8 +182,8 @@ function checkKindFields(
     throw new Error(`verification required item ${id} in ${file} needs a testId`);
 }
 
-function checkOptionalTypes(context: RequirementContext) {
-  const { entry, id, file } = context;
+function checkOptionalTypes(entry: Record<string, unknown>, file: string) {
+  const id = requirementId(entry);
   if (entry.condition !== undefined && typeof entry.condition !== "string")
     throw new Error(`Invalid condition for required item ${id} in ${file}`);
   if (entry.status !== undefined && entry.status !== "passed" && entry.status !== "failed")
@@ -198,8 +192,8 @@ function checkOptionalTypes(context: RequirementContext) {
     throw new Error(`Invalid fresh for required item ${id} in ${file}`);
 }
 
-function parseScope(context: RequirementContext): RequirementScope | undefined {
-  const { entry, id, file } = context;
+function parseScope(entry: Record<string, unknown>, file: string): RequirementScope | undefined {
+  const id = requirementId(entry);
   if (entry.scope === undefined) return undefined;
   const record = object(entry.scope, `scope of ${id} in ${file}`);
   const clause = (key: string) =>
@@ -214,8 +208,8 @@ function parseScope(context: RequirementContext): RequirementScope | undefined {
   };
 }
 
-function listFields(context: RequirementContext) {
-  const { entry, id, file } = context;
+function listFields(entry: Record<string, unknown>, file: string) {
+  const id = requirementId(entry);
   const list = (key: string) =>
     optionalStringList(entry, key, `Invalid ${key} for required item ${id} in ${file}`);
   return { inverted: list("inverted"), markers: list("markers"), sections: list("sections") };

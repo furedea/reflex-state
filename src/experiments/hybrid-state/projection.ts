@@ -35,95 +35,8 @@ export interface ProjectedInput {
 }
 
 export function buildProjection(input: ProjectionInput): ProjectedInput {
-  const fixedTools = input.fixedTools ?? ["read", "write", "edit", "test", "finish"];
-  const allowedTests = input.allowedTests ?? [];
-  const feedback = feedbackBytes(input);
-  if (input.mode === "history") {
-    const history = renderMessages(input.history);
-    const userText = sentText({
-      instruction: input.instruction,
-      tools: fixedTools,
-      tests: allowedTests,
-      history,
-      action_budget: input.actionBudget,
-    });
-    const bytes = {
-      ...sizes({ history, feedback }),
-      total: byteLength(userText),
-    };
-    return {
-      bundle: {
-        mode: input.mode,
-        instruction: input.instruction,
-        fixedTools,
-        facts: "",
-        memory: "",
-        latest: "",
-        history,
-        bytes,
-        truncated: [],
-      },
-      userText,
-    };
-  }
-  const facts = JSON.stringify(input.facts);
-  if (byteLength(facts) > input.budgets.factsBytes)
-    return unavailable(input, "facts_metadata_exceeds_budget", { fixedTools, allowedTests, facts });
-  const memoryResult = boundedMemory(input.memory, input.budgets.memoryBytes);
-  if (memoryResult.unavailable)
-    return unavailable(input, memoryResult.unavailable, {
-      fixedTools,
-      allowedTests,
-      facts,
-      memory: memoryResult.text,
-    });
-  const latestText = renderObservationGroup(input.latest);
-  if (byteLength(latestText) > input.budgets.latestObservationBytes)
-    return unavailable(input, "latest_observation_exceeds_budget", {
-      fixedTools,
-      allowedTests,
-      facts,
-      memory: memoryResult.text,
-      latest: latestText,
-    });
-  const userText = sentText({
-    instruction: input.instruction,
-    tools: fixedTools,
-    tests: allowedTests,
-    facts: JSON.parse(facts) as unknown,
-    memory: JSON.parse(memoryResult.text) as unknown,
-    latest_observation: JSON.parse(latestText) as unknown,
-    action_budget: input.actionBudget,
-    last_update_result: input.lastUpdateResult
-      ? serializeUpdateFeedback(input.lastUpdateResult)
-      : null,
-  });
-  const truncated = memoryResult.truncated;
-  if (byteLength(userText) > input.budgets.requestBytes)
-    return unavailable(input, "state_first_request_exceeds_budget", {
-      fixedTools,
-      allowedTests,
-      facts,
-      memory: memoryResult.text,
-      latest: latestText,
-      truncated,
-    });
-  return {
-    bundle: {
-      mode: input.mode,
-      instruction: input.instruction,
-      fixedTools,
-      facts,
-      memory: memoryResult.text,
-      latest: latestText,
-      bytes: {
-        ...sizes({ facts, memory: memoryResult.text, latest: latestText, feedback }),
-        total: byteLength(userText),
-      },
-      truncated,
-    },
-    userText,
-  };
+  const builder = new ProjectionBuilder(input);
+  return input.mode === "history" ? builder.projectHistory() : builder.projectStateFirst();
 }
 
 export function sentText(sections: Record<string, unknown>): string {
@@ -237,51 +150,113 @@ function boundedMemory(
   return { text, truncated: omitted.length ? ["memory"] : [] };
 }
 
-interface UnavailableDetail {
-  readonly fixedTools: readonly string[];
-  readonly allowedTests: readonly string[];
-  readonly facts?: string;
-  readonly memory?: string;
-  readonly latest?: string;
-  readonly truncated?: readonly string[];
-}
+/** Renders one actor input. The sections rendered so far are what an
+ * unavailable projection still reports. */
+class ProjectionBuilder {
+  private readonly fixedTools: readonly string[];
+  private readonly allowedTests: readonly string[];
+  private historyText: string | undefined;
+  private facts = "";
+  private memory = "";
+  private latest = "";
+  private truncated: readonly string[] = [];
 
-function unavailable(
-  input: ProjectionInput,
-  reason: string,
-  detail: UnavailableDetail,
-): ProjectedInput {
-  const { fixedTools, allowedTests, facts = "", memory = "", latest = "", truncated = [] } = detail;
-  const userText = sentText({
-    instruction: input.instruction,
-    tools: fixedTools,
-    tests: allowedTests,
-    unavailable: reason,
-    facts: facts ? (JSON.parse(facts) as unknown) : undefined,
-    action_budget: input.actionBudget,
-    ...(input.mode !== "history"
-      ? {
-          last_update_result: input.lastUpdateResult
-            ? serializeUpdateFeedback(input.lastUpdateResult)
-            : null,
-        }
-      : {}),
-  });
-  const bytes = sizes({ facts, memory, latest, feedback: feedbackBytes(input) });
-  return {
-    bundle: {
-      mode: input.mode,
+  constructor(private readonly input: ProjectionInput) {
+    this.fixedTools = input.fixedTools ?? ["read", "write", "edit", "test", "finish"];
+    this.allowedTests = input.allowedTests ?? [];
+  }
+
+  projectHistory(): ProjectedInput {
+    const { input } = this;
+    this.historyText = renderMessages(input.history);
+    const userText = sentText({
       instruction: input.instruction,
-      fixedTools,
-      facts,
-      memory,
-      latest,
-      bytes: { ...bytes, total: byteLength(userText) },
-      truncated,
+      tools: this.fixedTools,
+      tests: this.allowedTests,
+      history: this.historyText,
+      action_budget: input.actionBudget,
+    });
+    return this.projected(userText);
+  }
+
+  projectStateFirst(): ProjectedInput {
+    const { input } = this;
+    this.facts = JSON.stringify(input.facts);
+    if (byteLength(this.facts) > input.budgets.factsBytes)
+      return this.unavailable("facts_metadata_exceeds_budget");
+    const memoryResult = boundedMemory(input.memory, input.budgets.memoryBytes);
+    this.memory = memoryResult.text;
+    if (memoryResult.unavailable) return this.unavailable(memoryResult.unavailable);
+    this.latest = renderObservationGroup(input.latest);
+    if (byteLength(this.latest) > input.budgets.latestObservationBytes)
+      return this.unavailable("latest_observation_exceeds_budget");
+    const userText = sentText({
+      instruction: input.instruction,
+      tools: this.fixedTools,
+      tests: this.allowedTests,
+      facts: JSON.parse(this.facts) as unknown,
+      memory: JSON.parse(this.memory) as unknown,
+      latest_observation: JSON.parse(this.latest) as unknown,
+      action_budget: input.actionBudget,
+      last_update_result: input.lastUpdateResult
+        ? serializeUpdateFeedback(input.lastUpdateResult)
+        : null,
+    });
+    this.truncated = memoryResult.truncated;
+    if (byteLength(userText) > input.budgets.requestBytes)
+      return this.unavailable("state_first_request_exceeds_budget");
+    return this.projected(userText);
+  }
+
+  private unavailable(reason: string): ProjectedInput {
+    const { input } = this;
+    const userText = sentText({
+      instruction: input.instruction,
+      tools: this.fixedTools,
+      tests: this.allowedTests,
       unavailable: reason,
-    },
-    userText,
-  };
+      facts: this.facts ? (JSON.parse(this.facts) as unknown) : undefined,
+      action_budget: input.actionBudget,
+      ...(input.mode !== "history"
+        ? {
+            last_update_result: input.lastUpdateResult
+              ? serializeUpdateFeedback(input.lastUpdateResult)
+              : null,
+          }
+        : {}),
+    });
+    return this.projected(userText, reason);
+  }
+
+  private projected(userText: string, unavailableReason?: string): ProjectedInput {
+    const { input } = this;
+    return {
+      bundle: {
+        mode: input.mode,
+        instruction: input.instruction,
+        fixedTools: this.fixedTools,
+        facts: this.facts,
+        memory: this.memory,
+        latest: this.latest,
+        ...(this.historyText === undefined ? {} : { history: this.historyText }),
+        bytes: this.bytes(userText),
+        truncated: this.truncated,
+        ...(unavailableReason === undefined ? {} : { unavailable: unavailableReason }),
+      },
+      userText,
+    };
+  }
+
+  private bytes(userText: string): InputBundle["bytes"] {
+    return {
+      total: byteLength(userText),
+      facts: byteLength(this.facts),
+      memory: byteLength(this.memory),
+      latest: byteLength(this.latest),
+      history: byteLength(this.historyText ?? ""),
+      feedback: feedbackBytes(this.input),
+    };
+  }
 }
 
 /** Serialized size of the shared protocol fields (action_budget and, in llm
@@ -298,26 +273,6 @@ function feedbackBytes(input: ProjectionInput): number {
             : null,
     }),
   );
-}
-
-interface SizedParts {
-  readonly facts?: string;
-  readonly memory?: string;
-  readonly latest?: string;
-  readonly history?: string;
-  readonly feedback: number;
-}
-
-function sizes(parts: SizedParts): InputBundle["bytes"] {
-  const { facts = "", memory = "", latest = "", history = "", feedback } = parts;
-  return {
-    total: 0,
-    facts: byteLength(facts),
-    memory: byteLength(memory),
-    latest: byteLength(latest),
-    history: byteLength(history),
-    feedback,
-  };
 }
 
 function byteLength(value: string): number {

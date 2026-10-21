@@ -107,15 +107,6 @@ function sameItem(existing: MemoryItem, next: MemoryItem): boolean {
   );
 }
 
-interface ValidationState {
-  readonly memory: WorkMemory;
-  readonly context: ApplyContext;
-  readonly sources: ReadonlySet<string>;
-  readonly items: readonly MemoryItem[];
-  readonly claimedIds: Set<string>;
-  readonly replacedTargets: Set<string>;
-}
-
 type OperationCheck = { readonly operation: PatchOperation } | { readonly error: string };
 
 export function validateOperations(
@@ -129,20 +120,12 @@ export function validateOperations(
   readonly validIndices: readonly number[];
   readonly errors: readonly string[];
 } {
-  const items = Object.values(memory).flat();
-  const state: ValidationState = {
-    memory,
-    context,
-    sources: validSources(context, memory),
-    items,
-    claimedIds: new Set(items.map((item) => item.id)),
-    replacedTargets: new Set<string>(),
-  };
+  const validator = new OperationValidator(memory, context);
   const errors: string[] = [];
   const valid: PatchOperation[] = [];
   const validIndices: number[] = [];
   for (const [index, operation] of operations.entries()) {
-    const check = checkOperation(operation, state);
+    const check = validator.check(operation);
     if ("error" in check) {
       errors.push(`${check.error}#${index}`);
       continue;
@@ -153,19 +136,59 @@ export function validateOperations(
   return { valid, validIndices, errors };
 }
 
-function checkOperation(operation: PatchOperation, state: ValidationState): OperationCheck {
-  const shapeError = shapeErrorOf(operation, state.sources);
-  if (shapeError) return { error: shapeError };
-  const cited = citedSources(operation, state.memory, state.context);
-  const originError = originErrorOf(operation, cited, state.context.allowGenerated);
-  if (originError) return { error: originError };
-  if (hasMismatchedReplaceIds(operation)) return { error: "replace_id_mismatch" };
-  const trust = deriveTrust(operation, cited);
-  const target = operation.operation === "replace" ? resolveReplaceTarget(operation, state) : null;
-  if (target && "error" in target) return { error: target.error };
-  const normalized = normalizeOperation(operation, trust, target?.id);
-  const duplicate = claimAddedId(normalized, state.claimedIds);
-  return duplicate ? { error: duplicate } : { operation: normalized };
+/** Validates the operations of one patch against the memory and context they
+ * apply to, tracking which ids and replace targets earlier operations claimed. */
+class OperationValidator {
+  private readonly sources: ReadonlySet<string>;
+  private readonly items: readonly MemoryItem[];
+  private readonly claimedIds: Set<string>;
+  private readonly replacedTargets = new Set<string>();
+
+  constructor(
+    private readonly memory: WorkMemory,
+    private readonly context: ApplyContext,
+  ) {
+    this.sources = validSources(context, memory);
+    this.items = Object.values(memory).flat();
+    this.claimedIds = new Set(this.items.map((item) => item.id));
+  }
+
+  check(operation: PatchOperation): OperationCheck {
+    const shapeError = shapeErrorOf(operation, this.sources);
+    if (shapeError) return { error: shapeError };
+    const cited = citedSources(operation, this.memory, this.context);
+    const originError = originErrorOf(operation, cited, this.context.allowGenerated);
+    if (originError) return { error: originError };
+    if (hasMismatchedReplaceIds(operation)) return { error: "replace_id_mismatch" };
+    const trust = deriveTrust(operation, cited);
+    const target = operation.operation === "replace" ? this.resolveReplaceTarget(operation) : null;
+    if (target && "error" in target) return { error: target.error };
+    const normalized = normalizeOperation(operation, trust, target?.id);
+    const duplicate = this.claimAddedId(normalized);
+    return duplicate ? { error: duplicate } : { operation: normalized };
+  }
+
+  private resolveReplaceTarget(
+    operation: PatchOperation,
+  ): { readonly id: string } | { readonly error: string } {
+    const targetId = operation.itemId ?? operation.replaces;
+    const target = targetId ? this.items.find((item) => item.id === targetId) : undefined;
+    if (!target) return { error: "replace_unknown_target" };
+    if (target.kind !== operation.kind) return { error: "replace_kind_mismatch" };
+    if (target.kind === "constraints" && target.trust === "user")
+      return { error: "protected_constraint" };
+    if (this.replacedTargets.has(target.id)) return { error: "replace_duplicate_target" };
+    this.replacedTargets.add(target.id);
+    return { id: target.id };
+  }
+
+  private claimAddedId(operation: PatchOperation): string | undefined {
+    if (operation.operation !== "add") return undefined;
+    const effectiveId = operation.itemId ?? memoryId(operation);
+    if (this.claimedIds.has(effectiveId)) return "duplicate_id";
+    this.claimedIds.add(effectiveId);
+    return undefined;
+  }
 }
 
 function shapeErrorOf(operation: PatchOperation, sources: ReadonlySet<string>): string | undefined {
@@ -198,21 +221,6 @@ function hasMismatchedReplaceIds(operation: PatchOperation): boolean {
   );
 }
 
-function resolveReplaceTarget(
-  operation: PatchOperation,
-  state: ValidationState,
-): { readonly id: string } | { readonly error: string } {
-  const targetId = operation.itemId ?? operation.replaces;
-  const target = targetId ? state.items.find((item) => item.id === targetId) : undefined;
-  if (!target) return { error: "replace_unknown_target" };
-  if (target.kind !== operation.kind) return { error: "replace_kind_mismatch" };
-  if (target.kind === "constraints" && target.trust === "user")
-    return { error: "protected_constraint" };
-  if (state.replacedTargets.has(target.id)) return { error: "replace_duplicate_target" };
-  state.replacedTargets.add(target.id);
-  return { id: target.id };
-}
-
 function normalizeOperation(
   operation: PatchOperation,
   trust: SourceTrust,
@@ -230,14 +238,6 @@ function normalizeOperation(
     origin: operation.origin,
     ...(replaces ? { replaces } : {}),
   };
-}
-
-function claimAddedId(operation: PatchOperation, claimedIds: Set<string>): string | undefined {
-  if (operation.operation !== "add") return undefined;
-  const effectiveId = operation.itemId ?? memoryId(operation);
-  if (claimedIds.has(effectiveId)) return "duplicate_id";
-  claimedIds.add(effectiveId);
-  return undefined;
 }
 
 type CitedSource = { readonly text: string; readonly trust: SourceTrust };

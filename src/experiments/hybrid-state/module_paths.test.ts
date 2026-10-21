@@ -21,14 +21,6 @@ import type { Candidate, PatchOperation, TraceMessage, UpdateInput } from "./typ
 import { isExperimentMode, parseHybridConfig, parseHybridTask, parseTaskScoring } from "./types.js";
 import { needsRepair, type ApplyContext } from "./update.js";
 
-interface LegacyArguments {
-  readonly input: UpdateInput;
-  readonly operations: readonly PatchOperation[];
-  readonly context: ApplyContext;
-  readonly candidates: readonly Candidate[];
-  readonly message: TraceMessage;
-}
-
 describe("module paths from before the split", () => {
   it("cli.ts still exports the CLI helpers", () => {
     expect(enforceLivePolicy).toBe(livePolicy.enforceLivePolicy);
@@ -50,17 +42,18 @@ describe("module paths from before the split", () => {
 });
 
 describe("signatures changed by the split", () => {
-  it("no longer type-check in their old positional forms", () => {
-    const legacyCalls = ({ input, operations, context, candidates, message }: LegacyArguments) => [
-      // @ts-expect-error the memory budget moved into the options object
-      needsRepair(input, operations, 8192),
-      // @ts-expect-error the memory budget and apply context moved into the options object
-      needsRepair(input, operations, 8192, context),
-      // @ts-expect-error repair observations are derived from the input's candidates
-      buildRepairRequest(input, [], candidates, "model"),
-      // @ts-expect-error start and end are passed as one span
-      candidateId(message, 0, 1, "text"),
+  it("no longer type-check in their pre-split forms", () => {
+    const legacyCalls = [
+      (input: UpdateInput, operations: readonly PatchOperation[], context: ApplyContext) =>
+        // @ts-expect-error the repair-time apply context belongs to RepairCheck
+        needsRepair(input, operations, 8192, context),
+      (input: UpdateInput, candidates: readonly Candidate[]) =>
+        // @ts-expect-error repair observations are derived from the input's candidates
+        buildRepairRequest(input, [], candidates, "model"),
+      (message: TraceMessage) =>
+        // @ts-expect-error the text is derived from the message and span
+        candidateId(message, 0, 1, "text"),
     ];
-    expect(legacyCalls).toBeTypeOf("function");
+    expect(legacyCalls).toHaveLength(3);
   });
 });

@@ -39,15 +39,11 @@ export function parseSummaryForManifest(value: unknown, manifest: ExperimentMani
   return value;
 }
 
-export interface ManifestStart {
-  readonly config: HybridConfig;
-  readonly runId: string;
-  readonly evaluation: "trace_audit" | "closed_loop";
-  readonly input: string;
-}
-
-export function startManifest(start: ManifestStart): ExperimentManifest {
-  const { config, runId, evaluation, input } = start;
+export function startManifest(
+  config: HybridConfig,
+  runId: string,
+  input: string,
+): ExperimentManifest {
   return {
     schemaVersion: RESULT_SCHEMA_VERSION,
     protocolId: PROTOCOL_ID,
@@ -58,7 +54,7 @@ export function startManifest(start: ManifestStart): ExperimentManifest {
     config,
     modes: config.modes,
     provider: config.provider.mode,
-    evaluation,
+    evaluation: config.evaluation,
     modelIds: {
       jev: config.provider.jevModel ?? null,
       actor: config.provider.actorModel ?? null,

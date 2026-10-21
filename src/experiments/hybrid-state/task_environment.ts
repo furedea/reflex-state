@@ -1,5 +1,7 @@
 import type { HotState } from "../../core/types.js";
 import { normalizeCwd, verificationCheckKey } from "../../core/verification.js";
+import { RecordedCheck } from "./task_environment_checks.js";
+import type { CheckStatus, TestRun, VerificationObservation } from "./task_environment_checks.js";
 import { runScriptOracle } from "./task_environment_oracle.js";
 import type { EnvironmentOptions, OracleRun } from "./task_environment_oracle.js";
 import type {
@@ -14,20 +16,6 @@ export { checkIsolation } from "./task_environment_isolation.js";
 
 const EXPERIMENT_CWD = "/experiment";
 const EXPERIMENT_TEST_COMMAND = "experiment test";
-
-interface VerificationObservation {
-  readonly testId: string;
-  readonly command: string;
-  readonly checkKey: string;
-  readonly status: "passed" | "failed";
-  readonly generation: number;
-  /** Execution order within a generation so the last run check is identifiable. */
-  readonly seq: number;
-  /** Evidence id tying this verification to the tool call that produced it. */
-  readonly evidenceId?: string;
-  /** Task-constraint verdicts reported by the oracle for this check. */
-  readonly constraints?: Readonly<Record<string, boolean>>;
-}
 
 interface ExecutionResult {
   readonly text: string;
@@ -44,28 +32,7 @@ interface OracleRunResult {
   readonly constraints?: Readonly<Record<string, boolean>>;
 }
 
-interface RecordedCheck {
-  readonly testId: string;
-  readonly status: "passed" | "failed";
-  readonly generation: number;
-  readonly command: string;
-  readonly seq: number;
-  readonly evidenceId?: string;
-}
-
-interface CheckEntry extends RecordedCheck {
-  readonly checkKey: string;
-}
-
 type TestOracle = NonNullable<TaskScoring["oracles"]>[number];
-
-interface CheckOutcome {
-  readonly status: "passed" | "failed";
-  readonly text: string;
-  readonly constraints?: Readonly<Record<string, boolean>>;
-}
-
-type TestRun = Omit<VerificationObservation, "status" | "constraints">;
 
 export class TaskEnvironment {
   private readonly workspace = new Map<string, string>();
@@ -116,18 +83,18 @@ export class TaskEnvironment {
     readonly verification: FactsView["verification"];
     readonly blockers: readonly HotState["activeBlockers"][number][];
   } {
-    const entries: CheckEntry[] = [...this.checks].map(([checkKey, check]) => ({
-      ...check,
-      checkKey,
-    }));
-    const latest = entries.reduce<CheckEntry | undefined>(newestCheck, undefined);
+    const checks = [...this.checks.values()];
+    const latest = checks.reduce<RecordedCheck | undefined>(
+      (newest, check) => (check.isNewerThan(newest) ? check : newest),
+      undefined,
+    );
     const verification: FactsView["verification"] = {
       build: { status: "not_run", freshness: "unknown" },
       lint: { status: "not_run", freshness: "unknown" },
       test: latest
         ? {
             status: latest.status,
-            freshness: this.freshness(latest),
+            freshness: latest.freshness(this.generation),
             command: latest.command,
             cwd: normalizeCwd(EXPERIMENT_CWD),
             checkKey: latest.checkKey,
@@ -135,9 +102,12 @@ export class TaskEnvironment {
             attributable: true,
           }
         : { status: "not_run", freshness: "unknown" },
-      tests: this.latestTestFacts(entries),
+      tests: this.latestTestFacts(),
     };
-    return { verification, blockers: entries.filter(isFailed).map(blockerFor) };
+    return {
+      verification,
+      blockers: checks.filter((check) => check.isFailed()).map((check) => check.toBlocker()),
+    };
   }
 
   private read(action: ActorAction): ExecutionResult {
@@ -187,7 +157,7 @@ export class TaskEnvironment {
     if (oracle?.kind === "script" && oracle.script) return this.runScriptTest(run, oracle.script);
     // A task with a scoring file never falls back to the task's expectedFiles;
     // every allowed test needs an explicitly declared oracle.
-    if (this.usesExpectedFiles(oracle)) return this.runExpectedFilesTest(run, oracle);
+    if (this.usesExpectedFiles(testId)) return this.runExpectedFilesTest(run);
     return {
       text: `test ${testId}: no oracle registered`,
       passed: false,
@@ -197,61 +167,41 @@ export class TaskEnvironment {
 
   private async runScriptTest(run: TestRun, script: string): Promise<ExecutionResult> {
     const result = await runScriptOracle(this.workspace, script, this.options);
-    const status = result.passed ? "passed" : "failed";
-    return this.recordCheck(run, {
-      status,
-      text: `${testSummary(run, status)}${result.output ? `\n${result.output}` : ""}`,
-      ...(result.constraints ? { constraints: result.constraints } : {}),
-    });
+    const check = this.recordCheck(run, result.passed ? "passed" : "failed");
+    return reportOf(
+      check,
+      `${check.summary()}${result.output ? `\n${result.output}` : ""}`,
+      result.constraints,
+    );
   }
 
-  private runExpectedFilesTest(run: TestRun, oracle: TestOracle | undefined): ExecutionResult {
-    const mismatches = Object.entries(this.expectedFilesFor(oracle)).filter(
+  private runExpectedFilesTest(run: TestRun): ExecutionResult {
+    const mismatches = Object.entries(this.expectedFilesFor(run.testId)).filter(
       ([path, content]) => this.workspace.get(path) !== content,
     );
-    const status = mismatches.length ? "failed" : "passed";
-    return this.recordCheck(run, {
-      status,
-      text: mismatches.length
+    const check = this.recordCheck(run, mismatches.length ? "failed" : "passed");
+    return reportOf(
+      check,
+      mismatches.length
         ? `test ${run.testId}: failed (files differ: ${mismatches.map(([path]) => path).join(", ")})`
-        : testSummary(run, status),
-    });
+        : check.summary(),
+    );
   }
 
-  private recordCheck(run: TestRun, outcome: CheckOutcome): ExecutionResult {
-    const { status, text, constraints } = outcome;
-    this.checks.set(run.checkKey, {
-      testId: run.testId,
-      status,
-      generation: run.generation,
-      command: run.command,
-      seq: run.seq,
-      ...(run.evidenceId ? { evidenceId: run.evidenceId } : {}),
-    });
-    return {
-      text,
-      passed: status === "passed",
-      verification: {
-        testId: run.testId,
-        command: run.command,
-        checkKey: run.checkKey,
-        status,
-        generation: run.generation,
-        seq: run.seq,
-        ...(run.evidenceId ? { evidenceId: run.evidenceId } : {}),
-        ...(constraints ? { constraints } : {}),
-      },
-    };
+  private recordCheck(run: TestRun, status: CheckStatus): RecordedCheck {
+    const check = new RecordedCheck(run, status);
+    this.checks.set(run.checkKey, check);
+    return check;
   }
 
   private async finalResult(testId: string): Promise<OracleRunResult> {
     const oracle = this.oracleFor(testId);
     if (oracle?.kind === "script" && oracle.script)
       return this.scriptFinalResult(testId, oracle.script);
-    if (this.usesExpectedFiles(oracle))
+    if (this.usesExpectedFiles(testId))
       return {
         testId,
-        status: this.matchesFiles(this.expectedFilesFor(oracle)) ? "passed" : "failed",
+        status: this.matchesFiles(this.expectedFilesFor(testId)) ? "passed" : "failed",
       };
     return { testId, status: "not_run" };
   }
@@ -270,14 +220,17 @@ export class TaskEnvironment {
     return this.scoring?.oracles?.find((candidate) => candidate.testId === testId);
   }
 
-  private usesExpectedFiles(oracle: TestOracle | undefined): boolean {
+  private usesExpectedFiles(testId: string): boolean {
+    const oracle = this.oracleFor(testId);
     return (
       oracle?.kind === "expected_files" || (!oracle && !this.scoring && !!this.task.expectedFiles)
     );
   }
 
-  private expectedFilesFor(oracle: TestOracle | undefined): Readonly<Record<string, string>> {
-    return oracle ? (this.scoring?.expectedFiles ?? {}) : (this.task.expectedFiles ?? {});
+  private expectedFilesFor(testId: string): Readonly<Record<string, string>> {
+    return this.oracleFor(testId)
+      ? (this.scoring?.expectedFiles ?? {})
+      : (this.task.expectedFiles ?? {});
   }
 
   private matchesFiles(expected: Readonly<Record<string, string>>): boolean {
@@ -288,26 +241,22 @@ export class TaskEnvironment {
 
   /** Per-test facts let scoring compare each declared test's latest result;
    * a different check's success can never masquerade as this test's. */
-  private latestTestFacts(entries: readonly CheckEntry[]): Record<string, ExperimentCheckFact> {
-    const latestPerTest = new Map<string, CheckEntry>();
-    for (const entry of entries)
-      if (isNewerCheck(entry, latestPerTest.get(entry.testId)))
+  private latestTestFacts(): Record<string, ExperimentCheckFact> {
+    const latestPerTest = new Map<string, RecordedCheck>();
+    for (const entry of this.checks.values())
+      if (entry.isNewerThan(latestPerTest.get(entry.testId)))
         latestPerTest.set(entry.testId, entry);
     const tests: Record<string, ExperimentCheckFact> = {};
     for (const entry of latestPerTest.values())
       tests[entry.testId] = {
         testId: entry.testId,
         status: entry.status,
-        freshness: this.freshness(entry),
+        freshness: entry.freshness(this.generation),
         command: entry.command,
         checkKey: entry.checkKey,
         observedGeneration: entry.generation,
       };
     return tests;
-  }
-
-  private freshness(check: RecordedCheck): "current" | "stale" {
-    return check.generation === this.generation ? "current" : "stale";
   }
 }
 
@@ -329,9 +278,16 @@ function testNotAllowed(testId: string | undefined): ExecutionResult {
   };
 }
 
-function testSummary(run: TestRun, status: "passed" | "failed"): string {
-  const evidence = run.evidenceId ? ` evidence=${run.evidenceId}` : "";
-  return `test ${run.testId}: ${status} check=${run.checkKey} gen=${run.generation} seq=${run.seq}${evidence}`;
+function reportOf(
+  check: RecordedCheck,
+  text: string,
+  constraints?: Readonly<Record<string, boolean>>,
+): ExecutionResult {
+  return {
+    text,
+    passed: check.status === "passed",
+    verification: check.toObservation(constraints),
+  };
 }
 
 // An oracle that never executed is "not_run", not a failure of the artifact
@@ -339,30 +295,4 @@ function testSummary(run: TestRun, status: "passed" | "failed"): string {
 function scriptStatus(run: OracleRun): OracleRunResult["status"] {
   if (run.ran === false) return "not_run";
   return run.passed ? "passed" : "failed";
-}
-
-function isNewerCheck(check: RecordedCheck, prior: RecordedCheck | undefined): boolean {
-  return (
-    !prior ||
-    check.generation > prior.generation ||
-    (check.generation === prior.generation && check.seq > prior.seq)
-  );
-}
-
-function newestCheck(latest: CheckEntry | undefined, check: CheckEntry): CheckEntry {
-  return isNewerCheck(check, latest) ? check : (latest as CheckEntry);
-}
-
-function isFailed(check: CheckEntry): boolean {
-  return check.status === "failed";
-}
-
-function blockerFor(check: CheckEntry): HotState["activeBlockers"][number] {
-  return {
-    eventId: `env-${check.testId}` as HotState["activeBlockers"][number]["eventId"],
-    origin: "verification",
-    kind: "test",
-    checkKey: check.checkKey,
-    category: "test",
-  };
 }

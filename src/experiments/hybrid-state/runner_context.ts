@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 
-import type { ProjectedInput } from "./projection.js";
 import type {
   CallRecord,
   CallStartRecord,
@@ -41,6 +40,7 @@ export class PersistenceError extends Error {
 
 export interface RunContext {
   readonly runId: string;
+  readonly config: HybridConfig;
   readonly calls: CallRecord[];
   readonly contexts: ContextRecord[];
   readonly updates: UpdateRecord[];
@@ -66,30 +66,6 @@ export class BudgetExhausted extends Error {
   }
 }
 
-export interface TrialAddress {
-  readonly trialId: string;
-  readonly taskId: string;
-  readonly mode: ExperimentMode;
-  readonly step: number;
-  readonly kind: UpdateRecord["kind"];
-}
-
-export interface AuditAddress {
-  readonly kind: UpdateRecord["kind"];
-  readonly step: number;
-  readonly mode: string;
-}
-
-export interface ContextArgs {
-  readonly trialId: string;
-  readonly taskId: string;
-  readonly mode: ExperimentMode;
-  readonly step: number;
-  readonly projected: ProjectedInput;
-  readonly system: string;
-  readonly config: HybridConfig;
-}
-
 export function newRunContext(
   runId: string,
   config: HybridConfig,
@@ -97,6 +73,7 @@ export function newRunContext(
 ): RunContext {
   return {
     runId,
+    config,
     calls: [],
     contexts: [],
     updates: [],
@@ -125,12 +102,10 @@ export async function pushUpdate(ctx: RunContext, record: UpdateRecord): Promise
   await writeRecord(ctx, "updates.jsonl", (recorder) => recorder.update(record));
 }
 
-export async function recordContext(ctx: RunContext, args: ContextArgs): Promise<void> {
-  const { projected } = args;
-  const systemHash = createHash("sha256").update(args.system).digest("hex");
-  // The static system body is persisted once per distinct hash; each step's
-  // context record references it so the sent request stays reconstructible.
-  if (args.config.recordContextText && !ctx.systemPrompts.has(systemHash)) {
+/** Persists the static system body once per distinct hash and returns that hash. */
+export async function persistSystemPrompt(ctx: RunContext, system: string): Promise<string> {
+  const systemHash = createHash("sha256").update(system).digest("hex");
+  if (ctx.config.recordContextText && !ctx.systemPrompts.has(systemHash)) {
     ctx.systemPrompts.add(systemHash);
     await writeRecord(ctx, "system_prompts.jsonl", (recorder) =>
       recorder.prompt
@@ -138,55 +113,17 @@ export async function recordContext(ctx: RunContext, args: ContextArgs): Promise
             record: "system_prompt",
             runId: ctx.runId,
             hash: systemHash,
-            text: args.system,
+            text: system,
           })
         : Promise.resolve(),
     );
   }
-  await pushContext(ctx, {
-    runId: ctx.runId,
-    trialId: args.trialId,
-    taskId: args.taskId,
-    mode: args.mode,
-    step: args.step,
-    bytes: projected.bundle.bytes,
-    sentBytes: Buffer.byteLength(projected.userText),
-    included: [
-      "instruction",
-      "fixedTools",
-      "facts",
-      "memory",
-      "latest",
-      ...(projected.bundle.history === undefined ? [] : ["history"]),
-    ],
-    truncated: projected.bundle.truncated,
-    systemHash,
-    ...(args.config.recordContextText ? { text: projected.userText } : {}),
-  });
+  return systemHash;
 }
 
-export function trialRecord(
-  ctx: RunContext,
-  address: TrialAddress,
-  data: Record<string, unknown>,
-): UpdateRecord {
-  return { runId: ctx.runId, ...address, ...data };
-}
-
-export function auditRecord(
-  ctx: RunContext,
-  address: AuditAddress,
-  data: Record<string, unknown>,
-): UpdateRecord {
-  return {
-    runId: ctx.runId,
-    trialId: `audit-${address.mode}`,
-    taskId: "audit",
-    mode: address.mode as ExperimentMode,
-    step: address.step,
-    kind: address.kind,
-    ...data,
-  };
+export async function pushContext(ctx: RunContext, record: ContextRecord): Promise<void> {
+  ctx.contexts.push(record);
+  await writeRecord(ctx, "contexts.jsonl", (recorder) => recorder.context(record));
 }
 
 export function rememberCandidates(
@@ -230,11 +167,6 @@ export function operationView(operation: PatchOperation): Record<string, unknown
 
 export function memoryHash(memory: WorkMemory): string {
   return createHash("sha256").update(JSON.stringify(memory)).digest("hex").slice(0, 16);
-}
-
-async function pushContext(ctx: RunContext, record: ContextRecord): Promise<void> {
-  ctx.contexts.push(record);
-  await writeRecord(ctx, "contexts.jsonl", (recorder) => recorder.context(record));
 }
 
 async function writeRecord(

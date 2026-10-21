@@ -2,33 +2,22 @@ import { defaultConfig } from "../../core/config.js";
 import { scoreTrial } from "./evaluation.js";
 import { buildProjection, type ProjectedInput } from "./projection.js";
 import { actorSystemPrompt, buildActorRequest } from "./prompts.js";
-import type { ProviderSet } from "./providers.js";
-import {
-  actorProvider,
-  callOptions,
-  instrumented,
-  updateWithProviders,
-  type StepScope,
-} from "./runner_calls.js";
+import type { TrialSession, TrialStep } from "./runner_calls.js";
 import {
   countApplied,
   countDecisions,
   memoryHash,
   operationView,
-  pushUpdate,
-  recordContext,
   rememberCandidates,
-  trialRecord,
   type RunContext,
 } from "./runner_context.js";
-import { operationKey, recordToolExchange } from "./runner_exchange.js";
-import { evaluateFinalArtifact, finalBlockReason } from "./runner_final.js";
+import { operationKey } from "./runner_exchange.js";
+import { evaluateFinalArtifact } from "./runner_final.js";
 import { requiresIsolation } from "./runner_manifest.js";
-import { evaluateActorPatch } from "./runner_patch.js";
-import { openRig, type EnvironmentFactory, type TrialRig } from "./runner_rig.js";
-import { actorVerificationAtStop, terminationFor } from "./runner_scoring.js";
+import { ActorPatch } from "./runner_patch.js";
+import type { Execution, TrialRig } from "./runner_rig.js";
+import { terminationFor, type TrialIdentity } from "./runner_scoring.js";
 import { TrialTally } from "./runner_tally.js";
-import { TaskEnvironment } from "./task_environment.js";
 import { generateCandidates, latestGroup } from "./trace.js";
 import type {
   ActorAction,
@@ -53,51 +42,24 @@ export interface TrialPlan {
   readonly iteration: number;
 }
 
-export interface TrialRun {
-  readonly config: HybridConfig;
-  readonly isolationVerified: boolean;
-  readonly providers: ProviderSet;
-  readonly ctx: RunContext;
-}
-
-export interface TrialOptions {
-  readonly signal?: AbortSignal;
-  readonly environmentFor?: EnvironmentFactory;
-}
-
-interface TrialContext {
-  readonly plan: TrialPlan;
-  readonly run: TrialRun;
-  readonly signal: AbortSignal | undefined;
-}
-
-interface StepView {
-  readonly step: number;
-  readonly group: ObservationGroup;
-  readonly candidates: readonly Candidate[];
-}
-
 interface ActorTurn {
   readonly response: ActorResponse;
   readonly action: ActorAction;
 }
 
-type Execution = Awaited<ReturnType<TaskEnvironment["execute"]>>;
-
 /** Bounded per-trial set of undecided candidates carried into the next step. */
 const HELD_CANDIDATE_LIMIT = 32;
 
-export async function runTrial(
-  plan: TrialPlan,
-  run: TrialRun,
-  options: TrialOptions = {},
-): Promise<TrialScore> {
-  const trial = await TrialRunner.start({ plan, run, signal: options.signal }, options);
-  await trial.runSteps();
-  return trial.score();
+export function trialIdentity(plan: TrialPlan): TrialIdentity {
+  return {
+    trialId: plan.trialId,
+    taskId: plan.task.id,
+    mode: plan.mode,
+    iteration: plan.iteration,
+  };
 }
 
-class TrialRunner {
+export class TrialRunner {
   private readonly ctx: RunContext;
   private readonly config: HybridConfig;
   private readonly task: HybridTask;
@@ -115,40 +77,38 @@ class TrialRunner {
   private readonly heldCandidates = new Map<string, Candidate>();
   private readonly startedAt = new Date().toISOString();
   private groupStart = 0;
+  /** The step being run, with what it observed. */
+  private at: TrialStep;
+  private group: ObservationGroup = { messages: [] };
+  private candidates: readonly Candidate[] = [];
 
-  private constructor(
-    private readonly context: TrialContext,
+  constructor(
+    private readonly plan: TrialPlan,
+    private readonly session: TrialSession,
     private readonly rig: TrialRig,
   ) {
-    this.ctx = context.run.ctx;
-    this.config = context.run.config;
-    this.task = context.plan.task;
-    this.mode = context.plan.mode;
-    this.trialId = context.plan.trialId;
+    this.ctx = session.ctx;
+    this.config = session.ctx.config;
+    this.task = plan.task;
+    this.mode = plan.mode;
+    this.trialId = plan.trialId;
+    this.at = session.step(0);
   }
 
-  static async start(context: TrialContext, options: TrialOptions): Promise<TrialRunner> {
-    const isolated = requiresIsolation(context.run.config);
-    const rig = await openRig(context.plan, isolated, options.environmentFor);
-    return new TrialRunner(context, rig);
-  }
-
-  async runSteps(): Promise<void> {
+  async runSteps(signal?: AbortSignal): Promise<void> {
     for (let step = 0; step < this.config.budgets.maxActions; step++) {
-      if (this.stopRequested()) break;
+      if (this.stopRequested(signal)) break;
       if (!(await this.runStep(step))) break;
     }
     if (!this.completed && !this.error) this.error = "action_budget_exhausted";
   }
 
-  async score(): Promise<TrialScore> {
-    const { plan, run } = this.context;
-    const { env } = this.rig;
-    const { tally } = this;
-    const final = await evaluateFinalArtifact(
-      { env, task: this.task, blockReason: this.finalBlockReason() },
-      (verdicts) => tally.mergeConstraints(verdicts),
-    );
+  async score(isolationVerified: boolean): Promise<TrialScore> {
+    const { plan, config, tally, rig } = this;
+    const blockReason = this.finalBlockReason(isolationVerified);
+    const results = blockReason ? [] : await rig.env.evaluateFinal();
+    for (const result of results) tally.mergeConstraints(result.constraints);
+    const final = evaluateFinalArtifact(this.task, results, blockReason);
     const finishedAt = new Date().toISOString();
     return scoreTrial({
       trialId: this.trialId,
@@ -166,10 +126,9 @@ class TrialRunner {
       testResults: final.testResults,
       finalArtifact: final.finalArtifact,
       finalConstraintVerdicts: final.finalConstraintVerdicts,
-      actorVerificationAtStop: actorVerificationAtStop(
+      actorVerificationAtStop: tally.actorVerificationAtStop(
         this.task.allowedTests,
-        tally.actorTests,
-        env.observationGeneration,
+        rig.env.observationGeneration,
       ),
       actorTests: tally.actorTests,
       patchStats: tally.patchStats(),
@@ -182,12 +141,16 @@ class TrialRunner {
       appliedExtractive: tally.appliedExtractive,
       appliedGenerated: tally.appliedGenerated,
       activeMemoryItems: memoryItems(this.memory).length,
-      providerMode: run.config.provider.mode,
+      providerMode: config.provider.mode,
     });
   }
 
-  private stopRequested(): boolean {
-    if (!this.context.signal?.aborted) return false;
+  private get step(): number {
+    return this.at.index;
+  }
+
+  private stopRequested(signal: AbortSignal | undefined): boolean {
+    if (!signal?.aborted) return false;
     // Cancellation is a stop request: no more actions and no final oracle
     // pass over candidate code.
     this.cancelled = true;
@@ -197,48 +160,46 @@ class TrialRunner {
 
   /** Returns false when the trial must stop after this step. */
   private async runStep(step: number): Promise<boolean> {
-    await this.deliverInjections(step);
-    const view = this.observe(step);
-    if (!(await this.refreshMemory(view))) return false;
-    const turn = await this.requestAction(view);
+    this.at = this.session.step(step);
+    await this.deliverInjections();
+    this.observe();
+    if (!(await this.refreshMemory())) return false;
+    const turn = await this.requestAction();
     if (!turn) return false;
-    const responseId = this.recordResponse(step, turn.response);
-    if (this.mode === "llm" && !(await this.commitPatch(view, turn.response, responseId)))
-      return false;
-    return this.performAction(step, turn.action);
+    const responseId = this.recordResponse(turn.response);
+    if (this.mode === "llm" && !(await this.commitPatch(turn.response, responseId))) return false;
+    return this.performAction(turn.action);
   }
 
-  private async deliverInjections(step: number): Promise<void> {
+  private async deliverInjections(): Promise<void> {
     const { normalizer, engine, history } = this.rig;
     const consumed = this.held.splice(0, this.held.length);
     for (const message of consumed) {
       const prompt = normalizer.prompt(message.text);
       await engine.process(prompt);
       history.push({ ...message, id: prompt.id, sourceId: prompt.id, sequence: history.length });
-      await this.pushRecord(step, "injection", { text: message.text, sourceId: prompt.id });
+      await this.at.recordUpdate("injection", { text: message.text, sourceId: prompt.id });
     }
   }
 
-  private observe(step: number): StepView {
-    const group = latestGroup(this.rig.history, this.groupStart);
+  private observe(): void {
+    this.group = latestGroup(this.rig.history, this.groupStart);
     this.groupStart = this.rig.history.length;
-    const candidates = generateCandidates(group.messages, {
+    this.candidates = generateCandidates(this.group.messages, {
       maxBytes: this.config.candidateMaxBytes,
-      observedAt: step,
+      observedAt: this.step,
     });
-    rememberCandidates(this.ctx, this.mode, candidates);
-    return { step, group, candidates };
+    rememberCandidates(this.ctx, this.mode, this.candidates);
   }
 
   /** Update memory from unprocessed observations and held candidates BEFORE
    * building the next actor input; the visible response text is captured as
    * part of the next step's observation group instead. */
-  private async refreshMemory(view: StepView): Promise<boolean> {
-    const { mode, ctx } = this;
+  private async refreshMemory(): Promise<boolean> {
+    const { mode, ctx, step, group } = this;
     if (mode !== "rules" && mode !== "jev") return true;
-    const { step, group } = view;
     const { env, engine } = this.rig;
-    const merged = mergeCandidates(this.heldCandidates, view.candidates);
+    const merged = mergeCandidates(this.heldCandidates, this.candidates);
     const input = {
       instruction: this.task.instruction,
       mode,
@@ -251,17 +212,14 @@ class TrialRunner {
       step,
       now: step,
     } as const;
-    const result = await updateWithProviders(ctx, input, {
-      ...this.stepScope(step),
-      providers: this.context.run.providers,
-    });
+    const result = await this.at.updateMemory(input);
     this.memory = result.memory;
     this.heldCandidates.clear();
     for (const candidate of result.held) this.heldCandidates.set(candidate.id, candidate);
     countDecisions(ctx, mode, result.decisions.length);
     countApplied(ctx, mode, result.applied);
     this.tally.tallyApplied(result.applied);
-    await this.pushRecord(step, "update", {
+    await this.at.recordUpdate("update", {
       candidates: merged.map((candidate) => candidate.id),
       decisions: result.decisions,
       applied: result.applied.map(operationView),
@@ -274,38 +232,33 @@ class TrialRunner {
       this.error = `state_first_unavailable:${result.unavailable}`;
       return false;
     }
-    return this.withinHeldLimit(step);
+    return this.withinHeldLimit();
   }
 
-  private async withinHeldLimit(step: number): Promise<boolean> {
+  private async withinHeldLimit(): Promise<boolean> {
     if (this.heldCandidates.size <= HELD_CANDIDATE_LIMIT) return true;
     this.error = "state_first_unavailable:held_overflow";
-    await this.pushRecord(step, "update", { held_overflow: this.heldCandidates.size });
+    await this.at.recordUpdate("update", { held_overflow: this.heldCandidates.size });
     return false;
   }
 
-  private async requestAction(view: StepView): Promise<ActorTurn | undefined> {
-    const { step } = view;
-    const projected = await this.project(view);
+  private async requestAction(): Promise<ActorTurn | undefined> {
+    const projected = await this.project();
     if (projected.bundle.unavailable) {
       this.error = `state_first_unavailable:${projected.bundle.unavailable}`;
       return undefined;
     }
     this.tally.sentTexts.push(projected.userText);
-    const request = buildActorRequest({
-      mode: this.mode,
-      taskId: this.task.id,
-      trialId: this.trialId,
-      step,
-      userText: projected.userText,
-      allowedTests: this.task.allowedTests,
-      model: this.config.provider.actorModel ?? "fake",
-    });
-    const { providers } = this.context.run;
-    const response = await instrumented(
-      this.ctx,
-      { kind: "actor", mode: this.mode, request, ...this.stepScope(step) },
-      () => actorProvider(providers).act(request, callOptions(this.config)),
+    const response = await this.at.act(
+      buildActorRequest({
+        mode: this.mode,
+        taskId: this.task.id,
+        trialId: this.trialId,
+        step: this.step,
+        userText: projected.userText,
+        allowedTests: this.task.allowedTests,
+        model: this.config.provider.actorModel ?? "fake",
+      }),
     );
     if (response.error || !response.action) {
       this.error = response.error ?? "actor_action_missing";
@@ -314,9 +267,8 @@ class TrialRunner {
     return { response, action: response.action };
   }
 
-  private async project(view: StepView): Promise<ProjectedInput> {
-    const { step, group } = view;
-    const { config, task, mode } = this;
+  private async project(): Promise<ProjectedInput> {
+    const { config, task, mode, step } = this;
     const facts = factsFromState(
       this.rig.engine.state,
       defaultConfig(),
@@ -327,7 +279,7 @@ class TrialRunner {
       instruction: task.instruction,
       facts,
       memory: this.memory,
-      latest: group.messages,
+      latest: this.group.messages,
       history: this.rig.history,
       actionBudget: {
         limit: config.budgets.maxActions,
@@ -339,22 +291,14 @@ class TrialRunner {
       allowedTests: task.allowedTests,
       budgets: config.budgets,
     });
-    await recordContext(this.ctx, {
-      trialId: this.trialId,
-      taskId: task.id,
-      mode,
-      step,
-      projected,
-      system: actorSystemPrompt(mode),
-      config,
-    });
+    await this.at.recordContext(projected, actorSystemPrompt(mode));
     return projected;
   }
 
-  private recordResponse(step: number, response: ActorResponse): string {
+  private recordResponse(response: ActorResponse): string {
     const { history } = this.rig;
     this.tally.actionForms[response.actionForm ?? "canonical"] += 1;
-    const responseId = `resp-${this.trialId}-${step}`;
+    const responseId = `resp-${this.trialId}-${this.step}`;
     if (response.text)
       history.push({
         id: responseId,
@@ -368,27 +312,19 @@ class TrialRunner {
   }
 
   /** Returns false when the patch ends the trial. */
-  private async commitPatch(
-    view: StepView,
-    response: ActorResponse,
-    responseId: string,
-  ): Promise<boolean> {
-    const { step } = view;
-    const outcome = evaluateActorPatch({
-      memory: this.memory,
-      response,
-      responseId,
-      candidates: view.candidates,
-      observations: view.group.messages,
-      step,
-      memoryBytes: this.config.budgets.memoryBytes,
-    });
+  private async commitPatch(response: ActorResponse, responseId: string): Promise<boolean> {
+    const patch = new ActorPatch(response, responseId);
+    const outcome = patch.evaluate(
+      this.memory,
+      patch.applyContext(this.candidates, this.group.messages, this.step),
+      this.config.budgets.memoryBytes,
+    );
     if (outcome.kind === "invalid") {
       this.error = outcome.error;
       return false;
     }
     if (outcome.kind === "over_budget") {
-      await this.pushRecord(step, "update", {
+      await this.at.recordUpdate("update", {
         source: "actor_patch",
         patchInput: outcome.patchInput,
         rejected: "memory_exceeds_budget",
@@ -400,7 +336,7 @@ class TrialRunner {
     this.memory = outcome.memory;
     this.tally.tallyPatch(outcome);
     countApplied(this.ctx, this.mode, outcome.applied);
-    await this.pushRecord(step, "update", {
+    await this.at.recordUpdate("update", {
       source: "actor_patch",
       patchInput: outcome.patchInput,
       operations: outcome.applied.map(operationView),
@@ -412,25 +348,25 @@ class TrialRunner {
   }
 
   /** Returns false when the trial finished or must stop. */
-  private async performAction(step: number, action: ActorAction): Promise<boolean> {
-    const { tally } = this;
+  private async performAction(action: ActorAction): Promise<boolean> {
+    const { tally, step } = this;
     const evidenceId = `call-${this.trialId}-${step}`;
     const execution = await this.execute(action, evidenceId);
     if (!execution) return false;
-    tally.trackExecution(operationKey(action), execution);
+    tally.trackExecution(operationKey(action), execution.passed);
     if (execution.violation) {
       tally.policyViolations.push(execution.violation);
       this.error = execution.violation;
       return false;
     }
     tally.trackRead(action, this.rig.env.observationGeneration);
-    await recordToolExchange(this.rig, { action, evidenceId, execution });
-    tally.trackVerification(step, execution);
+    await this.rig.recordToolExchange(action, evidenceId, execution);
+    this.trackVerification(execution);
     if (action.tool === "finish") {
       this.completed = true;
       return false;
     }
-    this.scheduleInjections(step);
+    this.scheduleInjections();
     return true;
   }
 
@@ -445,7 +381,22 @@ class TrialRunner {
     }
   }
 
-  private scheduleInjections(step: number): void {
+  private trackVerification(execution: Execution): void {
+    const { verification } = execution;
+    if (!verification) return;
+    this.tally.trackVerification(
+      {
+        testId: verification.testId,
+        step: this.step,
+        passed: execution.passed,
+        generation: verification.generation,
+      },
+      verification.constraints,
+    );
+  }
+
+  private scheduleInjections(): void {
+    const { step } = this;
     const due = (this.task.injections ?? []).filter((injection) => injection.step === step + 1);
     for (const injection of due)
       this.held.push({
@@ -460,26 +411,10 @@ class TrialRunner {
 
   /** When the workspace is corrupt or required isolation was never confirmed,
    * no additional candidate code may execute at all. */
-  private finalBlockReason(): string | null {
-    const { config, isolationVerified } = this.context.run;
-    return finalBlockReason({
-      envFailed: this.envFailed,
-      cancelled: this.cancelled,
-      isolationUnverified: requiresIsolation(config) && !isolationVerified,
-    });
-  }
-
-  private stepScope(step: number): StepScope {
-    return { trialId: this.trialId, taskId: this.task.id, step, config: this.config };
-  }
-
-  private pushRecord(
-    step: number,
-    kind: "update" | "injection",
-    data: Record<string, unknown>,
-  ): Promise<void> {
-    const address = { trialId: this.trialId, taskId: this.task.id, mode: this.mode, step, kind };
-    return pushUpdate(this.ctx, trialRecord(this.ctx, address, data));
+  private finalBlockReason(isolationVerified: boolean): string | null {
+    if (this.envFailed) return "environment_error";
+    if (this.cancelled) return "cancelled";
+    return requiresIsolation(this.config) && !isolationVerified ? "isolation_unverified" : null;
   }
 }
 

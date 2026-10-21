@@ -28,20 +28,15 @@ interface RecordedCall {
   readonly response: unknown;
 }
 
-interface RecordedPosition {
-  readonly trialId?: string | undefined;
-  readonly step?: number | undefined;
-}
-
-type RecordedCallOptions = CallOptions & RecordedPosition;
-
 const RECORDED_KINDS: ReadonlySet<unknown> = new Set(["actor", "jev", "repair", "update"]);
 
 export class RecordedJevProvider implements JevProvider {
   readonly name = "recorded-jev";
   constructor(private readonly calls: ReadonlyMap<string, RecordedCall>) {}
-  choose(request: JevRequest, options?: RecordedCallOptions) {
-    const call = this.calls.get(recordedKey("jev", request, options));
+  choose(request: JevRequest, options?: CallOptions & { trialId?: string; step?: number }) {
+    const call = this.calls.get(
+      recordedKey("jev", request, trialPosition(options?.trialId, options?.step)),
+    );
     if (!call) return Promise.resolve({ answers: [], error: "recorded_response_missing" });
     return Promise.resolve(call.response as JevResponse);
   }
@@ -50,8 +45,10 @@ export class RecordedJevProvider implements JevProvider {
 export class RecordedRepairProvider implements RepairProvider {
   readonly name = "recorded-repair";
   constructor(private readonly calls: ReadonlyMap<string, RecordedCall>) {}
-  repair(request: RepairRequest, options?: RecordedCallOptions) {
-    const call = this.calls.get(recordedKey("repair", request, options));
+  repair(request: RepairRequest, options?: CallOptions & { trialId?: string; step?: number }) {
+    const call = this.calls.get(
+      recordedKey("repair", request, trialPosition(options?.trialId, options?.step)),
+    );
     if (!call) return Promise.resolve({ error: "recorded_response_missing" });
     return Promise.resolve(call.response as RepairResponse);
   }
@@ -62,7 +59,7 @@ export class RecordedActorProvider implements ActorProvider {
   constructor(private readonly calls: ReadonlyMap<string, RecordedCall>) {}
   act(request: ActorRequest) {
     const call = this.calls.get(
-      recordedKey("actor", request, { trialId: request.trialId, step: request.step }),
+      recordedKey("actor", request, trialPosition(request.trialId, request.step)),
     );
     if (!call) return Promise.resolve({ error: "recorded_response_missing" });
     return Promise.resolve(call.response as ActorResponse);
@@ -72,8 +69,13 @@ export class RecordedActorProvider implements ActorProvider {
 export class RecordedUpdateProvider implements UpdateProvider {
   readonly name = "recorded-update";
   constructor(private readonly calls: ReadonlyMap<string, RecordedCall>) {}
-  update(request: GenerativeUpdateRequest, options?: RecordedCallOptions) {
-    const call = this.calls.get(recordedKey("update", request, options));
+  update(
+    request: GenerativeUpdateRequest,
+    options?: CallOptions & { trialId?: string; step?: number },
+  ) {
+    const call = this.calls.get(
+      recordedKey("update", request, trialPosition(options?.trialId, options?.step)),
+    );
     if (!call) return Promise.resolve({ error: "recorded_response_missing" });
     return Promise.resolve(call.response as GenerativeUpdateResponse);
   }
@@ -97,8 +99,12 @@ export async function readRecordedProviders(path: string): Promise<ProviderSet> 
   };
 }
 
-function recordedKey(kind: string, request: unknown, position: RecordedPosition = {}): string {
-  return `${kind}|${position.trialId ?? ""}|${position.step ?? -1}|${requestHash(kind, request)}`;
+function recordedKey(kind: string, request: unknown, trialPositionKey: string): string {
+  return `${kind}|${trialPositionKey}|${requestHash(kind, request)}`;
+}
+
+function trialPosition(trialId: string | undefined, step: number | undefined): string {
+  return `${trialId ?? ""}|${step ?? -1}`;
 }
 
 function parseRecordedCall(entry: unknown): RecordedCall {

@@ -8,34 +8,26 @@ import type {
   JevRequest,
   JevResponse,
   PatchOperation,
+  RepairRequest,
   UpdateInput,
   UpdateProposal,
 } from "./types.js";
+import type { CandidateSelection } from "./update_selection.js";
 
-export interface JevOptions {
-  readonly jev?: JevProvider;
-  readonly jevModel?: string;
-  readonly maxQuestions?: number;
-  readonly requestBytes?: number;
-  readonly signal?: AbortSignal;
-}
-
-export interface JevSelection {
-  readonly decisions: readonly CandidateDecision[];
-  readonly proposal: UpdateProposal;
-  readonly held: readonly Candidate[];
+export interface JevSelection extends CandidateSelection {
   readonly unavailable?: string;
-}
-
-interface JevBase {
-  readonly proposal: UpdateProposal;
-  readonly decisions: readonly CandidateDecision[];
 }
 
 export async function jevSelection(
   input: UpdateInput,
-  base: JevBase,
-  options: JevOptions,
+  base: CandidateSelection,
+  options: {
+    readonly jev?: JevProvider;
+    readonly jevModel?: string;
+    readonly maxQuestions?: number;
+    readonly requestBytes?: number;
+    readonly signal?: AbortSignal;
+  },
 ): Promise<JevSelection> {
   const { questions, unasked } = buildJevQuestions(
     input.candidates,
@@ -104,7 +96,10 @@ export async function jevSelection(
   };
 }
 
-function exceedsRequestBudget(request: JevRequest, requestBytes: number | undefined): boolean {
+export function exceedsRequestBudget(
+  request: JevRequest | RepairRequest,
+  requestBytes: number | undefined,
+): boolean {
   return requestBytes !== undefined && Buffer.byteLength(JSON.stringify(request)) > requestBytes;
 }
 
@@ -142,23 +137,37 @@ function askedCandidates(
   );
 }
 
-interface JevOutcome {
-  readonly candidates: Candidate[];
-  readonly decisions: CandidateDecision[];
-  readonly held: Candidate[];
-}
-
-interface JevSubject {
-  readonly candidateId: string;
-  readonly candidate: Candidate | undefined;
-  readonly answer: JevAnswer | undefined;
-}
-
 type JevVerdict =
   | { readonly kind: "hold"; readonly reason: string }
   | { readonly kind: "drop" }
   | { readonly kind: "unavailable" }
-  | { readonly kind: "select" };
+  | { readonly kind: "select"; readonly candidate: Candidate; readonly answer: JevAnswer };
+
+/** Accumulates what the judge's verdicts decided for each asked candidate. */
+class JevOutcome {
+  readonly candidates: Candidate[] = [];
+  readonly decisions: CandidateDecision[] = [];
+  readonly held: Candidate[] = [];
+
+  record(verdict: JevVerdict, candidateId: string, candidate: Candidate | undefined): void {
+    if (verdict.kind === "hold") {
+      if (candidate) this.held.push(candidate);
+      this.decisions.push({ candidateId, disposition: "held", reason: verdict.reason });
+    } else if (verdict.kind === "drop") {
+      this.decisions.push({ candidateId, disposition: "rejected", reason: "jev_drop" });
+    } else if (verdict.kind === "unavailable") {
+      this.decisions.push({
+        candidateId,
+        disposition: "unclassified",
+        reason: "candidate_unavailable",
+      });
+      if (candidate) this.held.push(candidate);
+    } else {
+      this.candidates.push(verdict.candidate);
+      this.decisions.push(selectedDecision(candidateId, verdict.answer));
+    }
+  }
+}
 
 const HELD_CHOICES: ReadonlyMap<string, string> = new Map([
   ["none", "jev_not_selected"],
@@ -172,21 +181,21 @@ function selectedFromJev(
 ): JevOutcome {
   const byQuestion = new Map(response.answers.map((answer) => [answer.questionId, answer]));
   const candidateMap = new Map(inputCandidates.map((candidate) => [candidate.id, candidate]));
-  const outcome: JevOutcome = { candidates: [], decisions: [], held: [] };
+  const outcome = new JevOutcome();
   for (const question of questions) {
     const candidateId = question.candidateIds[0] ?? "unknown";
-    const subject = {
-      candidateId,
-      candidate: candidateMap.get(candidateId),
-      answer: byQuestion.get(question.id),
-    };
-    recordVerdict(outcome, subject, judgeAnswer(subject, question));
+    const candidate = candidateMap.get(candidateId);
+    const answer = byQuestion.get(question.id);
+    outcome.record(judgeAnswer(answer, candidate, question), candidateId, candidate);
   }
   return outcome;
 }
 
-function judgeAnswer(subject: JevSubject, question: JevQuestion): JevVerdict {
-  const { answer, candidate } = subject;
+function judgeAnswer(
+  answer: JevAnswer | undefined,
+  candidate: Candidate | undefined,
+  question: JevQuestion,
+): JevVerdict {
   if (!answer) return { kind: "hold", reason: "jev_missing" };
   if (answer.invalid) return { kind: "hold", reason: `jev_invalid:${answer.invalid}` };
   if (answer.confidence !== undefined && answer.confidence < 0.65)
@@ -195,27 +204,7 @@ function judgeAnswer(subject: JevSubject, question: JevQuestion): JevVerdict {
   if (heldReason) return { kind: "hold", reason: heldReason };
   if (answer.choice === "drop") return { kind: "drop" };
   if (!candidate || !(answer.choice in question.options)) return { kind: "unavailable" };
-  return { kind: "select" };
-}
-
-function recordVerdict(outcome: JevOutcome, subject: JevSubject, verdict: JevVerdict) {
-  const { candidateId, candidate, answer } = subject;
-  if (verdict.kind === "hold") {
-    if (candidate) outcome.held.push(candidate);
-    outcome.decisions.push({ candidateId, disposition: "held", reason: verdict.reason });
-  } else if (verdict.kind === "drop") {
-    outcome.decisions.push({ candidateId, disposition: "rejected", reason: "jev_drop" });
-  } else if (verdict.kind === "unavailable") {
-    outcome.decisions.push({
-      candidateId,
-      disposition: "unclassified",
-      reason: "candidate_unavailable",
-    });
-    if (candidate) outcome.held.push(candidate);
-  } else {
-    outcome.candidates.push(candidate!);
-    outcome.decisions.push(selectedDecision(candidateId, answer!));
-  }
+  return { kind: "select", candidate, answer };
 }
 
 function selectedDecision(candidateId: string, answer: JevAnswer): CandidateDecision {

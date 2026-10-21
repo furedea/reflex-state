@@ -1,3 +1,4 @@
+import type { ProjectedInput } from "./projection.js";
 import {
   FakeActorProvider,
   FakeJevProvider,
@@ -14,37 +15,27 @@ import {
 import {
   BudgetExhausted,
   PersistenceError,
+  persistSystemPrompt,
   pushCall,
   pushCallStart,
+  pushContext,
+  pushUpdate,
   type RunContext,
 } from "./runner_context.js";
+import type { TrialIdentity } from "./runner_scoring.js";
 import type {
+  ActorRequest,
+  ActorResponse,
   CallRecord,
-  ExperimentMode,
+  CallStartRecord,
   HybridConfig,
   HybridTask,
+  UpdateRecord,
   UpdateResult,
 } from "./types.js";
 import { updateMemory } from "./update.js";
 
-/** Where a provider call happens: which trial step, under which config. */
-export interface StepScope {
-  readonly trialId: string;
-  readonly taskId: string;
-  readonly step: number;
-  readonly config: HybridConfig;
-}
-
-export interface UpdateScope extends StepScope {
-  readonly providers: ProviderSet;
-}
-
-export interface CallSpec extends StepScope {
-  readonly kind: CallRecord["kind"];
-  readonly mode: ExperimentMode;
-  readonly request: unknown;
-}
-
+/** What a provider response reports about the call that produced it. */
 interface Instrumentable {
   latencyMs?: number;
   usage?: CallRecord["usage"];
@@ -53,94 +44,193 @@ interface Instrumentable {
   responseModel?: string;
 }
 
-interface CallBase {
-  readonly callId: string;
-  readonly runId: string;
-  readonly trialId: string;
-  readonly taskId: string;
-  readonly mode: ExperimentMode;
-  readonly step: number;
-  readonly kind: CallRecord["kind"];
-  readonly model: string;
-}
+/** A trial's access to the run: the shared run state, the providers, and the
+ * trial's identity. */
+export class TrialSession {
+  constructor(
+    readonly ctx: RunContext,
+    readonly providers: ProviderSet,
+    readonly identity: TrialIdentity,
+  ) {}
 
-interface CallAttempt {
-  readonly base: CallBase;
-  readonly requestBytes: number;
-  readonly requestHash: string;
-}
-
-interface RunningCall extends CallAttempt {
-  readonly startedAt: string;
-  readonly started: number;
-}
-
-interface ProviderBinding {
-  readonly ctx: RunContext;
-  readonly mode: ExperimentMode;
-  readonly scope: StepScope;
-}
-
-export async function instrumented<T extends Instrumentable>(
-  ctx: RunContext,
-  spec: CallSpec,
-  call: () => Promise<T>,
-): Promise<T> {
-  const attempt = openAttempt(ctx, spec);
-  await admit(ctx, spec, attempt);
-  const running: RunningCall = {
-    ...attempt,
-    startedAt: new Date().toISOString(),
-    started: performance.now(),
-  };
-  // A start record precedes the invocation so a crash before the end record is
-  // distinguishable from "no request was made".
-  await pushCallStart(ctx, {
-    record: "call_start",
-    ...attempt.base,
-    startedAt: running.startedAt,
-    requestBytes: attempt.requestBytes,
-    requestHash: attempt.requestHash,
-  });
-  try {
-    const response = await call();
-    await pushCall(ctx, completedCall(running, response, spec.config.recordResponseText));
-    return response;
-  } catch (error) {
-    if (error instanceof PersistenceError) throw error;
-    await pushCall(ctx, failedCall(running, error));
-    throw error;
+  step(index: number): TrialStep {
+    return new TrialStep(this, index);
   }
 }
 
-export async function updateWithProviders(
-  ctx: RunContext,
-  input: Parameters<typeof updateMemory>[0],
-  scope: UpdateScope,
-): Promise<UpdateResult> {
-  const { providers, config } = scope;
-  const binding: ProviderBinding = { ctx, mode: input.mode, scope };
-  const jev = providers.jev && instrumentedJev(providers.jev, binding);
-  const repair = providers.repair && instrumentedRepair(providers.repair, binding);
-  return updateMemory(input, {
-    ...(jev ? { jev } : {}),
-    ...(repair ? { repair } : {}),
-    ...modelSettings(config),
-    maxQuestions: config.budgets.maxQuestions,
-    maxRepairCalls: config.budgets.maxRepairCalls,
-    memoryBytes: config.budgets.memoryBytes,
-    requestBytes: config.budgets.requestBytes,
-    signal: AbortSignal.timeout(config.provider.timeoutMs),
-  });
+/** One step of a trial: every record and provider call of the step is
+ * addressed by the trial's identity and the step index. */
+export class TrialStep {
+  constructor(
+    private readonly session: TrialSession,
+    readonly index: number,
+  ) {}
+
+  get config(): HybridConfig {
+    return this.session.ctx.config;
+  }
+
+  async recordContext(projected: ProjectedInput, system: string): Promise<void> {
+    const { ctx, identity } = this.session;
+    // The static system body is persisted once per distinct hash; each step's
+    // context record references it so the sent request stays reconstructible.
+    const systemHash = await persistSystemPrompt(ctx, system);
+    await pushContext(ctx, {
+      runId: ctx.runId,
+      trialId: identity.trialId,
+      taskId: identity.taskId,
+      mode: identity.mode,
+      step: this.index,
+      bytes: projected.bundle.bytes,
+      sentBytes: Buffer.byteLength(projected.userText),
+      included: [
+        "instruction",
+        "fixedTools",
+        "facts",
+        "memory",
+        "latest",
+        ...(projected.bundle.history === undefined ? [] : ["history"]),
+      ],
+      truncated: projected.bundle.truncated,
+      systemHash,
+      ...(ctx.config.recordContextText ? { text: projected.userText } : {}),
+    });
+  }
+
+  recordUpdate(kind: UpdateRecord["kind"], data: Record<string, unknown>): Promise<void> {
+    const { ctx, identity } = this.session;
+    return pushUpdate(ctx, {
+      runId: ctx.runId,
+      trialId: identity.trialId,
+      taskId: identity.taskId,
+      mode: identity.mode,
+      step: this.index,
+      kind,
+      ...data,
+    });
+  }
+
+  act(request: ActorRequest): Promise<ActorResponse> {
+    return this.instrumented("actor", request, () =>
+      actorProvider(this.session.providers).act(request, callOptions(this.config)),
+    );
+  }
+
+  async updateMemory(input: Parameters<typeof updateMemory>[0]): Promise<UpdateResult> {
+    const { providers } = this.session;
+    const { config } = this;
+    const jev = providers.jev && this.instrumentedJev(providers.jev);
+    const repair = providers.repair && this.instrumentedRepair(providers.repair);
+    return updateMemory(input, {
+      ...(jev ? { jev } : {}),
+      ...(repair ? { repair } : {}),
+      ...modelSettings(config),
+      maxQuestions: config.budgets.maxQuestions,
+      maxRepairCalls: config.budgets.maxRepairCalls,
+      memoryBytes: config.budgets.memoryBytes,
+      requestBytes: config.budgets.requestBytes,
+      signal: AbortSignal.timeout(config.provider.timeoutMs),
+    });
+  }
+
+  async instrumented<T extends Instrumentable>(
+    kind: CallRecord["kind"],
+    request: unknown,
+    call: () => Promise<T>,
+  ): Promise<T> {
+    const { ctx } = this.session;
+    const header = this.openHeader(kind, request);
+    await this.admit(header);
+    const started = performance.now();
+    // A start record precedes the invocation so a crash before the end record is
+    // distinguishable from "no request was made".
+    await pushCallStart(ctx, { record: "call_start", ...header });
+    try {
+      const response = await call();
+      await pushCall(ctx, this.completedCall(header, started, response));
+      return response;
+    } catch (error) {
+      if (error instanceof PersistenceError) throw error;
+      await pushCall(ctx, failedCall(header, started, error));
+      throw error;
+    }
+  }
+
+  private instrumentedJev(provider: JevProvider): JevProvider {
+    return {
+      name: provider.name,
+      choose: (request, options) =>
+        this.instrumented("jev", request, () =>
+          provider.choose(request, options ?? callOptions(this.config)),
+        ),
+    };
+  }
+
+  private instrumentedRepair(provider: RepairProvider): RepairProvider {
+    return {
+      name: provider.name,
+      repair: (request, options) =>
+        this.instrumented("repair", request, () =>
+          provider.repair(request, options ?? callOptions(this.config)),
+        ),
+    };
+  }
+
+  private openHeader(kind: CallRecord["kind"], request: unknown): Omit<CallStartRecord, "record"> {
+    const { ctx, identity } = this.session;
+    const requestBytes = Buffer.byteLength(JSON.stringify(sentRequestBody(kind, request)));
+    const hash = requestHash(kind, request);
+    return {
+      callId: `${kind}-${identity.trialId}-${this.index}-${ctx.callSeq++}`,
+      runId: ctx.runId,
+      trialId: identity.trialId,
+      taskId: identity.taskId,
+      mode: identity.mode,
+      step: this.index,
+      kind,
+      model: modelFor(kind, this.config),
+      startedAt: new Date().toISOString(),
+      requestBytes,
+      requestHash: hash,
+    };
+  }
+
+  private async admit(header: Omit<CallStartRecord, "record">): Promise<void> {
+    const { ctx } = this.session;
+    if (ctx.budget.sent >= ctx.budget.limit) await rejectUnsent(ctx, header, "not_sent");
+    const sentForTrial = ctx.trialSent.get(header.trialId) ?? 0;
+    if (sentForTrial >= this.config.provider.trialMaxRequests)
+      await rejectUnsent(ctx, header, "not_sent_trial_budget");
+    ctx.budget.sent++;
+    ctx.trialSent.set(header.trialId, sentForTrial + 1);
+  }
+
+  private completedCall(
+    header: Omit<CallStartRecord, "record">,
+    started: number,
+    response: Instrumentable,
+  ): CallRecord {
+    const { requestBytes, requestHash: hash, startedAt, ...base } = header;
+    return {
+      ...base,
+      providerInvoked: true,
+      requestBytes,
+      requestHash: hash,
+      startedAt,
+      latencyMs: response.latencyMs ?? performance.now() - started,
+      ...(response.usage ? { usage: response.usage } : {}),
+      ...(response.error ? { error: response.error } : {}),
+      ...(response.responseModel ? { responseModel: response.responseModel } : {}),
+      ...(this.config.recordResponseText && typeof response.rawText === "string"
+        ? { responseText: response.rawText }
+        : {}),
+      attempts: 1,
+    };
+  }
 }
 
 export function callOptions(config: HybridConfig): CallOptions {
   return { signal: AbortSignal.timeout(config.provider.timeoutMs) };
-}
-
-export function actorProvider(providers: ProviderSet): ActorProvider {
-  if (!providers.actor) throw new Error("actor provider is required for closed_loop");
-  return providers.actor;
 }
 
 export function fakeProviders(tasks: readonly HybridTask[]): ProviderSet {
@@ -152,26 +242,9 @@ export function fakeProviders(tasks: readonly HybridTask[]): ProviderSet {
   };
 }
 
-function instrumentedJev(provider: JevProvider, binding: ProviderBinding): JevProvider {
-  const { ctx, mode, scope } = binding;
-  return {
-    name: provider.name,
-    choose: (request, options) =>
-      instrumented(ctx, { kind: "jev", mode, request, ...scope }, () =>
-        provider.choose(request, options ?? callOptions(scope.config)),
-      ),
-  };
-}
-
-function instrumentedRepair(provider: RepairProvider, binding: ProviderBinding): RepairProvider {
-  const { ctx, mode, scope } = binding;
-  return {
-    name: provider.name,
-    repair: (request, options) =>
-      instrumented(ctx, { kind: "repair", mode, request, ...scope }, () =>
-        provider.repair(request, options ?? callOptions(scope.config)),
-      ),
-  };
+function actorProvider(providers: ProviderSet): ActorProvider {
+  if (!providers.actor) throw new Error("actor provider is required for closed_loop");
+  return providers.actor;
 }
 
 function modelSettings(config: HybridConfig): {
@@ -185,42 +258,18 @@ function modelSettings(config: HybridConfig): {
   };
 }
 
-function openAttempt(ctx: RunContext, spec: CallSpec): CallAttempt {
-  const { kind, request } = spec;
-  const requestBytes = Buffer.byteLength(JSON.stringify(sentRequestBody(kind, request)));
-  const hash = requestHash(kind, request);
-  return {
-    base: {
-      callId: `${kind}-${spec.trialId}-${spec.step}-${ctx.callSeq++}`,
-      runId: ctx.runId,
-      trialId: spec.trialId,
-      taskId: spec.taskId,
-      mode: spec.mode,
-      step: spec.step,
-      kind,
-      model: modelFor(kind, spec.config),
-    },
+async function rejectUnsent(
+  ctx: RunContext,
+  header: Omit<CallStartRecord, "record">,
+  error: string,
+): Promise<never> {
+  const { requestBytes, requestHash: hash, startedAt, ...base } = header;
+  await pushCall(ctx, {
+    ...base,
+    providerInvoked: false,
     requestBytes,
     requestHash: hash,
-  };
-}
-
-async function admit(ctx: RunContext, spec: CallSpec, attempt: CallAttempt): Promise<void> {
-  if (ctx.budget.sent >= ctx.budget.limit) await rejectUnsent(ctx, attempt, "not_sent");
-  const sentForTrial = ctx.trialSent.get(spec.trialId) ?? 0;
-  if (sentForTrial >= spec.config.provider.trialMaxRequests)
-    await rejectUnsent(ctx, attempt, "not_sent_trial_budget");
-  ctx.budget.sent++;
-  ctx.trialSent.set(spec.trialId, sentForTrial + 1);
-}
-
-async function rejectUnsent(ctx: RunContext, attempt: CallAttempt, error: string): Promise<never> {
-  await pushCall(ctx, {
-    ...attempt.base,
-    providerInvoked: false,
-    requestBytes: attempt.requestBytes,
-    requestHash: attempt.requestHash,
-    startedAt: new Date().toISOString(),
+    startedAt,
     latencyMs: null,
     error,
     attempts: 0,
@@ -228,36 +277,19 @@ async function rejectUnsent(ctx: RunContext, attempt: CallAttempt, error: string
   throw new BudgetExhausted();
 }
 
-function completedCall(
-  running: RunningCall,
-  response: Instrumentable,
-  recordResponseText: boolean,
+function failedCall(
+  header: Omit<CallStartRecord, "record">,
+  started: number,
+  error: unknown,
 ): CallRecord {
+  const { requestBytes, requestHash: hash, startedAt, ...base } = header;
   return {
-    ...running.base,
+    ...base,
     providerInvoked: true,
-    requestBytes: running.requestBytes,
-    requestHash: running.requestHash,
-    startedAt: running.startedAt,
-    latencyMs: response.latencyMs ?? performance.now() - running.started,
-    ...(response.usage ? { usage: response.usage } : {}),
-    ...(response.error ? { error: response.error } : {}),
-    ...(response.responseModel ? { responseModel: response.responseModel } : {}),
-    ...(recordResponseText && typeof response.rawText === "string"
-      ? { responseText: response.rawText }
-      : {}),
-    attempts: 1,
-  };
-}
-
-function failedCall(running: RunningCall, error: unknown): CallRecord {
-  return {
-    ...running.base,
-    providerInvoked: true,
-    requestBytes: running.requestBytes,
-    requestHash: running.requestHash,
-    startedAt: running.startedAt,
-    latencyMs: performance.now() - running.started,
+    requestBytes,
+    requestHash: hash,
+    startedAt,
+    latencyMs: performance.now() - started,
     error: error instanceof Error ? error.message : "provider_error",
     attempts: 1,
   };

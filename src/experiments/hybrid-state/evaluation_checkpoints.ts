@@ -5,19 +5,17 @@ import type {
   TaskCheckpoint,
 } from "./types.js";
 
-export interface CheckpointScoringInput {
-  readonly checkpoints: readonly TaskCheckpoint[];
-  readonly sentTexts: readonly string[];
-  readonly failureObserved: boolean;
-}
-
-export function scoreCheckpoints(outcome: CheckpointScoringInput): readonly CheckpointResult[] {
-  return outcome.checkpoints.map((checkpoint) => {
-    const step = checkpoint.at === "final" ? outcome.sentTexts.length - 1 : checkpoint.at;
+export function scoreCheckpoints(
+  checkpoints: readonly TaskCheckpoint[],
+  sentTexts: readonly string[],
+  failureObserved: boolean,
+): readonly CheckpointResult[] {
+  return checkpoints.map((checkpoint) => {
+    const step = checkpoint.at === "final" ? sentTexts.length - 1 : checkpoint.at;
     const items: CheckpointItemResult[] = checkpoint.required.map((item) => {
-      if (checkpoint.appliesWhen === "failure_observed" && !outcome.failureObserved)
+      if (checkpoint.appliesWhen === "failure_observed" && !failureObserved)
         return { id: item.id, retained: null, reason: "not_applicable" };
-      const text = outcome.sentTexts[step];
+      const text = sentTexts[step];
       if (text === undefined) return { id: item.id, retained: null, reason: "step_not_reached" };
       return evaluateRequirement(item, text);
     });
@@ -215,32 +213,20 @@ function evaluateExactValue(item: CheckpointRequirement, sentText: string): Chec
 
 const EXPERIMENT_TEST_PREFIX = "experiment test ";
 
-interface VerificationQuery {
-  readonly testId: string;
-  readonly want: string;
-  readonly fresh: boolean;
-}
-
 /** Structured verification: the latest check for the declared test id must
  * carry the required status and freshness. In state-first inputs the facts
  * section is compared field by field; in history inputs the per-test records
  * are compared by generation and sequence. */
 function evaluateVerification(item: CheckpointRequirement, sentText: string): CheckpointItemResult {
-  const query: VerificationQuery = {
-    testId: item.testId ?? "",
-    want: item.status ?? "passed",
-    fresh: item.fresh ?? true,
-  };
   const parsed = parseSentJson(sentText);
-  if (parsed && parsed.facts !== undefined)
-    return evaluateFactsVerification(item.id, query, parsed.facts);
+  if (parsed && parsed.facts !== undefined) return evaluateFactsVerification(item, parsed.facts);
   // History mode: only actual test tool results count as verification events.
   // A matching line inside an assistant explanation, a user message, or a
   // file's contents is not a check record — the evidence must be the first
   // line of a `tool_result test` message. Generation is likewise derived from
   // tool results only.
   const transcript = parsed && typeof parsed.history === "string" ? parsed.history : sentText;
-  return evaluateHistoryVerification(item.id, query, historyItems(transcript));
+  return evaluateHistoryVerification(item, historyItems(transcript));
 }
 
 interface FactsTest {
@@ -250,16 +236,19 @@ interface FactsTest {
 }
 
 function evaluateFactsVerification(
-  id: string,
-  query: VerificationQuery,
+  item: CheckpointRequirement,
   facts: unknown,
 ): CheckpointItemResult {
-  const test = lookupFactsTest(facts, query.testId);
+  const { id } = item;
+  const testId = item.testId ?? "";
+  const test = lookupFactsTest(facts, testId);
   if (!test || test.status === "not_run") return { id, retained: false, reason: "missing" };
-  if (test.command !== `${EXPERIMENT_TEST_PREFIX}${query.testId}`)
+  if (test.command !== `${EXPERIMENT_TEST_PREFIX}${testId}`)
     return { id, retained: false, reason: "wrong_test" };
-  if (test.status !== query.want) return { id, retained: false, reason: "wrong_status" };
-  if (query.fresh && test.freshness !== "current") return { id, retained: false, reason: "stale" };
+  if (test.status !== (item.status ?? "passed"))
+    return { id, retained: false, reason: "wrong_status" };
+  if ((item.fresh ?? true) && test.freshness !== "current")
+    return { id, retained: false, reason: "stale" };
   return { id, retained: true };
 }
 
@@ -284,14 +273,15 @@ interface TestRecord {
 }
 
 function evaluateHistoryVerification(
-  id: string,
-  query: VerificationQuery,
+  item: CheckpointRequirement,
   items: readonly SentItem[],
 ): CheckpointItemResult {
-  const latest = latestTestRecord(items, query.testId);
+  const { id } = item;
+  const latest = latestTestRecord(items, item.testId ?? "");
   if (!latest) return { id, retained: false, reason: "missing" };
-  if (latest.status !== query.want) return { id, retained: false, reason: "wrong_status" };
-  if (query.fresh && latest.gen < maxGeneration(items))
+  if (latest.status !== (item.status ?? "passed"))
+    return { id, retained: false, reason: "wrong_status" };
+  if ((item.fresh ?? true) && latest.gen < maxGeneration(items))
     return { id, retained: false, reason: "stale" };
   return { id, retained: true };
 }
@@ -316,7 +306,7 @@ function latestTestRecord(items: readonly SentItem[], testId: string): TestRecor
   for (const entry of toolResults(items)) {
     if (entry.toolName !== "test") continue;
     const record = parseTestRecord(testLine, entry.text);
-    if (record && isNewer(record, latest)) latest = record;
+    if (record && (!latest || isNewer(record, latest))) latest = record;
   }
   return latest;
 }
@@ -327,7 +317,6 @@ function parseTestRecord(testLine: RegExp, text: string): TestRecord | undefined
   return { status: match[1], gen: Number(match[2]), seq: Number(match[3]) };
 }
 
-function isNewer(record: TestRecord, latest: TestRecord | undefined): boolean {
-  if (!latest) return true;
+function isNewer(record: TestRecord, latest: TestRecord): boolean {
   return record.gen > latest.gen || (record.gen === latest.gen && record.seq > latest.seq);
 }

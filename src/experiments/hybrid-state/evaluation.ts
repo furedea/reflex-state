@@ -211,7 +211,7 @@ export function scoreTrial(outcome: TrialOutcome): TrialScore {
     actorTests: outcome.actorTests,
     patchStats: outcome.patchStats,
     actionForms: outcome.actionForms,
-    checkpoints: scoreCheckpoints(outcome),
+    checkpoints: scoreCheckpoints(outcome.checkpoints, outcome.sentTexts, outcome.failureObserved),
     rereads: outcome.rereads,
     retries: outcome.retries,
     appliedExtractive: outcome.appliedExtractive,

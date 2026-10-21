@@ -1,47 +1,32 @@
 import type { TaskEnvironment } from "./task_environment.js";
 import type { FinalArtifactEvaluation, HybridTask } from "./types.js";
 
-export interface FinalSubject {
-  readonly env: TaskEnvironment;
-  readonly task: HybridTask;
-  /** Why candidate code must not run at all, or null when the oracles may run. */
-  readonly blockReason: string | null;
-}
+type OracleResults = Awaited<ReturnType<TaskEnvironment["evaluateFinal"]>>;
 
 export interface FinalEvaluation {
-  readonly testResults: Record<string, "passed" | "failed" | "not_run">;
+  readonly testResults: FinalArtifactEvaluation["tests"];
   readonly finalArtifact: FinalArtifactEvaluation;
   readonly finalConstraintVerdicts: Record<string, boolean> | null;
 }
 
-export function finalBlockReason(state: {
-  readonly envFailed: boolean;
-  readonly cancelled: boolean;
-  readonly isolationUnverified: boolean;
-}): string | null {
-  if (state.envFailed) return "environment_error";
-  if (state.cancelled) return "cancelled";
-  return state.isolationUnverified ? "isolation_unverified" : null;
-}
-
 /** The final workspace is scored by the evaluator's own oracles — a
  * budget-exhausted trial still gets an independent artifact verdict, and an
- * oracles-never-ran outcome is "not_run", never counted as a failure. */
-export async function evaluateFinalArtifact(
-  subject: FinalSubject,
-  onConstraints: (verdicts: Readonly<Record<string, boolean>>) => void,
-): Promise<FinalEvaluation> {
-  const { env, task, blockReason } = subject;
+ * oracles-never-ran outcome is "not_run", never counted as a failure.
+ * `blockReason` is why candidate code must not run at all, or null when the
+ * oracles may run; a blocked trial passes no results. */
+export function evaluateFinalArtifact(
+  task: HybridTask,
+  results: OracleResults,
+  blockReason: string | null,
+): FinalEvaluation {
   const testResults: Record<string, "passed" | "failed" | "not_run"> = {};
   const finalConstraints: Record<string, boolean> = {};
   let sawFinalConstraints = false;
-  const results = blockReason ? [] : await env.evaluateFinal();
   for (const result of results) {
     testResults[result.testId] = result.status;
     if (result.constraints) {
       sawFinalConstraints = true;
       Object.assign(finalConstraints, result.constraints);
-      onConstraints(result.constraints);
     }
   }
   for (const testId of task.allowedTests)
@@ -55,7 +40,7 @@ export async function evaluateFinalArtifact(
 
 function finalArtifact(
   task: HybridTask,
-  testResults: FinalEvaluation["testResults"],
+  testResults: FinalArtifactEvaluation["tests"],
   blockReason: string | null,
 ): FinalArtifactEvaluation {
   const evaluated = Object.values(testResults).some((status) => status !== "not_run");

@@ -1,6 +1,6 @@
 import { summarize } from "./evaluation.js";
 import type { ProviderSet } from "./providers.js";
-import { fakeProviders } from "./runner_calls.js";
+import { fakeProviders, TrialSession } from "./runner_calls.js";
 import {
   BudgetExhausted,
   newRunContext,
@@ -14,9 +14,10 @@ import {
   newRunId,
   requiresIsolation,
 } from "./runner_manifest.js";
+import { TrialRig } from "./runner_rig.js";
 import { idleTrialScore } from "./runner_scoring.js";
-import { runTrial, type TrialOptions, type TrialPlan } from "./runner_trial.js";
-import type { TaskEnvironment } from "./task_environment.js";
+import { trialIdentity, TrialRunner, type TrialPlan } from "./runner_trial.js";
+import { TaskEnvironment } from "./task_environment.js";
 import type { HybridConfig, HybridTask, SkippedTrial, TaskScoring, TrialScore } from "./types.js";
 
 export { runAudit } from "./runner_audit.js";
@@ -51,55 +52,81 @@ export async function runClosedLoop(options: {
     isolated: boolean,
   ) => TaskEnvironment;
 }): Promise<ExperimentRun> {
-  const { config } = options;
-  const runId = options.runId ?? newRunId();
-  const providers = options.providers ?? fakeProviders(options.tasks);
-  const ctx = newRunContext(runId, config, options.recorder);
-  const scores: TrialScore[] = [];
-  const skipped: SkippedTrial[] = [];
-  const trials = seededOrder(planTrials(config, options.tasks, options.scoring), config.seed);
-  const run = {
-    config,
-    isolationVerified: options.isolationVerified ?? !requiresIsolation(config),
-    providers,
-    ctx,
-  };
-  for (const plan of trials) {
-    const reason = skipReason(ctx, options.signal);
-    if (reason) skipped.push(skippedTrial(plan, reason));
-    else scores.push(await runScoredTrial(plan, run, options));
-  }
-  const summary = summarize({
-    runId,
-    evaluation: "closed_loop",
-    provider: config.provider.mode,
-    modes: config.modes,
-    scores,
-    plannedTrials: trials.length,
-    skipped,
-    calls: ctx.calls,
-    contexts: ctx.contexts,
-    uniqueCandidates: ctx.uniqueCandidates,
-    decisionCounts: ctx.decisionCounts,
-    appliedCounts: ctx.appliedCounts,
-    environment: experimentEnvironment(config),
-  });
-  const inputHash = options.tasks.map((task) => JSON.stringify(task)).join("\n");
-  const manifest = await createManifest(config, {
-    input: inputHash,
-    evaluation: "closed_loop",
-    runId,
-  });
-  return { manifest, updates: ctx.updates, calls: ctx.calls, contexts: ctx.contexts, summary };
+  return new ClosedLoopRun(options).run();
 }
 
-function skipReason(
-  ctx: RunContext,
-  signal: AbortSignal | undefined,
-): SkippedTrial["reason"] | undefined {
-  if (signal?.aborted) return "cancelled";
-  if (ctx.budget.sent >= ctx.budget.limit) return "not_run_global_budget";
-  return undefined;
+class ClosedLoopRun {
+  private readonly ctx: RunContext;
+  private readonly providers: ProviderSet;
+  private readonly isolationVerified: boolean;
+
+  constructor(private readonly options: Parameters<typeof runClosedLoop>[0]) {
+    const { config } = options;
+    this.ctx = newRunContext(options.runId ?? newRunId(), config, options.recorder);
+    this.providers = options.providers ?? fakeProviders(options.tasks);
+    this.isolationVerified = options.isolationVerified ?? !requiresIsolation(config);
+  }
+
+  async run(): Promise<ExperimentRun> {
+    const { config, tasks, scoring } = this.options;
+    const { ctx } = this;
+    const scores: TrialScore[] = [];
+    const skipped: SkippedTrial[] = [];
+    const trials = seededOrder(planTrials(config, tasks, scoring), config.seed);
+    for (const plan of trials) {
+      const reason = this.skipReason();
+      if (reason) skipped.push(skippedTrial(plan, reason));
+      else scores.push(await this.runScoredTrial(plan));
+    }
+    const summary = summarize({
+      runId: ctx.runId,
+      evaluation: "closed_loop",
+      provider: config.provider.mode,
+      modes: config.modes,
+      scores,
+      plannedTrials: trials.length,
+      skipped,
+      calls: ctx.calls,
+      contexts: ctx.contexts,
+      uniqueCandidates: ctx.uniqueCandidates,
+      decisionCounts: ctx.decisionCounts,
+      appliedCounts: ctx.appliedCounts,
+      environment: experimentEnvironment(config),
+    });
+    const inputHash = tasks.map((task) => JSON.stringify(task)).join("\n");
+    const manifest = await createManifest(ctx, inputHash, "closed_loop");
+    return { manifest, updates: ctx.updates, calls: ctx.calls, contexts: ctx.contexts, summary };
+  }
+
+  private skipReason(): SkippedTrial["reason"] | undefined {
+    if (this.options.signal?.aborted) return "cancelled";
+    if (this.ctx.budget.sent >= this.ctx.budget.limit) return "not_run_global_budget";
+    return undefined;
+  }
+
+  private runScoredTrial(plan: TrialPlan): Promise<TrialScore> {
+    return this.runTrial(plan).catch((error): TrialScore => {
+      if (error instanceof BudgetExhausted) return unfinishedTrial(plan, this.options.config);
+      throw error;
+    });
+  }
+
+  private async runTrial(plan: TrialPlan): Promise<TrialScore> {
+    const rig = await TrialRig.open(this.openEnvironment(plan), plan.task.instruction);
+    const session = new TrialSession(this.ctx, this.providers, trialIdentity(plan));
+    const trial = new TrialRunner(plan, session, rig);
+    await trial.runSteps(this.options.signal);
+    return trial.score(this.isolationVerified);
+  }
+
+  private openEnvironment(plan: TrialPlan): TaskEnvironment {
+    const { task, scoring } = plan;
+    const isolated = requiresIsolation(this.options.config);
+    const { environmentFor } = this.options;
+    return environmentFor
+      ? environmentFor(task, scoring, isolated)
+      : new TaskEnvironment(task, scoring, { isolated });
+  }
 }
 
 function skippedTrial(plan: TrialPlan, reason: SkippedTrial["reason"]): SkippedTrial {
@@ -112,23 +139,8 @@ function skippedTrial(plan: TrialPlan, reason: SkippedTrial["reason"]): SkippedT
   };
 }
 
-function runScoredTrial(
-  plan: TrialPlan,
-  run: Parameters<typeof runTrial>[1],
-  options: TrialOptions,
-): Promise<TrialScore> {
-  return runTrial(plan, run, options).catch((error): TrialScore => {
-    if (error instanceof BudgetExhausted) return unfinishedTrial(plan, run.config);
-    throw error;
-  });
-}
-
 function unfinishedTrial(plan: TrialPlan, config: HybridConfig): TrialScore {
-  return idleTrialScore(
-    { trialId: plan.trialId, taskId: plan.task.id, mode: plan.mode, iteration: plan.iteration },
-    config.provider.mode,
-    { error: "request_limit" },
-  );
+  return idleTrialScore(trialIdentity(plan), config.provider.mode, { error: "request_limit" });
 }
 
 /** Deterministic trial order derived from config.seed. */

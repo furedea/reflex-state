@@ -44,9 +44,15 @@ export interface ProviderSet {
   readonly update?: UpdateProvider;
 }
 
+export interface CompletionRequest {
+  readonly system: string;
+  readonly user: string;
+  readonly model: string;
+}
+
 export interface CompletionClient {
   complete(
-    request: { readonly system: string; readonly user: string; readonly model: string },
+    request: CompletionRequest,
     options: { readonly signal: AbortSignal },
   ): Promise<{
     readonly text: string;

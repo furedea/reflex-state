@@ -14,6 +14,7 @@ import type {
   ActorProvider,
   CallOptions,
   CompletionClient,
+  CompletionRequest,
   JevProvider,
   ProviderSet,
   RepairProvider,
@@ -36,6 +37,7 @@ export type {
   ActorProvider,
   CallOptions,
   CompletionClient,
+  CompletionRequest,
   JevProvider,
   ProviderSet,
   RepairProvider,
@@ -79,10 +81,7 @@ export class PiCompletionClient implements CompletionClient {
     return model;
   }
 
-  async complete(
-    request: { readonly system: string; readonly user: string; readonly model: string },
-    options: { readonly signal: AbortSignal },
-  ) {
+  async complete(request: CompletionRequest, options: { readonly signal: AbortSignal }) {
     const model = await this.model(request.model);
     const message = await this.runtime!.complete(
       model,
@@ -197,7 +196,7 @@ export class LiveActorProvider implements ActorProvider {
     const raw = {
       rawText: response.text,
       ...(response.model ? { responseModel: response.model } : {}),
-      ...usageField(response),
+      ...usageField(response.usage),
     };
     let decoded;
     try {
@@ -254,7 +253,7 @@ export class LiveUpdateProvider implements UpdateProvider {
 
 async function completeOperations(
   client: CompletionClient,
-  request: { readonly system: string; readonly user: string; readonly model: string },
+  request: CompletionRequest,
   options: CallOptions | undefined,
 ): Promise<RepairResponse & GenerativeUpdateResponse> {
   const started = performance.now();
@@ -264,7 +263,7 @@ async function completeOperations(
   } catch (error) {
     return { latencyMs: performance.now() - started, error: errorMessage(error) };
   }
-  const usage = usageField(response);
+  const usage = usageField(response.usage);
   let operations: PatchOperation[];
   try {
     operations = decodeOperationsEnvelope(response.text);
@@ -315,8 +314,8 @@ function signalOf(options: CallOptions | undefined): AbortSignal {
   return options?.signal ?? new AbortController().signal;
 }
 
-function usageField(response: { readonly usage?: Usage }): { usage?: Usage } {
-  return response.usage ? { usage: sanitizeUsage(response.usage) } : {};
+function usageField(usage: Usage | undefined): { usage?: Usage } {
+  return usage ? { usage: sanitizeUsage(usage) } : {};
 }
 
 function jevUsage(response: unknown): Usage | undefined {

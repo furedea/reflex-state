@@ -1,14 +1,9 @@
 import { createHash } from "node:crypto";
 
 import { snapshotForRun } from "./freeze.js";
+import type { RunContext } from "./runner_context.js";
 import type { ExperimentEnvironment, ExperimentManifest, HybridConfig } from "./types.js";
 import { PROMPT_VERSION, PROTOCOL_ID, RESULT_SCHEMA_VERSION } from "./types.js";
-
-export interface ManifestSource {
-  readonly input: string;
-  readonly evaluation: "trace_audit" | "closed_loop";
-  readonly runId: string;
-}
 
 /** Oracle scripts execute workspace code, so isolation is required whenever a
  * config asks for it or when a closed_loop run uses a non-fake provider
@@ -33,18 +28,20 @@ export function experimentEnvironment(config: HybridConfig): ExperimentEnvironme
 }
 
 export async function createManifest(
-  config: HybridConfig,
-  source: ManifestSource,
+  ctx: RunContext,
+  input: string,
+  evaluation: "trace_audit" | "closed_loop",
 ): Promise<ExperimentManifest> {
+  const { config, runId } = ctx;
   const snapshot = await snapshotForRun(config);
   return {
     schemaVersion: RESULT_SCHEMA_VERSION,
     protocolId: PROTOCOL_ID,
-    runId: source.runId,
+    runId,
     status: "completed",
     head: snapshot.head,
     dirty: snapshot.dirty,
-    inputHash: createHash("sha256").update(source.input).digest("hex"),
+    inputHash: createHash("sha256").update(input).digest("hex"),
     ...(snapshot.taskSetHash ? { taskSetHash: snapshot.taskSetHash } : {}),
     promptHashes: snapshot.promptHashes,
     runtime: {
@@ -56,7 +53,7 @@ export async function createManifest(
     config,
     modes: config.modes,
     provider: config.provider.mode,
-    evaluation: source.evaluation,
+    evaluation,
     modelIds: {
       jev: config.provider.jevModel ?? null,
       actor: config.provider.actorModel ?? null,

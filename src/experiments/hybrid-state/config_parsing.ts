@@ -1,5 +1,11 @@
 import { integerField, object, unknownKeys } from "./config_parsing_fields.js";
-import type { EvaluationKind, ExperimentMode, HybridConfig, ProviderMode } from "./types.js";
+import type {
+  EvaluationKind,
+  ExperimentMode,
+  HybridConfig,
+  HybridProviderConfig,
+  ProviderMode,
+} from "./types.js";
 
 export { parseHybridTask, parseTaskScoring } from "./config_parsing_task.js";
 
@@ -81,7 +87,7 @@ export function isExperimentMode(value: unknown): value is ExperimentMode {
 }
 
 type ModelKey = "jevModel" | "actorModel" | "repairModel" | "updateModel";
-type ProviderModels = { readonly [K in ModelKey]: string | undefined };
+type ProviderModels = Pick<HybridProviderConfig, ModelKey>;
 
 function parseProvider(
   provider: Record<string, unknown>,
@@ -102,7 +108,7 @@ function parseProvider(
     throw new Error("provider.trialMaxRequests must not exceed provider.maxRequests");
   return {
     mode: providerMode as ProviderMode,
-    ...presentModels(models),
+    ...models,
     maxRequests,
     trialMaxRequests,
     timeoutMs: integerField(provider, "timeoutMs", 1),
@@ -111,19 +117,15 @@ function parseProvider(
 }
 
 function parseModels(provider: Record<string, unknown>): ProviderModels {
-  const model = (key: ModelKey) => {
+  const models: { -readonly [K in ModelKey]?: string } = {};
+  for (const key of MODEL_KEYS) {
     const value = provider[key];
-    if (value === undefined) return undefined;
+    if (value === undefined) continue;
     if (typeof value !== "string" || !value.trim())
       throw new Error(`Invalid provider.${key}: model IDs must be non-empty`);
-    return value;
-  };
-  return {
-    jevModel: model("jevModel"),
-    actorModel: model("actorModel"),
-    repairModel: model("repairModel"),
-    updateModel: model("updateModel"),
-  };
+    models[key] = value;
+  }
+  return models;
 }
 
 function requireLiveModels(
@@ -142,12 +144,6 @@ function requireLiveModels(
     !models.actorModel
   )
     throw new Error("Live audit with the llm mode requires provider.updateModel or actorModel");
-}
-
-function presentModels(models: ProviderModels): { readonly [K in ModelKey]?: string } {
-  const present: { -readonly [K in ModelKey]?: string } = {};
-  for (const key of MODEL_KEYS) if (models[key]) present[key] = models[key];
-  return present;
 }
 
 function executionIsolationField(value: unknown): { readonly executionIsolation?: "required" } {

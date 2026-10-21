@@ -244,10 +244,30 @@ function parseJsonObject(text: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-interface JsonScan {
-  depth: number;
-  inString: boolean;
-  escaped: boolean;
+class JsonObjectScanner {
+  private depth = 0;
+  private inString = false;
+  private escaped = false;
+
+  get isBalanced(): boolean {
+    return this.depth === 0;
+  }
+
+  advance(ch: string | undefined): void {
+    if (this.inString) {
+      this.advanceInString(ch);
+      return;
+    }
+    if (ch === '"') this.inString = true;
+    else if (ch === "{") this.depth++;
+    else if (ch === "}") this.depth--;
+  }
+
+  private advanceInString(ch: string | undefined): void {
+    if (this.escaped) this.escaped = false;
+    else if (ch === "\\") this.escaped = true;
+    else if (ch === '"') this.inString = false;
+  }
 }
 
 /** The first balanced `{...}` span, string-aware so braces inside strings do
@@ -256,26 +276,10 @@ interface JsonScan {
 function extractFirstJsonObject(text: string): string | null {
   const start = text.indexOf("{");
   if (start < 0) return null;
-  const scan: JsonScan = { depth: 0, inString: false, escaped: false };
+  const scanner = new JsonObjectScanner();
   for (let i = start; i < text.length; i++) {
-    advanceJsonScan(scan, text[i]);
-    if (scan.depth === 0) return text.slice(start, i + 1);
+    scanner.advance(text[i]);
+    if (scanner.isBalanced) return text.slice(start, i + 1);
   }
   return null;
-}
-
-function advanceJsonScan(scan: JsonScan, ch: string | undefined): void {
-  if (scan.inString) {
-    advanceInString(scan, ch);
-    return;
-  }
-  if (ch === '"') scan.inString = true;
-  else if (ch === "{") scan.depth++;
-  else if (ch === "}") scan.depth--;
-}
-
-function advanceInString(scan: JsonScan, ch: string | undefined): void {
-  if (scan.escaped) scan.escaped = false;
-  else if (ch === "\\") scan.escaped = true;
-  else if (ch === '"') scan.inString = false;
 }

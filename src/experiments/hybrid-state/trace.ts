@@ -85,7 +85,7 @@ export function generateCandidates(
       const truncated = Buffer.byteLength(text) > maxBytes;
       const category = classify(message);
       const candidate: Candidate = {
-        id: candidateId(message, unit, text),
+        id: candidateId(message, unit.start, unit.end),
         category,
         sourceId: message.sourceId,
         sourceIds: [message.sourceId],
@@ -115,12 +115,10 @@ export function latestGroup(history: readonly TraceMessage[], fromIndex = 0): Ob
   return { messages: history.slice(fromIndex) };
 }
 
-export function candidateId(
-  message: TraceMessage,
-  span: { readonly start: number; readonly end: number },
-  text: string,
-): string {
-  const digest = hash(`${message.id}:${span.start}:${span.end}:${text}`).slice(0, 12);
+/** The candidate text is the message text between `start` and `end`. */
+export function candidateId(message: TraceMessage, start: number, end: number): string {
+  const text = message.text.slice(start, end);
+  const digest = hash(`${message.id}:${start}:${end}:${text}`).slice(0, 12);
   return `cand-${digest}`;
 }
 
@@ -300,41 +298,49 @@ function parseAssistant(
   sequence: number,
 ): TraceMessage[] {
   if (!Array.isArray(message.content)) return [];
-  const result: TraceMessage[] = [];
-  for (const block of message.content) {
-    if (!isRecord(block)) continue;
-    const parsed = parseAssistantBlock(block, { sourceId, sequence }, result.length);
-    if (parsed) result.push(parsed);
-  }
-  return result;
+  return new AssistantContentParser(sourceId, sequence).parse(message.content);
 }
 
-function parseAssistantBlock(
-  block: Record<string, unknown>,
-  origin: { readonly sourceId: string; readonly sequence: number },
-  index: number,
-): TraceMessage | undefined {
-  const { sourceId, sequence } = origin;
-  if (block.type === "text" && typeof block.text === "string" && block.text)
+/** Parses the content blocks of one assistant entry, which all share its source and position. */
+class AssistantContentParser {
+  constructor(
+    private readonly sourceId: string,
+    private readonly sequence: number,
+  ) {}
+
+  parse(content: readonly unknown[]): TraceMessage[] {
+    const result: TraceMessage[] = [];
+    for (const block of content) {
+      if (!isRecord(block)) continue;
+      const parsed = this.parseBlock(block, result.length);
+      if (parsed) result.push(parsed);
+    }
+    return result;
+  }
+
+  private parseBlock(block: Record<string, unknown>, index: number): TraceMessage | undefined {
+    const { sourceId, sequence } = this;
+    if (block.type === "text" && typeof block.text === "string" && block.text)
+      return {
+        id: `${sourceId}:text:${index}`,
+        role: "assistant",
+        text: block.text,
+        sequence,
+        sourceId,
+        truncated: false,
+      };
+    if (block.type !== "toolCall") return undefined;
+    const args = isRecord(block.arguments) ? block.arguments : {};
     return {
-      id: `${sourceId}:text:${index}`,
-      role: "assistant",
-      text: block.text,
+      id: `${sourceId}:call:${index}`,
+      role: "tool_call",
+      text: JSON.stringify(args),
       sequence,
       sourceId,
+      ...toolFields(block.name, block.id),
       truncated: false,
     };
-  if (block.type !== "toolCall") return undefined;
-  const args = isRecord(block.arguments) ? block.arguments : {};
-  return {
-    id: `${sourceId}:call:${index}`,
-    role: "tool_call",
-    text: JSON.stringify(args),
-    sequence,
-    sourceId,
-    ...toolFields(block.name, block.id),
-    truncated: false,
-  };
+  }
 }
 
 function visibleText(value: unknown): string {

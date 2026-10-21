@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { generateCandidates, parseTraceEntries } from "./trace.js";
+import { candidateId, generateCandidates, parseTraceEntries } from "./trace.js";
 
 describe("hybrid trace", () => {
   it("keeps visible text and ignores private thinking blocks", () => {
@@ -173,5 +173,16 @@ describe("hybrid trace", () => {
       ["e3:result", "", true],
     ]);
     expect(trace.missingText).toEqual(["e2"]);
+  });
+
+  it("derives a candidate id from its message and the text between start and end", () => {
+    const trace = parseTraceEntries([
+      { id: "u", type: "message", message: { role: "user", content: "first unit\n\nsecond unit" } },
+    ]);
+    const message = trace.messages[0]!;
+    const [first, second] = generateCandidates(trace.messages);
+    expect(first!.id).toBe(candidateId(message, first!.start, first!.end));
+    expect(second!.id).toBe(candidateId(message, second!.start, second!.end));
+    expect(first!.id).not.toBe(second!.id);
   });
 });

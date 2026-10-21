@@ -4,32 +4,26 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
+import { ActiveRun } from "./cli_active_run.js";
 import { enforceLivePolicy } from "./cli_live_policy.js";
-import { parseManifest, parseSummaryForManifest, startManifest } from "./cli_manifest.js";
+import { parseManifest, parseSummaryForManifest } from "./cli_manifest.js";
 import type { CliOptions } from "./cli_options.js";
 import { providerSet } from "./cli_providers.js";
 import { recorderFor, ResultWriter } from "./cli_result_writer.js";
-import { loadScoring, loadTasks, taskInputHash, validateScoredTasks } from "./cli_tasks.js";
+import {
+  loadScoring,
+  loadTasks,
+  taskInputHash,
+  validateScoredTasks,
+  type ScoredTasks,
+} from "./cli_tasks.js";
 import { parseHybridConfig } from "./config_parsing.js";
 import { reportMarkdown, loadLabels } from "./evaluation.js";
 import { captureFreeze, verifyFreeze, type FreezeRecord } from "./freeze.js";
-import {
-  PersistenceError,
-  requiresIsolation,
-  runAudit,
-  runClosedLoop,
-  type ExperimentRun,
-} from "./runner.js";
+import { requiresIsolation, runAudit, runClosedLoop } from "./runner.js";
 import { checkIsolation } from "./task_environment.js";
 import { parseTraceEntries } from "./trace.js";
-import type {
-  EvaluationKind,
-  ExperimentManifest,
-  HybridConfig,
-  HybridTask,
-  TaskScoring,
-  TraceData,
-} from "./types.js";
+import type { EvaluationKind, HybridConfig, TraceData } from "./types.js";
 
 export { enforceLivePolicy, verifyApprovedTasks } from "./cli_live_policy.js";
 export { parseManifest } from "./cli_manifest.js";
@@ -37,21 +31,6 @@ export { recorderFor, ResultWriter } from "./cli_result_writer.js";
 export { loadScoring, loadTasks, validateScoredTasks } from "./cli_tasks.js";
 
 type Command = "audit" | "run";
-
-interface RunJob {
-  readonly config: HybridConfig;
-  readonly values: CliOptions;
-  readonly writer: ResultWriter;
-  readonly runId: string;
-  /** Registers the started manifest so a later failure can be recorded on it. */
-  readonly track: (manifest: ExperimentManifest) => void;
-}
-
-interface PreparedTasks {
-  readonly taskRoot: string;
-  readonly tasks: readonly HybridTask[];
-  readonly scoring: ReadonlyMap<string, TaskScoring>;
-}
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -84,39 +63,29 @@ async function execute(command: Command, values: CliOptions): Promise<void> {
   // Preflight completes before the output directory is reserved or any record
   // is written, so a rejected run leaves no partial result.
   await enforceLivePolicy(config, values);
-  const isolationVerified = await resolveIsolation(command, config);
+  await verifyIsolation(command, config);
   await verifyFrozenCondition(config, values.freeze);
   // Task and scoring validation belongs to preflight: a rejected run must not
   // reserve or leave a partial result directory.
   const prepared = command === "run" ? await prepareTasks(config) : undefined;
   const writer = await ResultWriter.reserve(values.out);
   const runId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  let manifest: ExperimentManifest | undefined;
-  const job: RunJob = {
-    config,
-    values,
-    writer,
-    runId,
-    track: (started) => {
-      manifest = started;
-    },
-  };
+  const run = new ActiveRun(config, writer, runId);
   try {
-    if (command === "audit") await executeAudit(job);
-    else if (prepared) await executeClosedLoop(job, prepared, isolationVerified);
+    if (command === "audit") await executeAudit(run, values);
+    else if (prepared) await executeClosedLoop(run, values, prepared);
   } catch (error) {
-    await recordFailure(writer, manifest, error);
+    await run.recordFailure(error);
     throw error;
   }
 }
 
-async function resolveIsolation(command: Command, config: HybridConfig): Promise<boolean> {
-  if (!requiresIsolation(config)) return true;
-  if (command !== "run") return false;
+/** Live closed-loop runs require a verified sandbox; audits never run the actor. */
+async function verifyIsolation(command: Command, config: HybridConfig): Promise<void> {
+  if (command !== "run" || !requiresIsolation(config)) return;
   const isolation = await checkIsolation();
   if (!isolation.available)
     throw new Error(`live_ready=false: ${isolation.detail}${failedChecks(isolation.checks)}`);
-  return true;
 }
 
 function failedChecks(checks: readonly { name: string; passed: boolean }[] | undefined): string {
@@ -137,29 +106,22 @@ async function verifyFrozenCondition(config: HybridConfig, freezePath?: string):
   if (!check.ok) throw new Error(`frozen_condition_mismatch: ${check.mismatches.join("; ")}`);
 }
 
-async function prepareTasks(config: HybridConfig): Promise<PreparedTasks> {
+async function prepareTasks(config: HybridConfig): Promise<ScoredTasks> {
   const taskRoot = config.taskRoot ?? "experiments/hybrid-state/tasks";
   const tasks = await loadTasks(taskRoot);
   const scoring = await loadScoring(taskRoot, tasks);
   validateScoredTasks(tasks, scoring);
-  return { taskRoot, tasks, scoring };
+  return { tasks, scoring };
 }
 
-async function executeAudit(job: RunJob): Promise<void> {
-  const { config, values, writer, runId } = job;
+async function executeAudit(run: ActiveRun, values: CliOptions): Promise<void> {
+  const { config, writer, runId } = run;
   const trace = await loadTrace(values);
   const labels = values.labels
     ? await loadLabels(values.labels)
     : await loadLabels("experiments/hybrid-state/labels/basic.json").catch(() => undefined);
   const providers = await providerSet(config, values);
-  const manifest = startManifest({
-    config,
-    runId,
-    evaluation: "trace_audit",
-    input: trace.sourceHash,
-  });
-  job.track(manifest);
-  await writer.writeManifest(manifest);
+  await run.start(trace.sourceHash);
   const result = await runAudit({
     config,
     trace,
@@ -168,25 +130,17 @@ async function executeAudit(job: RunJob): Promise<void> {
     runId,
     recorder: recorderFor(writer),
   });
-  await finalize(writer, manifest, result);
+  await run.finalize(result);
 }
 
 async function executeClosedLoop(
-  job: RunJob,
-  prepared: PreparedTasks,
-  isolationVerified: boolean,
+  run: ActiveRun,
+  values: CliOptions,
+  { tasks, scoring }: ScoredTasks,
 ): Promise<void> {
-  const { config, values, writer, runId } = job;
-  const { tasks, scoring } = prepared;
+  const { config, writer, runId } = run;
   const providers = await providerSet(config, values, tasks);
-  const manifest = startManifest({
-    config,
-    runId,
-    evaluation: "closed_loop",
-    input: taskInputHash(tasks),
-  });
-  job.track(manifest);
-  await writer.writeManifest(manifest);
+  await run.start(taskInputHash(tasks));
   const result = await runClosedLoop({
     config,
     tasks,
@@ -194,44 +148,9 @@ async function executeClosedLoop(
     providers,
     runId,
     recorder: recorderFor(writer),
-    isolationVerified,
+    isolationVerified: true,
   });
-  await finalize(writer, manifest, result);
-}
-
-async function recordFailure(
-  writer: ResultWriter,
-  manifest: ExperimentManifest | undefined,
-  error: unknown,
-): Promise<void> {
-  if (!manifest) return;
-  const failed: ExperimentManifest = {
-    ...manifest,
-    status: "failed",
-    finishedAt: new Date().toISOString(),
-    error: error instanceof Error ? error.message : "run_failed",
-    failedStage: error instanceof PersistenceError ? "recording" : "execution",
-  };
-  await writer.writeManifest(failed).catch(() => undefined);
-}
-
-/** Runs end with summary and report persisted before the completed manifest is
- * finalized; a persistence failure leaves status "failed", never "completed". */
-async function finalize(
-  writer: ResultWriter,
-  started: ExperimentManifest,
-  result: ExperimentRun,
-): Promise<void> {
-  await writer.writeSummary(result.summary);
-  await writer.writeReport(reportMarkdown(result.summary, result.manifest));
-  await writer.writeManifest({
-    ...result.manifest,
-    status: "completed",
-    startedAt: started.startedAt,
-    finishedAt: new Date().toISOString(),
-  });
-  console.log(`new run executed: ${result.summary.runId}`);
-  console.log(JSON.stringify(result.summary, null, 2));
+  await run.finalize(result);
 }
 
 async function report(values: Record<string, string | boolean | undefined>): Promise<void> {

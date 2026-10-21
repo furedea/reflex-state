@@ -1,6 +1,5 @@
 import { scoreTrial } from "./evaluation.js";
 import type {
-  ActorVerificationEntry,
   ExperimentMode,
   HybridConfig,
   PatchStats,
@@ -53,29 +52,6 @@ export function terminationFor(completed: boolean, error: string | undefined): T
   if (exact) return exact;
   const prefixed = PREFIX_TERMINATIONS.find(([prefix]) => error.startsWith(prefix));
   return prefixed ? prefixed[1] : "provider_error";
-}
-
-/** Per declared test: the actor's latest own run at stop time and whether the
- * workspace still matched the generation that run verified. */
-export function actorVerificationAtStop(
-  allowedTests: readonly string[],
-  actorTests: readonly ActorTestRun[],
-  finalGeneration: number,
-): Record<string, ActorVerificationEntry> {
-  const result: Record<string, ActorVerificationEntry> = {};
-  for (const testId of allowedTests) {
-    const latest = [...actorTests].reverse().find((run) => run.testId === testId);
-    if (!latest) {
-      result[testId] = { status: "not_run" };
-      continue;
-    }
-    result[testId] = {
-      status: latest.passed ? "passed" : "failed",
-      step: latest.step,
-      freshness: latest.generation === finalGeneration ? "current" : "stale",
-    };
-  }
-  return result;
 }
 
 function emptyPatchStats(): PatchStats {
