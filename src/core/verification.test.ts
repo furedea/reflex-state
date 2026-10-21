@@ -16,7 +16,7 @@ test("check keys include kind, normalized cwd, and the complete command", () => 
 test.each(["pytest tests/unit", "pnpm test", "pnpm run lint", "tsc --noEmit"])(
   "classifies a single verification command as attributable: %s",
   (command) => {
-    const result = classifyVerification(command, "/workspace", defaultConfig());
+    const result = classifyVerification({ command, cwd: "/workspace" }, defaultConfig());
     expect(result).toMatchObject({ attributable: true, compound: false });
     expect(result?.checkKey).toMatch(/^check:[a-f0-9]{64}$/);
   },
@@ -25,18 +25,23 @@ test.each(["pytest tests/unit", "pnpm test", "pnpm run lint", "tsc --noEmit"])(
 test.each(["pytest || true", "pytest; echo done", "false && pytest", "pytest | tee out.log"])(
   "does not attribute a shell compound to one verification: %s",
   (command) => {
-    expect(classifyVerification(command, "/workspace", defaultConfig())).toMatchObject({
+    expect(classifyVerification({ command, cwd: "/workspace" }, defaultConfig())).toMatchObject({
       compound: true,
       attributable: false,
       unknownReason: "compound_command",
     });
-    expect(classifyVerification(command, "/workspace", defaultConfig())?.checkKey).toBeUndefined();
+    expect(
+      classifyVerification({ command, cwd: "/workspace" }, defaultConfig())?.checkKey,
+    ).toBeUndefined();
   },
 );
 
 test("truncated commands are unknown even when the visible prefix matches", () => {
   expect(
-    classifyVerification("pytest tests/unit", "/workspace", defaultConfig(), true),
+    classifyVerification(
+      { command: "pytest tests/unit", cwd: "/workspace", truncated: true },
+      defaultConfig(),
+    ),
   ).toMatchObject({
     attributable: false,
     unknownReason: "command_truncated",
@@ -48,7 +53,10 @@ test("normalization does not change quoted whitespace", () => {
 });
 
 test("unclosed shell syntax is unknown", () => {
-  const result = classifyVerification("pytest 'unterminated", "/workspace", defaultConfig());
+  const result = classifyVerification(
+    { command: "pytest 'unterminated", cwd: "/workspace" },
+    defaultConfig(),
+  );
   expect(result).toMatchObject({ attributable: false, compound: true });
   expect(result?.checkKey).toBeUndefined();
 });

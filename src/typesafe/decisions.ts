@@ -89,11 +89,16 @@ export function describeResponse(
   for (const id of ids) {
     const answer = answers[id];
     shape["answers." + id] = valueType(answer);
-    if (!isRecord(answer)) continue;
-    for (const field of ["noul", "choice", "confidence", "probabilities"])
-      if (Object.hasOwn(answer, field))
-        shape["answers." + id + "." + field] = valueType(answer[field]);
+    if (isRecord(answer)) Object.assign(shape, describeAnswerFields(id, answer));
   }
+  return shape;
+}
+
+function describeAnswerFields(id: string, answer: Record<string, unknown>) {
+  const shape: Record<string, string> = {};
+  for (const field of ["noul", "choice", "confidence", "probabilities"])
+    if (Object.hasOwn(answer, field))
+      shape["answers." + id + "." + field] = valueType(answer[field]);
   return shape;
 }
 

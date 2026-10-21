@@ -16,59 +16,89 @@ export function extractFacts(context: ExtractionContext): DeterministicFacts {
   const { event } = context;
   const exitCode = resultExitCode(event);
   const call = relatedCall(context);
-  const observedCall = call && call.cwd ? call : call ? { ...call, cwd: context.cwd } : undefined;
-  const paths = callPaths(context);
   const fileChanges = changedPaths(context);
-  const generation = context.state.observationGeneration ?? 0;
-  const started = observedCall ? startedVerification(context, observedCall.id) : undefined;
-  const verification = verificationFact(
-    event,
-    observedCall,
-    context.config,
-    generation,
-    context.state.pendingChanges ?? [],
-    started,
-  );
+  const verification = observedVerification(context, call);
   const mutation = mutationFact(context, call, fileChanges);
   return {
     fileChanges,
-    filesRead: event.type === "tool_call" && call?.toolName === "read" ? paths : [],
+    filesRead: filesRead(event, call, callPaths(context)),
     phaseProposal: phaseProposal(event, verification),
-    deterministicallyResolved:
-      verification?.status === "passed" &&
-      verification.freshness === "current" &&
-      verification.checkKey
-        ? context.state.activeBlockers
-            .filter(
-              (blocker) =>
-                blocker.origin === "verification" && blocker.checkKey === verification.checkKey,
-            )
-            .map((blocker) => blocker.eventId)
-        : [],
-    supersededInWorkingSet: context.state.workingSet.filter((id) => {
-      const previous = context.evidence.get(id);
-      if (!previous) return false;
-      const previousContext = { ...context, event: previous };
-      if (
-        verification &&
-        event.type === "tool_result" &&
-        previous.type === "tool_result" &&
-        verificationFact(
-          previous,
-          withCwd(relatedCall(previousContext), context.cwd),
-          context.config,
-          context.state.observationGeneration ?? 0,
-          [],
-        )?.checkKey === verification.checkKey
-      )
-        return true;
-      const oldPaths = changedPaths(previousContext);
-      return oldPaths.length > 0 && oldPaths.every((path) => fileChanges.includes(path));
-    }),
+    deterministicallyResolved: resolvedBlockers(context.state, verification),
+    supersededInWorkingSet: supersededEvents(context, { verification, fileChanges }),
     ...(exitCode === undefined ? {} : { exitCode }),
     ...(verification ? { verification } : {}),
     ...(mutation ? { mutation } : {}),
   };
+}
+
+function filesRead(event: AgentEvent, call: ToolCallEvent | undefined, paths: string[]): string[] {
+  return event.type === "tool_call" && call?.toolName === "read" ? paths : [];
+}
+
+function observedVerification(context: ExtractionContext, call: ToolCallEvent | undefined) {
+  const observedCall = withCwd(call, context.cwd);
+  const started = observedCall ? startedVerification(context, observedCall.id) : undefined;
+  return verificationFact(context.event, observedCall, {
+    config: context.config,
+    generation: context.state.observationGeneration ?? 0,
+    pendingChanges: context.state.pendingChanges ?? [],
+    started,
+  });
+}
+
+function resolvedBlockers(
+  state: HotState,
+  verification: DeterministicFacts["verification"],
+): EventId[] {
+  if (verification?.status !== "passed" || verification.freshness !== "current") return [];
+  const { checkKey } = verification;
+  if (!checkKey) return [];
+  return state.activeBlockers
+    .filter((blocker) => blocker.origin === "verification" && blocker.checkKey === checkKey)
+    .map((blocker) => blocker.eventId);
+}
+
+interface CurrentObservation {
+  readonly verification: DeterministicFacts["verification"];
+  readonly fileChanges: readonly string[];
+}
+
+function supersededEvents(context: ExtractionContext, current: CurrentObservation): EventId[] {
+  return context.state.workingSet.filter((id) => {
+    const previous = context.evidence.get(id);
+    return previous !== undefined && isSuperseded(context, previous, current);
+  });
+}
+
+function isSuperseded(
+  context: ExtractionContext,
+  previous: AgentEvent,
+  current: CurrentObservation,
+): boolean {
+  const previousContext = { ...context, event: previous };
+  if (sameVerificationCheck(context, previousContext, current.verification)) return true;
+  const oldPaths = changedPaths(previousContext);
+  return oldPaths.length > 0 && oldPaths.every((path) => current.fileChanges.includes(path));
+}
+
+function sameVerificationCheck(
+  context: ExtractionContext,
+  previousContext: ExtractionContext,
+  verification: DeterministicFacts["verification"],
+): boolean {
+  const previous = previousContext.event;
+  if (!verification || context.event.type !== "tool_result" || previous.type !== "tool_result")
+    return false;
+  const previousFact = verificationFact(
+    previous,
+    withCwd(relatedCall(previousContext), context.cwd),
+    {
+      config: context.config,
+      generation: context.state.observationGeneration ?? 0,
+      pendingChanges: [],
+    },
+  );
+  return previousFact?.checkKey === verification.checkKey;
 }
 
 function withCwd(call: ToolCallEvent | undefined, cwd: string): ToolCallEvent | undefined {
@@ -83,6 +113,10 @@ function phaseProposal(
   if (verification?.status === "failed") return "debugging";
   if (verification?.status === "running") return "testing";
   if (event.type === "file_change") return "editing";
+  return toolPhase(event);
+}
+
+function toolPhase(event: AgentEvent): DeterministicFacts["phaseProposal"] {
   if (event.type !== "tool_call" && event.type !== "tool_result") return null;
   if (["read", "grep", "find", "ls"].includes(event.toolName)) return "exploring";
   if (["edit", "write"].includes(event.toolName)) return "editing";

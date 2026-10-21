@@ -22,6 +22,25 @@ export interface VerificationClassification {
   readonly unknownReason?: string;
 }
 
+export interface VerificationInput {
+  readonly command: string;
+  readonly cwd: string;
+  readonly truncated?: boolean | undefined;
+}
+
+export interface VerificationContext {
+  readonly config: ReflexStateConfig;
+  readonly generation: number;
+  readonly pendingChanges: readonly EventId[];
+  readonly started?: StartedVerification | undefined;
+}
+
+interface StartedVerification {
+  readonly eventId: EventId;
+  readonly generation: number;
+  readonly checkKey?: string;
+}
+
 const commands: Record<VerificationKind, RegExp> = {
   test: /^(pytest|vitest|jest|cargo\s+test|go\s+test|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test)(?:\s|$)/,
   build:
@@ -36,40 +55,15 @@ export function normalizeCwd(cwd: string): string {
 
 export function normalizeCommand(command: string): string {
   let result = "";
-  let quote: "'" | '"' | "" = "";
-  let escaped = false;
   let pendingSpace = false;
+  const state = initialScanState();
   for (const char of command.trim()) {
-    if (escaped) {
-      result += char;
-      escaped = false;
-      pendingSpace = false;
-      continue;
-    }
-    if (char === "\\" && quote !== "'") {
-      result += char;
-      escaped = true;
-      pendingSpace = false;
-      continue;
-    }
-    if (quote) {
-      result += char;
-      if (char === quote) quote = "";
-      pendingSpace = false;
-      continue;
-    }
-    if (char === "'" || char === '"') {
-      if (pendingSpace) result += " ";
-      result += char;
-      quote = char;
-      pendingSpace = false;
-      continue;
-    }
-    if (/\s/.test(char)) {
+    const kind = scanChar(state, char);
+    if (kind === "plain" && /\s/.test(char)) {
       pendingSpace = result.length > 0;
       continue;
     }
-    if (pendingSpace) result += " ";
+    if (pendingSpace && (kind === "plain" || kind === "open-quote")) result += " ";
     result += char;
     pendingSpace = false;
   }
@@ -82,23 +76,16 @@ export function verificationCheckKey(kind: VerificationKind, cwd: string, comman
 }
 
 export function classifyVerification(
-  command: string,
-  cwd: string,
+  input: VerificationInput,
   config: ReflexStateConfig,
-  truncated = false,
 ): VerificationClassification | undefined {
+  const { command, cwd } = input;
   const normalized = normalizeCommand(command);
   const kind = detectKind(normalized, config);
   if (!kind) return undefined;
   const shell = shellOperators(normalized);
   const compound = shell.length > 0 || hasUnclosedSyntax(normalized);
-  const unknownReason = truncated
-    ? "command_truncated"
-    : shell.length > 0
-      ? "compound_command"
-      : compound
-        ? "ambiguous_shell_syntax"
-        : undefined;
+  const unknownReason = unknownReasonFor(input.truncated ?? false, shell.length > 0, compound);
   return {
     kind,
     command,
@@ -110,47 +97,49 @@ export function classifyVerification(
   };
 }
 
+function unknownReasonFor(
+  truncated: boolean,
+  hasShellOperators: boolean,
+  compound: boolean,
+): string | undefined {
+  if (truncated) return "command_truncated";
+  if (hasShellOperators) return "compound_command";
+  return compound ? "ambiguous_shell_syntax" : undefined;
+}
+
 export function verificationFact(
   event: AgentEvent,
   call: ToolCallEvent | undefined,
-  config: ReflexStateConfig,
-  generation: number,
-  pendingChanges: readonly EventId[],
-  started?: { readonly eventId: EventId; readonly generation: number; readonly checkKey?: string },
+  context: VerificationContext,
 ): VerificationFact | undefined {
   if (!call || call.toolName !== "bash" || typeof call.input.command !== "string") return undefined;
   const classification = classifyVerification(
-    call.input.command,
-    call.cwd ?? ".",
-    config,
-    call.commandTruncated,
+    { command: call.input.command, cwd: call.cwd ?? ".", truncated: call.commandTruncated },
+    context.config,
   );
   if (!classification?.kind) return undefined;
-  const kind = classification.kind;
-  const status = statusFor(event, classification);
-  const current =
-    event.type === "tool_call"
-      ? true
-      : Boolean(
-          started &&
-          started.generation === generation &&
-          pendingChanges.every((id) => id === started.eventId),
-        );
-  const freshness: VerificationFreshness =
-    event.type === "tool_call"
-      ? "unknown"
-      : classification.attributable
-        ? current
-          ? "current"
-          : "stale"
-        : "unknown";
+  const { started } = context;
   return {
     ...classification,
-    kind,
-    status,
+    kind: classification.kind,
+    status: statusFor(event, classification),
     ...(started ? { startedEvent: started.eventId, observedGeneration: started.generation } : {}),
-    freshness,
+    freshness: freshnessFor(event, classification, context),
   };
+}
+
+function freshnessFor(
+  event: AgentEvent,
+  classification: VerificationClassification,
+  { started, generation, pendingChanges }: VerificationContext,
+): VerificationFreshness {
+  if (event.type === "tool_call" || !classification.attributable) return "unknown";
+  const current = Boolean(
+    started &&
+    started.generation === generation &&
+    pendingChanges.every((id) => id === started.eventId),
+  );
+  return current ? "current" : "stale";
 }
 
 function detectKind(command: string, config: ReflexStateConfig): VerificationKind | undefined {
@@ -177,62 +166,30 @@ function detectSingle(command: string, config: ReflexStateConfig): VerificationK
 function candidateSegments(command: string): string[] {
   const segments: string[] = [];
   let part = "";
-  let quote: "'" | '"' | "" = "";
-  let escaped = false;
+  const state = initialScanState();
   for (const char of command) {
-    if (escaped) {
+    const isSeparator = scanChar(state, char) === "plain" && ";|&<>\n".includes(char);
+    if (!isSeparator) {
       part += char;
-      escaped = false;
       continue;
     }
-    if (char === "\\" && quote !== "'") {
-      part += char;
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      part += char;
-      if (char === quote) quote = "";
-      continue;
-    }
-    if (char === "'" || char === '"') {
-      part += char;
-      quote = char;
-      continue;
-    }
-    if (";|&<>\n".includes(char)) {
-      if (part.trim()) segments.push(part.trim());
-      part = "";
-      continue;
-    }
-    part += char;
+    pushSegment(segments, part);
+    part = "";
   }
-  if (part.trim()) segments.push(part.trim());
+  pushSegment(segments, part);
   return segments;
+}
+
+function pushSegment(segments: string[], part: string): void {
+  if (part.trim()) segments.push(part.trim());
 }
 
 function shellOperators(command: string): string[] {
   const operators: string[] = [];
-  let quote: "'" | '"' | "" = "";
-  let escaped = false;
+  const state = initialScanState();
   for (let index = 0; index < command.length; index++) {
     const char = command[index] ?? "";
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\" && quote !== "'") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = "";
-      continue;
-    }
-    if (char === "'" || char === '"') {
-      quote = char;
-      continue;
-    }
+    if (scanChar(state, char) !== "plain") continue;
     if (char === "$" && command[index + 1] === "(") operators.push("substitution");
     else if (char === "`" || ";|&<>\n".includes(char)) operators.push(char);
   }
@@ -240,24 +197,40 @@ function shellOperators(command: string): string[] {
 }
 
 function hasUnclosedSyntax(command: string): boolean {
-  let quote: "'" | '"' | "" = "";
-  let escaped = false;
-  for (const char of command) {
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\" && quote !== "'") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = "";
-      continue;
-    }
-    if (char === "'" || char === '"') quote = char;
+  const state = initialScanState();
+  for (const char of command) scanChar(state, char);
+  return Boolean(state.quote || state.escaped);
+}
+
+type CharKind = "escaped" | "escape" | "quoted" | "open-quote" | "plain";
+
+interface ScanState {
+  quote: "'" | '"' | "";
+  escaped: boolean;
+}
+
+function initialScanState(): ScanState {
+  return { quote: "", escaped: false };
+}
+
+function scanChar(state: ScanState, char: string): CharKind {
+  if (state.escaped) {
+    state.escaped = false;
+    return "escaped";
   }
-  return Boolean(quote || escaped);
+  if (char === "\\" && state.quote !== "'") {
+    state.escaped = true;
+    return "escape";
+  }
+  if (state.quote) {
+    if (char === state.quote) state.quote = "";
+    return "quoted";
+  }
+  if (char === "'" || char === '"') {
+    state.quote = char;
+    return "open-quote";
+  }
+  return "plain";
 }
 
 function statusFor(

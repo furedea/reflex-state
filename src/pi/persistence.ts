@@ -8,44 +8,26 @@ interface StoredEntry {
   readonly data?: unknown;
 }
 
+interface Reconstruction {
+  state: ReturnType<typeof initialState>;
+  readonly events: Map<EventId, AgentEvent>;
+  readonly transitions: StateTransitionRecord[];
+  hasMeta: boolean;
+  legacy: boolean;
+}
+
 export function reconstruct(branch: readonly StoredEntry[]) {
-  let state = initialState();
-  const events = new Map<EventId, AgentEvent>();
-  const transitions: StateTransitionRecord[] = [];
-  let hasMeta = false;
-  let legacy = false;
+  const reconstruction: Reconstruction = {
+    state: initialState(),
+    events: new Map<EventId, AgentEvent>(),
+    transitions: [],
+    hasMeta: false,
+    legacy: false,
+  };
   for (const entry of branch) {
-    if (entry.type !== "custom") continue;
-    if (
-      entry.customType === "reflex-state.meta" &&
-      isRecord(entry.data) &&
-      entry.data.stateVersion === 2
-    )
-      hasMeta = true;
-    if (entry.customType === "reflex-state.reset") {
-      state = initialState();
-      events.clear();
-      transitions.length = 0;
-      legacy = false;
-      continue;
-    }
-    if (entry.customType !== "reflex-state.transition") continue;
-    let record;
-    try {
-      record = parseTransition(entry.data);
-    } catch (error) {
-      if (error instanceof LegacyTraceError) {
-        legacy = true;
-        continue;
-      }
-      throw error;
-    }
-    if (legacy) continue;
-    if (events.has(record.event.id)) throw new Error("Duplicate ReflexState event on branch");
-    state = record.after;
-    events.set(record.event.id, record.event);
-    transitions.push(record);
+    if (entry.type === "custom") applyEntry(reconstruction, entry);
   }
+  const { state, events, transitions, hasMeta, legacy } = reconstruction;
   return {
     state: legacy
       ? { ...initialState(), stateHealth: "legacy_state_requires_reset" as const }
@@ -55,6 +37,47 @@ export function reconstruct(branch: readonly StoredEntry[]) {
     hasMeta,
     legacy,
   };
+}
+
+function applyEntry(reconstruction: Reconstruction, entry: StoredEntry): void {
+  if (
+    entry.customType === "reflex-state.meta" &&
+    isRecord(entry.data) &&
+    entry.data.stateVersion === 2
+  )
+    reconstruction.hasMeta = true;
+  if (entry.customType === "reflex-state.reset") resetReconstruction(reconstruction);
+  else if (entry.customType === "reflex-state.transition") applyTransition(reconstruction, entry);
+}
+
+function resetReconstruction(reconstruction: Reconstruction): void {
+  reconstruction.state = initialState();
+  reconstruction.events.clear();
+  reconstruction.transitions.length = 0;
+  reconstruction.legacy = false;
+}
+
+function applyTransition(reconstruction: Reconstruction, entry: StoredEntry): void {
+  const record = parseStoredTransition(entry.data);
+  if (!record) {
+    reconstruction.legacy = true;
+    return;
+  }
+  if (reconstruction.legacy) return;
+  if (reconstruction.events.has(record.event.id))
+    throw new Error("Duplicate ReflexState event on branch");
+  reconstruction.state = record.after;
+  reconstruction.events.set(record.event.id, record.event);
+  reconstruction.transitions.push(record);
+}
+
+function parseStoredTransition(data: unknown): StateTransitionRecord | undefined {
+  try {
+    return parseTransition(data);
+  } catch (error) {
+    if (error instanceof LegacyTraceError) return undefined;
+    throw error;
+  }
 }
 
 export function highestEventOrdinal(entries: readonly StoredEntry[]): number {

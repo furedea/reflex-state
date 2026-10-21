@@ -31,15 +31,20 @@ export interface TypeSafeSystemOneClient {
   systemOne(request: SystemOneRequest, options: { signal: AbortSignal }): Promise<unknown>;
 }
 
+const FAILURE_KINDS: readonly (readonly [abstract new (...args: never[]) => Error, string])[] = [
+  [AuthenticationError, "auth_error"],
+  [APITimeoutError, "timeout"],
+  [RateLimitError, "rate_limit"],
+  [APIConnectionError, "connection_error"],
+  [BadRequestError, "bad_request"],
+  [UnprocessableEntityError, "unprocessable"],
+  [InternalServerError, "server_error"],
+  [InvalidResponseError, "invalid_response"],
+];
+
 export function failureKind(error: unknown): string {
-  if (error instanceof AuthenticationError) return "auth_error";
-  if (error instanceof APITimeoutError) return "timeout";
-  if (error instanceof RateLimitError) return "rate_limit";
-  if (error instanceof APIConnectionError) return "connection_error";
-  if (error instanceof BadRequestError) return "bad_request";
-  if (error instanceof UnprocessableEntityError) return "unprocessable";
-  if (error instanceof InternalServerError) return "server_error";
-  if (error instanceof InvalidResponseError) return "invalid_response";
+  const known = FAILURE_KINDS.find(([errorClass]) => error instanceof errorClass);
+  if (known) return known[1];
   if (error instanceof Error && /api[_ ]?key/i.test(error.message)) return "auth_error";
   if (error instanceof TypeSafeError) return "sdk_error";
   return "updater_error";

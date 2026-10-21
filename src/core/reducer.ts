@@ -8,6 +8,7 @@ import type {
   HotState,
   SemanticDecisions,
   TaskStatus,
+  VerificationFact,
   VerificationState,
 } from "./types.js";
 
@@ -202,31 +203,49 @@ function updatedVerification(
   pendingChanges: readonly EventId[],
 ): HotState["verification"] {
   const { state, event, facts } = context;
-  const next: Record<"build" | "test" | "lint", VerificationState> = {
-    build: { ...state.verification.build },
-    test: { ...state.verification.test },
-    lint: { ...state.verification.lint },
-  };
-  if (facts.mutation) {
-    for (const kind of ["build", "test", "lint"] as const)
-      if (next[kind].status !== "not_run") next[kind] = { ...next[kind], freshness: "stale" };
-  }
-  if (!facts.verification) {
-    if (event.type === "session_resume") {
-      for (const kind of ["build", "test", "lint"] as const)
-        if (next[kind].status !== "not_run") next[kind] = { ...next[kind], freshness: "stale" };
-    }
-    return next;
-  }
+  const cloned = mapVerification(state.verification, (item) => ({ ...item }));
+  const next = facts.mutation ? markStale(cloned) : cloned;
   const fact = facts.verification;
-  const current = next[fact.kind];
+  if (!fact) return event.type === "session_resume" ? markStale(next) : next;
+  const entry = verificationEntry(next[fact.kind], fact, { event, generation });
+  const staleBecausePending = event.type === "tool_result" && pendingChanges.length > 0;
+  return {
+    ...next,
+    [fact.kind]: staleBecausePending
+      ? { ...entry, freshness: fact.attributable ? "stale" : "unknown" }
+      : entry,
+  };
+}
+
+function markStale(verification: HotState["verification"]): HotState["verification"] {
+  return mapVerification(verification, (item) =>
+    item.status !== "not_run" ? { ...item, freshness: "stale" } : item,
+  );
+}
+
+function mapVerification(
+  verification: HotState["verification"],
+  map: (item: VerificationState) => VerificationState,
+): HotState["verification"] {
+  return {
+    build: map(verification.build),
+    test: map(verification.test),
+    lint: map(verification.lint),
+  };
+}
+
+function verificationEntry(
+  current: VerificationState,
+  fact: VerificationFact,
+  { event, generation }: { event: AgentEvent; generation: number },
+): VerificationState {
   const {
     checkKey: _previousCheckKey,
     startedEvent: _previousStartedEvent,
     unknownReason: _previousUnknownReason,
     ...stable
   } = current;
-  next[fact.kind] = {
+  return {
     ...stable,
     status: fact.status,
     freshness: fact.freshness ?? (fact.status === "running" ? "unknown" : "current"),
@@ -235,21 +254,16 @@ function updatedVerification(
     cwd: fact.cwd,
     ...(fact.checkKey ? { checkKey: fact.checkKey } : {}),
     ...(fact.startedEvent ? { startedEvent: fact.startedEvent } : {}),
-    ...(fact.observedGeneration !== undefined
-      ? { observedGeneration: fact.observedGeneration }
-      : event.type === "tool_call"
-        ? { observedGeneration: generation, startedEvent: event.id }
-        : {}),
+    ...observedFields(fact, event, generation),
     attributable: fact.attributable,
     ...(fact.unknownReason ? { unknownReason: fact.unknownReason } : {}),
   };
-  if (event.type === "tool_result" && pendingChanges.length > 0) {
-    next[fact.kind] = {
-      ...next[fact.kind],
-      freshness: fact.attributable ? "stale" : "unknown",
-    };
-  }
-  return next;
+}
+
+function observedFields(fact: VerificationFact, event: AgentEvent, generation: number) {
+  if (fact.observedGeneration !== undefined) return { observedGeneration: fact.observedGeneration };
+  if (event.type === "tool_call") return { observedGeneration: generation, startedEvent: event.id };
+  return {};
 }
 
 function uniqueRecent<T>(values: readonly T[], cap: number): T[] {

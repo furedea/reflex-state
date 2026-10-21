@@ -73,3 +73,29 @@ test("malformed v2 blocker and cursor data are rejected", () => {
     }),
   ).toThrow(InvalidTraceError);
 });
+
+test("parseEvent accepts each event payload shape and rejects malformed ones", () => {
+  const base = { ...callFixture() };
+  const excerpt = { head: "h", sha256: "s", truncated: false, totalChars: 1 };
+  const accepted = [
+    { ...base, type: "user_prompt", text: "hi" },
+    { ...base, type: "file_change", paths: ["a.ts"] },
+    { ...base, type: "agent_end", finalText: excerpt, stopReason: "stop" },
+    { ...base, type: "tool_result", isError: false, excerpt },
+    base,
+  ];
+  for (const event of accepted) expect(parseEvent(event)).toEqual(event);
+  const rejected = [
+    { ...base, type: "user_prompt", text: 1 },
+    { ...base, type: "file_change", paths: [1] },
+    { ...base, type: "agent_end", finalText: excerpt, stopReason: "other" },
+    { ...base, type: "tool_result", isError: false, excerpt: { ...excerpt, totalChars: -1 } },
+    { ...base, type: "tool_call", input: null },
+    { ...base, id: "X1" },
+    { ...base, source: { kind: "tool_call", timestamp: Number.NaN } },
+  ];
+  for (const event of rejected) expect(() => parseEvent(event)).toThrow(InvalidTraceError);
+  expect(() => parseEvent({ ...base, type: "constructor", toolCallId: undefined })).toThrow(
+    "Invalid tool event",
+  );
+});
