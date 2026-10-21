@@ -32,19 +32,12 @@ import type {
   TraceData,
   TraceMessage,
   TrialScore,
+  UpdateInput,
   UpdateResult,
   WorkMemory,
 } from "./types.js";
 import { emptyMemory, PROMPT_VERSION } from "./types.js";
-import {
-  applyContext,
-  applyOperations,
-  factsFromState,
-  memoryItems,
-  type updateMemory,
-} from "./update.js";
-
-type UpdateInput = Parameters<typeof updateMemory>[0];
+import { applyContext, applyOperations, factsFromState, memoryItems } from "./update.js";
 
 export async function runAudit(options: {
   readonly config: HybridConfig;
