@@ -40,7 +40,6 @@ export class PersistenceError extends Error {
 
 export interface RunContext {
   readonly runId: string;
-  readonly config: HybridConfig;
   readonly calls: CallRecord[];
   readonly contexts: ContextRecord[];
   readonly updates: UpdateRecord[];
@@ -53,6 +52,11 @@ export interface RunContext {
   readonly systemPrompts: Set<string>;
   callSeq: number;
   readonly recorder?: RunRecorder;
+}
+
+/** The run state plus the config it was created for; not part of the public API. */
+export interface ConfiguredRunContext extends RunContext {
+  readonly config: HybridConfig;
 }
 
 export interface RequestBudget {
@@ -70,7 +74,7 @@ export function newRunContext(
   runId: string,
   config: HybridConfig,
   recorder?: RunRecorder,
-): RunContext {
+): ConfiguredRunContext {
   return {
     runId,
     config,
@@ -88,22 +92,28 @@ export function newRunContext(
   };
 }
 
-export async function pushCall(ctx: RunContext, record: CallRecord): Promise<void> {
+export async function pushCall(ctx: ConfiguredRunContext, record: CallRecord): Promise<void> {
   ctx.calls.push(record);
   await writeRecord(ctx, "calls.jsonl", (recorder) => recorder.call(record));
 }
 
-export async function pushCallStart(ctx: RunContext, record: CallStartRecord): Promise<void> {
+export async function pushCallStart(
+  ctx: ConfiguredRunContext,
+  record: CallStartRecord,
+): Promise<void> {
   await writeRecord(ctx, "calls.jsonl", (recorder) => recorder.callStart(record));
 }
 
-export async function pushUpdate(ctx: RunContext, record: UpdateRecord): Promise<void> {
+export async function pushUpdate(ctx: ConfiguredRunContext, record: UpdateRecord): Promise<void> {
   ctx.updates.push(record);
   await writeRecord(ctx, "updates.jsonl", (recorder) => recorder.update(record));
 }
 
 /** Persists the static system body once per distinct hash and returns that hash. */
-export async function persistSystemPrompt(ctx: RunContext, system: string): Promise<string> {
+export async function persistSystemPrompt(
+  ctx: ConfiguredRunContext,
+  system: string,
+): Promise<string> {
   const systemHash = createHash("sha256").update(system).digest("hex");
   if (ctx.config.recordContextText && !ctx.systemPrompts.has(systemHash)) {
     ctx.systemPrompts.add(systemHash);
@@ -121,13 +131,13 @@ export async function persistSystemPrompt(ctx: RunContext, system: string): Prom
   return systemHash;
 }
 
-export async function pushContext(ctx: RunContext, record: ContextRecord): Promise<void> {
+export async function pushContext(ctx: ConfiguredRunContext, record: ContextRecord): Promise<void> {
   ctx.contexts.push(record);
   await writeRecord(ctx, "contexts.jsonl", (recorder) => recorder.context(record));
 }
 
 export function rememberCandidates(
-  ctx: RunContext,
+  ctx: ConfiguredRunContext,
   mode: ExperimentMode,
   candidates: readonly Candidate[],
 ): void {
@@ -136,12 +146,16 @@ export function rememberCandidates(
   ctx.uniqueCandidates.set(mode, set);
 }
 
-export function countDecisions(ctx: RunContext, mode: ExperimentMode, count: number): void {
+export function countDecisions(
+  ctx: ConfiguredRunContext,
+  mode: ExperimentMode,
+  count: number,
+): void {
   ctx.decisionCounts.set(mode, (ctx.decisionCounts.get(mode) ?? 0) + count);
 }
 
 export function countApplied(
-  ctx: RunContext,
+  ctx: ConfiguredRunContext,
   mode: ExperimentMode,
   applied: readonly PatchOperation[],
 ): void {
@@ -170,7 +184,7 @@ export function memoryHash(memory: WorkMemory): string {
 }
 
 async function writeRecord(
-  ctx: RunContext,
+  ctx: ConfiguredRunContext,
   file: string,
   write: (recorder: RunRecorder) => Promise<void>,
 ): Promise<void> {

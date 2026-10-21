@@ -20,7 +20,7 @@ import {
   pushCallStart,
   pushContext,
   pushUpdate,
-  type RunContext,
+  type ConfiguredRunContext,
 } from "./runner_context.js";
 import type { TrialIdentity } from "./runner_scoring.js";
 import type {
@@ -48,7 +48,7 @@ interface Instrumentable {
  * trial's identity. */
 export class TrialSession {
   constructor(
-    readonly ctx: RunContext,
+    readonly ctx: ConfiguredRunContext,
     readonly providers: ProviderSet,
     readonly identity: TrialIdentity,
   ) {}
@@ -259,7 +259,7 @@ function modelSettings(config: HybridConfig): {
 }
 
 async function rejectUnsent(
-  ctx: RunContext,
+  ctx: ConfiguredRunContext,
   header: Omit<CallStartRecord, "record">,
   error: string,
 ): Promise<never> {

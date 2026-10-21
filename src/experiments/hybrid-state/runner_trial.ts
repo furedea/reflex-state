@@ -9,7 +9,7 @@ import {
   memoryHash,
   operationView,
   rememberCandidates,
-  type RunContext,
+  type ConfiguredRunContext,
 } from "./runner_context.js";
 import { operationKey } from "./runner_exchange.js";
 import { evaluateFinalArtifact } from "./runner_final.js";
@@ -60,7 +60,7 @@ export function trialIdentity(plan: TrialPlan): TrialIdentity {
 }
 
 export class TrialRunner {
-  private readonly ctx: RunContext;
+  private readonly ctx: ConfiguredRunContext;
   private readonly config: HybridConfig;
   private readonly task: HybridTask;
   private readonly mode: ExperimentMode;

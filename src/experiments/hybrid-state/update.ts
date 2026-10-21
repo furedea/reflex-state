@@ -19,7 +19,7 @@ import { RepairCheck, requestRepair } from "./update_repair.js";
 import type { CandidateSelection } from "./update_selection.js";
 
 export type { ApplyContext, ApplyFailure, ApplySuccess } from "./update_operations.js";
-export { needsRepair } from "./update_repair.js";
+export { needsRepair, RepairCheck } from "./update_repair.js";
 export {
   applyContext,
   applyOperations,

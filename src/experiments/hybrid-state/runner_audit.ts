@@ -14,7 +14,7 @@ import {
   pushUpdate,
   rememberCandidates,
   type ExperimentRun,
-  type RunContext,
+  type ConfiguredRunContext,
   type RunRecorder,
 } from "./runner_context.js";
 import { createManifest, experimentEnvironment, newRunId } from "./runner_manifest.js";
@@ -61,7 +61,7 @@ class TraceAudit {
   };
 
   constructor(
-    readonly ctx: RunContext,
+    readonly ctx: ConfiguredRunContext,
     readonly trace: TraceData,
     readonly providers: ProviderSet,
   ) {}
@@ -341,7 +341,7 @@ class AuditTrial {
 }
 
 /** The run-level summary record has no mode; "-" stands in for it. */
-function pushAuditSummary(ctx: RunContext, data: Record<string, unknown>): Promise<void> {
+function pushAuditSummary(ctx: ConfiguredRunContext, data: Record<string, unknown>): Promise<void> {
   return pushUpdate(ctx, {
     runId: ctx.runId,
     trialId: "audit--",

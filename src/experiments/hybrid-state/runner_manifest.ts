@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { snapshotForRun } from "./freeze.js";
-import type { RunContext } from "./runner_context.js";
+import type { ConfiguredRunContext } from "./runner_context.js";
 import type { ExperimentEnvironment, ExperimentManifest, HybridConfig } from "./types.js";
 import { PROMPT_VERSION, PROTOCOL_ID, RESULT_SCHEMA_VERSION } from "./types.js";
 
@@ -28,7 +28,7 @@ export function experimentEnvironment(config: HybridConfig): ExperimentEnvironme
 }
 
 export async function createManifest(
-  ctx: RunContext,
+  ctx: ConfiguredRunContext,
   input: string,
   evaluation: "trace_audit" | "closed_loop",
 ): Promise<ExperimentManifest> {

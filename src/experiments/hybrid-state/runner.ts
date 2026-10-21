@@ -4,8 +4,8 @@ import { fakeProviders, TrialSession } from "./runner_calls.js";
 import {
   BudgetExhausted,
   newRunContext,
+  type ConfiguredRunContext,
   type ExperimentRun,
-  type RunContext,
   type RunRecorder,
 } from "./runner_context.js";
 import {
@@ -56,7 +56,7 @@ export async function runClosedLoop(options: {
 }
 
 class ClosedLoopRun {
-  private readonly ctx: RunContext;
+  private readonly ctx: ConfiguredRunContext;
   private readonly providers: ProviderSet;
   private readonly isolationVerified: boolean;
 
