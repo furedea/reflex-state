@@ -1,11 +1,5 @@
 import { integerField, object, unknownKeys } from "./config_parsing_fields.js";
-import {
-  isExperimentMode,
-  type EvaluationKind,
-  type ExperimentMode,
-  type HybridConfig,
-  type ProviderMode,
-} from "./types.js";
+import type { EvaluationKind, ExperimentMode, HybridConfig, ProviderMode } from "./types.js";
 
 export { parseHybridTask, parseTaskScoring } from "./config_parsing_task.js";
 
@@ -80,6 +74,10 @@ function parseModes(value: unknown): ExperimentMode[] {
   if (new Set(value).size !== value.length)
     throw new Error("Config modes must not contain duplicates");
   return [...(value as ExperimentMode[])];
+}
+
+export function isExperimentMode(value: unknown): value is ExperimentMode {
+  return value === "history" || value === "llm" || value === "rules" || value === "jev";
 }
 
 type ModelKey = "jevModel" | "actorModel" | "repairModel" | "updateModel";

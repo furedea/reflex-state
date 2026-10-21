@@ -5,16 +5,13 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { actorRequest, budgets, config, message, task } from "./acceptance_fixtures.js";
-import { loadHybridConfig } from "./cli.js";
-import { parseManifest } from "./cli_manifest.js";
-import { ResultWriter } from "./cli_result_writer.js";
-import { parseHybridConfig } from "./config_parsing.js";
+import { loadHybridConfig, parseManifest, ResultWriter } from "./cli.js";
 import { reportMarkdown } from "./evaluation.js";
 import { buildProjection } from "./projection.js";
 import { FakeActorProvider, InputDependentActorProvider } from "./providers.js";
 import { runClosedLoop } from "./runner.js";
 import { safePath, TaskEnvironment } from "./task_environment.js";
-import { emptyMemory } from "./types.js";
+import { emptyMemory, parseHybridConfig } from "./types.js";
 import { applyOperations, initialFacts } from "./update.js";
 
 describe("acceptance: state, environment, and evaluation", () => {

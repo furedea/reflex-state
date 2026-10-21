@@ -60,3 +60,10 @@ test("unclosed shell syntax is unknown", () => {
   expect(result).toMatchObject({ attributable: false, compound: true });
   expect(result?.checkKey).toBeUndefined();
 });
+
+test("the positional command form no longer type-checks", () => {
+  const legacyCall = () =>
+    // @ts-expect-error command and cwd are passed as one invocation object
+    classifyVerification("pytest", "/workspace", defaultConfig());
+  expect(legacyCall).toBeTypeOf("function");
+});

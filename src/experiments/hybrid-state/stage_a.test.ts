@@ -4,8 +4,13 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { enforceLivePolicy, verifyApprovedTasks } from "./cli_live_policy.js";
-import { loadScoring, loadTasks, validateScoredTasks } from "./cli_tasks.js";
+import {
+  enforceLivePolicy,
+  loadScoring,
+  loadTasks,
+  validateScoredTasks,
+  verifyApprovedTasks,
+} from "./cli.js";
 import { FakeActorProvider, FakeJevProvider, FakeRepairProvider } from "./providers.js";
 import { PersistenceError, requiresIsolation, runClosedLoop } from "./runner.js";
 import type { HybridConfig, HybridTask, TrialScore } from "./types.js";

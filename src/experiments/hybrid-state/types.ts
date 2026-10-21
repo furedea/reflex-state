@@ -3,6 +3,13 @@ import type { AgentEvent, EventId, HotState } from "../../core/types.js";
 export type * from "./types_records.js";
 export type * from "./types_results.js";
 export type * from "./types_task.js";
+// config_parsing imports only types from this module, so this adds no runtime cycle.
+export {
+  isExperimentMode,
+  parseHybridConfig,
+  parseHybridTask,
+  parseTaskScoring,
+} from "./config_parsing.js";
 
 export const HYBRID_SCHEMA_VERSION = 2 as const;
 /** Result artifacts (manifest/summary) move independently of the config
@@ -423,8 +430,4 @@ export function emptyUsage(): Usage {
     cacheReadTokens: null,
     cacheWriteTokens: null,
   };
-}
-
-export function isExperimentMode(value: unknown): value is ExperimentMode {
-  return value === "history" || value === "llm" || value === "rules" || value === "jev";
 }

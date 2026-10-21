@@ -283,14 +283,14 @@ export function ruleProposal(input: UpdateInput): {
 export function needsRepair(
   input: UpdateInput,
   operations: readonly PatchOperation[],
-  limits: { readonly memoryBytes: number; readonly context?: ApplyContext },
+  options: { readonly memoryBytes: number; readonly context?: ApplyContext },
 ): RepairReason[] {
-  const ctx = limits.context ?? applyContext(input, false);
+  const ctx = options.context ?? applyContext(input, false);
   const validation = validateOperations(input.memory, operations, ctx);
   const reasons = reasonsFromErrors(validation.errors);
   const applied = applyOperations(input.memory, validation.valid, ctx);
   if (applied.ok) {
-    if (Buffer.byteLength(renderMemoryProjection(applied.memory)) > limits.memoryBytes)
+    if (Buffer.byteLength(renderMemoryProjection(applied.memory)) > options.memoryBytes)
       reasons.push("budget_exceeded");
   } else if (!validation.errors.length) reasons.push("invalid_update");
   return [...new Set(reasons)];

@@ -31,6 +31,11 @@ import type {
   TraceData,
 } from "./types.js";
 
+export { enforceLivePolicy, verifyApprovedTasks } from "./cli_live_policy.js";
+export { parseManifest } from "./cli_manifest.js";
+export { recorderFor, ResultWriter } from "./cli_result_writer.js";
+export { loadScoring, loadTasks, validateScoredTasks } from "./cli_tasks.js";
+
 type Command = "audit" | "run";
 
 interface RunJob {

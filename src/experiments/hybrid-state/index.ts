@@ -1,4 +1,3 @@
-export * from "./config_parsing.js";
 export * from "./evaluation.js";
 export * from "./projection.js";
 export * from "./prompts.js";
