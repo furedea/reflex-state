@@ -56,42 +56,62 @@ function mergeValue(
 }
 
 function validateConfig(config: ReflexStateConfig): void {
-  for (const value of Object.values(config.thresholds)) {
-    if (!Number.isFinite(value) || value < 0 || value > 1)
-      throw new InvalidConfigError("Thresholds must be between zero and one");
-  }
-  if (config.thresholds.noulReject >= config.thresholds.noulAccept)
-    throw new InvalidConfigError("noulReject must be below noulAccept");
-  for (const [key, value] of Object.entries(config.limits)) {
-    if (!Number.isSafeInteger(value) || value < (key === "maxExcerptTailChars" ? 0 : 1))
-      throw new InvalidConfigError("Invalid limit: " + key);
-  }
-  for (const key of ["timeoutMs", "deadlineMs", "cooldownMs"] as const) {
-    if (
-      !Number.isSafeInteger(config.jev[key]) ||
-      config.jev[key] < 1 ||
-      config.jev[key] > 2_147_483_647
-    )
-      throw new InvalidConfigError("Invalid Jev duration: " + key);
-  }
-  if (!Number.isSafeInteger(config.jev.maxRetries) || config.jev.maxRetries < 0)
-    throw new InvalidConfigError("Invalid retry count");
-  if (!config.jev.model.trim()) throw new InvalidConfigError("Jev model must not be empty");
-  if (
-    !["append", "current-run"].includes(config.projection.mode) ||
-    !["last-message", "run-start"].includes(config.projection.placement)
-  )
+  validateThresholds(config.thresholds);
+  validateLimits(config.limits);
+  validateJev(config.jev);
+  if (!isSupportedProjection(config.projection))
     throw new InvalidConfigError("Unsupported projection configuration");
   if (config.shadowQuestions.some((question) => question !== "phase"))
     throw new InvalidConfigError("Unsupported shadow question");
-  for (const expressions of Object.values(config.verificationCommands)) {
-    for (const expression of expressions) {
-      try {
-        new RegExp(expression);
-      } catch {
-        throw new InvalidConfigError("Invalid verification command expression");
-      }
-    }
+  validateVerificationCommands(config.verificationCommands);
+}
+
+function validateThresholds(thresholds: ReflexStateConfig["thresholds"]): void {
+  for (const value of Object.values(thresholds)) {
+    if (!Number.isFinite(value) || value < 0 || value > 1)
+      throw new InvalidConfigError("Thresholds must be between zero and one");
+  }
+  if (thresholds.noulReject >= thresholds.noulAccept)
+    throw new InvalidConfigError("noulReject must be below noulAccept");
+}
+
+function validateLimits(limits: ReflexStateConfig["limits"]): void {
+  for (const [key, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value < (key === "maxExcerptTailChars" ? 0 : 1))
+      throw new InvalidConfigError("Invalid limit: " + key);
+  }
+}
+
+function validateJev(jev: ReflexStateConfig["jev"]): void {
+  for (const key of ["timeoutMs", "deadlineMs", "cooldownMs"] as const) {
+    if (!Number.isSafeInteger(jev[key]) || jev[key] < 1 || jev[key] > 2_147_483_647)
+      throw new InvalidConfigError("Invalid Jev duration: " + key);
+  }
+  if (!Number.isSafeInteger(jev.maxRetries) || jev.maxRetries < 0)
+    throw new InvalidConfigError("Invalid retry count");
+  if (!jev.model.trim()) throw new InvalidConfigError("Jev model must not be empty");
+}
+
+function isSupportedProjection(projection: ReflexStateConfig["projection"]): boolean {
+  return (
+    ["append", "current-run"].includes(projection.mode) &&
+    ["last-message", "run-start"].includes(projection.placement)
+  );
+}
+
+function validateVerificationCommands(commands: ReflexStateConfig["verificationCommands"]): void {
+  for (const expression of Object.values(commands).flat()) {
+    if (!isValidRegExp(expression))
+      throw new InvalidConfigError("Invalid verification command expression");
+  }
+}
+
+function isValidRegExp(expression: string): boolean {
+  try {
+    new RegExp(expression);
+    return true;
+  } catch {
+    return false;
   }
 }
 

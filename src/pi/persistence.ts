@@ -8,53 +8,72 @@ interface StoredEntry {
   readonly data?: unknown;
 }
 
-export function reconstruct(branch: readonly StoredEntry[]) {
-  let state = initialState();
-  const events = new Map<EventId, AgentEvent>();
-  const transitions: StateTransitionRecord[] = [];
-  let hasMeta = false;
-  let legacy = false;
-  for (const entry of branch) {
-    if (entry.type !== "custom") continue;
+class Reconstruction {
+  private state = initialState();
+  private readonly events = new Map<EventId, AgentEvent>();
+  private readonly transitions: StateTransitionRecord[] = [];
+  private hasMeta = false;
+  private legacy = false;
+
+  applyEntry(entry: StoredEntry): void {
     if (
       entry.customType === "reflex-state.meta" &&
       isRecord(entry.data) &&
       entry.data.stateVersion === 2
     )
-      hasMeta = true;
-    if (entry.customType === "reflex-state.reset") {
-      state = initialState();
-      events.clear();
-      transitions.length = 0;
-      legacy = false;
-      continue;
-    }
-    if (entry.customType !== "reflex-state.transition") continue;
-    let record;
-    try {
-      record = parseTransition(entry.data);
-    } catch (error) {
-      if (error instanceof LegacyTraceError) {
-        legacy = true;
-        continue;
-      }
-      throw error;
-    }
-    if (legacy) continue;
-    if (events.has(record.event.id)) throw new Error("Duplicate ReflexState event on branch");
-    state = record.after;
-    events.set(record.event.id, record.event);
-    transitions.push(record);
+      this.hasMeta = true;
+    if (entry.customType === "reflex-state.reset") this.reset();
+    else if (entry.customType === "reflex-state.transition") this.applyTransition(entry);
   }
-  return {
-    state: legacy
-      ? { ...initialState(), stateHealth: "legacy_state_requires_reset" as const }
-      : state,
-    events,
-    transitions,
-    hasMeta,
-    legacy,
-  };
+
+  result() {
+    return {
+      state: this.legacy
+        ? { ...initialState(), stateHealth: "legacy_state_requires_reset" as const }
+        : this.state,
+      events: this.events,
+      transitions: this.transitions,
+      hasMeta: this.hasMeta,
+      legacy: this.legacy,
+    };
+  }
+
+  private reset(): void {
+    this.state = initialState();
+    this.events.clear();
+    this.transitions.length = 0;
+    this.legacy = false;
+  }
+
+  private applyTransition(entry: StoredEntry): void {
+    const record = parseStoredTransition(entry.data);
+    if (!record) {
+      this.legacy = true;
+      return;
+    }
+    if (this.legacy) return;
+    if (this.events.has(record.event.id)) throw new Error("Duplicate ReflexState event on branch");
+    this.state = record.after;
+    this.events.set(record.event.id, record.event);
+    this.transitions.push(record);
+  }
+}
+
+export function reconstruct(branch: readonly StoredEntry[]) {
+  const reconstruction = new Reconstruction();
+  for (const entry of branch) {
+    if (entry.type === "custom") reconstruction.applyEntry(entry);
+  }
+  return reconstruction.result();
+}
+
+function parseStoredTransition(data: unknown): StateTransitionRecord | undefined {
+  try {
+    return parseTransition(data);
+  } catch (error) {
+    if (error instanceof LegacyTraceError) return undefined;
+    throw error;
+  }
 }
 
 export function highestEventOrdinal(entries: readonly StoredEntry[]): number {

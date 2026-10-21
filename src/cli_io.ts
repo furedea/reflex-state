@@ -17,19 +17,22 @@ export async function traceMetadata(
   path: string,
 ): Promise<{ cwd?: string; config?: ReflexStateConfig }> {
   try {
-    const value: unknown = JSON.parse(await readFile(path, "utf8"));
-    if (!isRecord(value)) throw new Error("Invalid trace metadata");
-    const result =
-      value.config === undefined ? undefined : mergeConfig(defaultConfig(), value.config);
-    for (const warning of result?.warnings ?? []) console.error(warning);
-    return {
-      ...(typeof value.cwd === "string" ? { cwd: value.cwd } : {}),
-      ...(result ? { config: result.config } : {}),
-    };
+    return parseTraceMetadata(JSON.parse(await readFile(path, "utf8")));
   } catch (error) {
     if (isRecord(error) && error.code === "ENOENT") return {};
     throw new Error("Invalid trace metadata");
   }
+}
+
+function parseTraceMetadata(value: unknown): { cwd?: string; config?: ReflexStateConfig } {
+  if (!isRecord(value)) throw new Error("Invalid trace metadata");
+  const result =
+    value.config === undefined ? undefined : mergeConfig(defaultConfig(), value.config);
+  for (const warning of result?.warnings ?? []) console.error(warning);
+  return {
+    ...(typeof value.cwd === "string" ? { cwd: value.cwd } : {}),
+    ...(result ? { config: result.config } : {}),
+  };
 }
 
 export async function writeArtifacts(

@@ -1,5 +1,11 @@
 import { defaultConfig } from "./config.js";
-import { classifyVerification, normalizeCommand, verificationCheckKey } from "./verification.js";
+import { callFixture } from "./test_fixtures.js";
+import {
+  classifyToolCall,
+  classifyVerification,
+  normalizeCommand,
+  verificationCheckKey,
+} from "./verification.js";
 
 test("check keys include kind, normalized cwd, and the complete command", () => {
   expect(verificationCheckKey("test", "/workspace", "pytest tests/unit")).toBe(
@@ -35,12 +41,10 @@ test.each(["pytest || true", "pytest; echo done", "false && pytest", "pytest | t
 );
 
 test("truncated commands are unknown even when the visible prefix matches", () => {
-  expect(
-    classifyVerification("pytest tests/unit", "/workspace", defaultConfig(), true),
-  ).toMatchObject({
-    attributable: false,
-    unknownReason: "command_truncated",
-  });
+  const call = { ...callFixture({ command: "pytest tests/unit" }), commandTruncated: true };
+  const result = classifyToolCall(call, defaultConfig());
+  expect(result).toMatchObject({ attributable: false, unknownReason: "command_truncated" });
+  expect(result?.checkKey).toBeUndefined();
 });
 
 test("normalization does not change quoted whitespace", () => {
@@ -51,4 +55,11 @@ test("unclosed shell syntax is unknown", () => {
   const result = classifyVerification("pytest 'unterminated", "/workspace", defaultConfig());
   expect(result).toMatchObject({ attributable: false, compound: true });
   expect(result?.checkKey).toBeUndefined();
+});
+
+test("truncation is not a classifyVerification argument", () => {
+  const withTruncation = () =>
+    // @ts-expect-error truncation belongs to the tool call; use classifyToolCall
+    classifyVerification("pytest", "/workspace", defaultConfig(), true);
+  expect(withTruncation).toBeTypeOf("function");
 });

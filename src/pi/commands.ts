@@ -43,99 +43,95 @@ async function handleCommand(
   session: SessionRuntime,
   ctx: ExtensionCommandContext,
 ): Promise<void> {
-  if (!args) {
-    ctx.ui.notify(renderState(session), "info");
-    return;
-  }
-  if (args === "stats") {
-    const blockers = blockerView(session.state, session.config);
-    const workingSet = workingSetView(session.state, session.config.limits.maxWorkingSetEvents);
-    ctx.ui.notify(
-      JSON.stringify(
-        {
-          ...session.metrics.snapshot(),
-          health: session.health,
-          workingSet: {
-            count: workingSet.total,
-            shown: workingSet.shownCount,
-            omitted: workingSet.omittedCount,
-            cap: session.config.limits.maxWorkingSetEvents,
-          },
-          blockers: {
-            count: blockers.unresolvedTotal,
-            shown: blockers.shownCount,
-            omitted: blockers.omittedCount,
-            cap: session.config.limits.maxProjectedBlockers,
-          },
-        },
-        missingMetric,
-        2,
-      ),
-      "info",
-    );
-    return;
-  }
-  if (args === "debug") {
-    ctx.ui.notify(
-      JSON.stringify(
-        session.history.findLast((record) => record.decisions.telemetry.questionsAsked > 0)
-          ?.decisions ?? { message: "No semantic decisions yet" },
-        null,
-        2,
-      ),
-      "info",
-    );
-    return;
-  }
+  const notify = (message: string) => ctx.ui.notify(message, "info");
+  if (!args) return notify(renderState(session));
+  if (args === "stats") return notify(statsText(session));
+  if (args === "debug") return notify(debugText(session));
   const history = /^history(?:\s+(\d+))?$/.exec(args);
-  if (history) {
-    const count = Math.min(1000, Math.max(1, Number(history[1] ?? 10)));
-    ctx.ui.notify(
-      session.history
-        .slice(-count)
-        .map(
-          (record) =>
-            record.id +
-            " " +
-            record.event.id +
-            " " +
-            record.event.type +
-            "\n" +
-            record.changes.join("\n") +
-            "\n" +
-            decisionEntries(record.decisions)
-              .map(
-                ([id, decision]) =>
-                  id + ": " + decision.gate + (decision.shadow ? " (shadow)" : ""),
-              )
-              .join(", "),
-        )
-        .join("\n\n") || "No transitions yet",
-      "info",
-    );
-    return;
-  }
-  if (args === "reset") {
-    await ctx.waitForIdle();
-    if (
-      await ctx.ui.confirm(
-        "Reset ReflexState?",
-        "The current hot state will be cleared. The original session history remains available.",
-      )
-    )
-      await session.reset();
-    return;
-  }
+  if (history) return notify(historyText(session, Number(history[1] ?? 10)));
+  if (args === "reset") return resetWithConfirmation(session, ctx);
   const toggle = /^(projection|jev)\s+(on|off)$/.exec(args);
   if (toggle) {
     await session.toggle(toggle[1] as "projection" | "jev", toggle[2] === "on");
-    ctx.ui.notify("ReflexState " + args, "info");
-    return;
+    return notify("ReflexState " + args);
   }
   ctx.ui.notify(
     "Usage: /state [history [n] | stats | debug | reset | projection on|off | jev on|off]",
     "warning",
   );
+}
+
+function statsText(session: SessionRuntime): string {
+  const blockers = blockerView(session.state, session.config);
+  const workingSet = workingSetView(session.state, session.config.limits.maxWorkingSetEvents);
+  return JSON.stringify(
+    {
+      ...session.metrics.snapshot(),
+      health: session.health,
+      workingSet: {
+        count: workingSet.total,
+        shown: workingSet.shownCount,
+        omitted: workingSet.omittedCount,
+        cap: session.config.limits.maxWorkingSetEvents,
+      },
+      blockers: {
+        count: blockers.unresolvedTotal,
+        shown: blockers.shownCount,
+        omitted: blockers.omittedCount,
+        cap: session.config.limits.maxProjectedBlockers,
+      },
+    },
+    missingMetric,
+    2,
+  );
+}
+
+function debugText(session: SessionRuntime): string {
+  return JSON.stringify(
+    session.history.findLast((record) => record.decisions.telemetry.questionsAsked > 0)
+      ?.decisions ?? { message: "No semantic decisions yet" },
+    null,
+    2,
+  );
+}
+
+function historyText(session: SessionRuntime, requestedCount: number): string {
+  const count = Math.min(1000, Math.max(1, requestedCount));
+  return (
+    session.history
+      .slice(-count)
+      .map(
+        (record) =>
+          record.id +
+          " " +
+          record.event.id +
+          " " +
+          record.event.type +
+          "\n" +
+          record.changes.join("\n") +
+          "\n" +
+          decisionEntries(record.decisions)
+            .map(
+              ([id, decision]) => id + ": " + decision.gate + (decision.shadow ? " (shadow)" : ""),
+            )
+            .join(", "),
+      )
+      .join("\n\n") || "No transitions yet"
+  );
+}
+
+async function resetWithConfirmation(
+  session: SessionRuntime,
+  ctx: ExtensionCommandContext,
+): Promise<void> {
+  await ctx.waitForIdle();
+  if (
+    await ctx.ui.confirm(
+      "Reset ReflexState?",
+      "The current hot state will be cleared. The original session history remains available.",
+    )
+  )
+    await session.reset();
 }
 
 function renderState(session: SessionRuntime): string {

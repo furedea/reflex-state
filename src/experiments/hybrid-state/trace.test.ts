@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { generateCandidates, parseTraceEntries } from "./trace.js";
+import { candidateId, generateCandidates, parseTraceEntries } from "./trace.js";
 
 describe("hybrid trace", () => {
   it("keeps visible text and ignores private thinking blocks", () => {
@@ -93,5 +93,96 @@ describe("hybrid trace", () => {
       "tool_result",
     ]);
     expect(trace.missingText).toEqual([]);
+  });
+
+  it("parses pi tool calls and results with their identifiers", () => {
+    const trace = parseTraceEntries([
+      {
+        id: "a",
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "plan" },
+            { type: "toolCall", id: "c1", name: "read", arguments: { path: "x" } },
+            { type: "toolCall", arguments: "bad" },
+          ],
+        },
+      },
+      {
+        id: "r",
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "read",
+          toolCallId: "c1",
+          isError: true,
+          content: [{ type: "text", text: "boom" }],
+        },
+      },
+    ]);
+    expect(trace.messages).toEqual([
+      {
+        id: "a:text:0",
+        role: "assistant",
+        text: "plan",
+        sequence: 0,
+        sourceId: "a",
+        truncated: false,
+      },
+      {
+        id: "a:call:1",
+        role: "tool_call",
+        text: '{"path":"x"}',
+        sequence: 1,
+        sourceId: "a",
+        toolName: "read",
+        toolCallId: "c1",
+        truncated: false,
+      },
+      {
+        id: "a:call:2",
+        role: "tool_call",
+        text: "{}",
+        sequence: 2,
+        sourceId: "a",
+        truncated: false,
+      },
+      {
+        id: "r:result",
+        role: "tool_result",
+        text: "boom",
+        sequence: 3,
+        sourceId: "r",
+        toolName: "read",
+        toolCallId: "c1",
+        isError: true,
+        truncated: false,
+      },
+    ]);
+  });
+
+  it("parses agent_end final text and records entries without text", () => {
+    const trace = parseTraceEntries([
+      { id: "e1", type: "agent_end", finalText: { head: "done", truncated: true } },
+      { id: "e2", type: "agent_end", finalText: { head: "" } },
+      { id: "e3", type: "tool_result", excerpt: { truncated: true } },
+    ]);
+    expect(trace.messages.map((message) => [message.id, message.text, message.truncated])).toEqual([
+      ["e1:text", "done", true],
+      ["e3:result", "", true],
+    ]);
+    expect(trace.missingText).toEqual(["e2"]);
+  });
+
+  it("derives a candidate id from its message and the text between start and end", () => {
+    const trace = parseTraceEntries([
+      { id: "u", type: "message", message: { role: "user", content: "first unit\n\nsecond unit" } },
+    ]);
+    const message = trace.messages[0]!;
+    const [first, second] = generateCandidates(trace.messages);
+    expect(first!.id).toBe(candidateId(message, first!.start, first!.end));
+    expect(second!.id).toBe(candidateId(message, second!.start, second!.end));
+    expect(first!.id).not.toBe(second!.id);
   });
 });

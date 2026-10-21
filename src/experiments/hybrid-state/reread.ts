@@ -93,60 +93,61 @@ export function analyzeRereads(
   steps: readonly RereadStepView[],
   reads: readonly ReadObservation[],
 ): RereadCase[] {
-  const firstRead = new Map<string, number>();
-  const lastContent = new Map<string, string>();
-  for (const observation of reads) {
-    if (!firstRead.has(observation.path)) firstRead.set(observation.path, observation.step);
-    lastContent.set(observation.path, observation.content);
+  return new RereadAnalysis(trialId, steps, reads).cases();
+}
+
+function rereadPath(stepView: RereadStepView): string | undefined {
+  const action = stepView.action;
+  if (!action || action.tool !== "read") return undefined;
+  return action.path;
+}
+
+/** The re-reads of one trial, judged against the steps and reads it recorded. */
+class RereadAnalysis {
+  private readonly firstReads = new Map<string, ReadObservation>();
+
+  constructor(
+    private readonly trialId: string,
+    private readonly steps: readonly RereadStepView[],
+    private readonly reads: readonly ReadObservation[],
+  ) {
+    for (const observation of reads)
+      if (!this.firstReads.has(observation.path))
+        this.firstReads.set(observation.path, observation);
   }
-  const cases: RereadCase[] = [];
-  const seen = new Set<string>();
-  for (const stepView of steps) {
-    const action = stepView.action;
-    if (!action || action.tool !== "read" || action.path === undefined) continue;
-    const path = action.path;
-    const earlier = firstRead.get(path);
-    if (earlier === undefined || earlier === stepView.step) {
-      seen.add(path);
-      continue;
+
+  cases(): RereadCase[] {
+    const cases: RereadCase[] = [];
+    for (const stepView of this.steps) {
+      const path = rereadPath(stepView);
+      if (path === undefined) continue;
+      const firstRead = this.firstReads.get(path);
+      if (firstRead === undefined || firstRead.step === stepView.step) continue;
+      cases.push(this.buildCase(stepView, firstRead));
     }
+    return cases;
+  }
+
+  private buildCase(stepView: RereadStepView, firstRead: ReadObservation): RereadCase {
+    const { trialId, steps, reads } = this;
+    const { path, step: earlier } = firstRead;
     const scope = evidenceScope(stepView);
     const inputs = inputTexts(stepView);
     const priorContent = contentBefore(reads, path, stepView.step);
-    const changed = changedBetween(steps, path, earlier, stepView.step);
-    const verbatim =
-      scope === "unavailable" || priorContent === null
-        ? null
-        : contentVisible(inputs, priorContent);
-    const markersFound =
-      scope === "unavailable" || priorContent === null
-        ? []
-        : extractMarkers(priorContent).filter((marker) =>
-            inputs.some((input) => contains(input, marker)),
-          );
-    const required =
-      scope === "unavailable" || stepView.requiredDetails === undefined
-        ? null
-        : {
-            present: stepView.requiredDetails.filter((detail) =>
-              inputs.some((input) => contains(input, detail)),
-            ),
-            missing: stepView.requiredDetails.filter(
-              (detail) => !inputs.some((input) => contains(input, detail)),
-            ),
-          };
-    const necessity =
-      required === null ? "undetermined" : required.missing.length ? "missing" : "sufficient";
+    const changed = changedBetween(steps, firstRead, stepView);
+    const usable = scope !== "unavailable" && priorContent !== null;
+    const verbatim = usable ? contentVisible(inputs, priorContent) : null;
+    const markersFound = usable
+      ? extractMarkers(priorContent).filter((marker) =>
+          inputs.some((input) => contains(input, marker)),
+        )
+      : [];
+    const required = requiredCheck(scope, stepView.requiredDetails, inputs);
     const droppedBefore = steps.some(
       (candidate) => candidate.step < stepView.step && (candidate.droppedReasons?.length ?? 0) > 0,
     );
-    const tested = stepView.testsPassedBefore?.length
-      ? true
-      : steps.some(
-          (candidate) =>
-            candidate.step < stepView.step && (candidate.testsPassedBefore?.length ?? 0) > 0,
-        );
-    cases.push({
+    const tested = testedBefore(steps, stepView);
+    return {
       trialId,
       step: stepView.step,
       path,
@@ -156,14 +157,38 @@ export function analyzeRereads(
       verbatimPresent: verbatim,
       markersFound,
       required,
-      necessity,
+      necessity: necessityOf(required),
       patchDroppedBefore: droppedBefore,
       testsPassedBefore: tested,
       tags: classify({ changed, verbatim, markersFound, required, scope, droppedBefore, tested }),
       basis: basisFor({ changed, verbatim, required, scope, droppedBefore }),
-    });
+    };
   }
-  return cases;
+}
+
+function requiredCheck(
+  scope: EvidenceScope,
+  requiredDetails: readonly string[] | undefined,
+  inputs: readonly string[],
+): RereadCase["required"] {
+  if (scope === "unavailable" || requiredDetails === undefined) return null;
+  const isPresent = (detail: string) => inputs.some((input) => contains(input, detail));
+  return {
+    present: requiredDetails.filter(isPresent),
+    missing: requiredDetails.filter((detail) => !isPresent(detail)),
+  };
+}
+
+function necessityOf(required: RereadCase["required"]): RereadCase["necessity"] {
+  if (required === null) return "undetermined";
+  return required.missing.length ? "missing" : "sufficient";
+}
+
+function testedBefore(steps: readonly RereadStepView[], stepView: RereadStepView): boolean {
+  if (stepView.testsPassedBefore?.length) return true;
+  return steps.some(
+    (candidate) => candidate.step < stepView.step && (candidate.testsPassedBefore?.length ?? 0) > 0,
+  );
 }
 
 function evidenceScope(step: RereadStepView): EvidenceScope {
@@ -189,10 +214,11 @@ function contentBefore(
  * content stale, so the re-read is legitimate verification. */
 function changedBetween(
   steps: readonly RereadStepView[],
-  path: string,
-  from: number,
-  to: number,
+  earlierRead: ReadObservation,
+  reread: RereadStepView,
 ): boolean | null {
+  const { path, step: from } = earlierRead;
+  const to = reread.step;
   let missing = false;
   for (const candidate of steps) {
     if (candidate.step <= from || candidate.step >= to) continue;
@@ -253,26 +279,44 @@ function classify(flags: {
 }): RereadTag[] {
   const tags: RereadTag[] = [];
   if (flags.changed === true) tags.push("stale_or_conflicting");
-  if (flags.scope === "unavailable") tags.push("unknown");
-  else if (flags.required && flags.required.missing.length)
-    // Named details the planned work needed were absent from the recorded
-    // input — the only case that earns "necessary_detail_missing".
-    tags.push("necessary_detail_missing");
-  else if (flags.verbatim === false) {
-    if (flags.required && !flags.required.missing.length)
-      // Every named requirement was present although the original text was
-      // not — the re-read was not caused by missing required detail.
-      tags.push("visible_information_rechecked");
-    else if (flags.markersFound.length === 0)
-      // Nothing derived from the file reached the input at all; whether the
-      // planned work needed it stays undetermined without named requirements.
-      tags.push("not_saved", ...(flags.required === null ? ["unknown" as RereadTag] : []));
-    else tags.push("unknown");
-  } else if (flags.verbatim === true && flags.changed !== true)
-    tags.push("visible_information_rechecked");
+  tags.push(
+    ...(requirementTags(flags.scope, flags.required) ??
+      (flags.verbatim === false
+        ? unseenContentTags(flags.required, flags.markersFound)
+        : recheckedTags(flags.verbatim, flags.changed))),
+  );
   if (flags.tested) tags.push("termination_overrun");
   if (!tags.length) tags.push("unknown");
   return [...new Set(tags)];
+}
+
+/** Tags decided before the content itself matters; undefined when it still does. */
+function requirementTags(
+  scope: EvidenceScope,
+  required: RereadCase["required"],
+): RereadTag[] | undefined {
+  if (scope === "unavailable") return ["unknown"];
+  // Named details the planned work needed were absent from the recorded
+  // input — the only case that earns "necessary_detail_missing".
+  if (required && required.missing.length) return ["necessary_detail_missing"];
+  return undefined;
+}
+
+function unseenContentTags(
+  required: RereadCase["required"],
+  markersFound: readonly string[],
+): RereadTag[] {
+  // Every named requirement was present although the original text was
+  // not — the re-read was not caused by missing required detail.
+  if (required) return ["visible_information_rechecked"];
+  // Nothing derived from the file reached the input at all; whether the
+  // planned work needed it stays undetermined without named requirements.
+  if (markersFound.length === 0) return ["not_saved", "unknown"];
+  return ["unknown"];
+}
+
+function recheckedTags(verbatim: boolean | null, changed: boolean | null): RereadTag[] {
+  return verbatim === true && changed !== true ? ["visible_information_rechecked"] : [];
 }
 
 function basisFor(flags: {

@@ -7,69 +7,75 @@ import type { StateBlockContext } from "./state_block.js";
 
 type Message = ContextEvent["messages"][number];
 
+type ProjectionMode = NonNullable<ProjectionMeasurement["mode"]>;
+
+interface Fallback {
+  readonly reason: string;
+  readonly mode: ProjectionMode;
+}
+
+interface PlacementTarget {
+  readonly index: number;
+  readonly message: Message;
+}
+
+type ProjectionPlan =
+  | { readonly retained: Message[]; readonly target: PlacementTarget }
+  | { readonly fallback: Fallback };
+
+interface Projection {
+  messages: Message[];
+  measurement: ProjectionMeasurement;
+}
+
 export function projectContext(
   messages: Message[],
   context: StateBlockContext & { compacting?: boolean },
-) {
-  if (!context.config.enabled || !context.config.projection.enabled)
-    return projectionResult(messages, messages, "disabled", "disabled");
-  if (context.state.stateHealth && context.state.stateHealth !== "valid")
-    return projectionResult(
-      messages,
-      messages,
-      context.state.stateHealth,
-      context.config.projection.mode,
-    );
-  if (context.compacting) return projectionResult(messages, messages, "compacting", "disabled");
+): Projection {
+  const preflight = preflightFallback(context);
+  if (preflight) return fallbackResult(messages, preflight);
+  const plan = planProjection(messages, context);
+  if ("fallback" in plan) return fallbackResult(messages, plan.fallback);
+  const { retained, target } = plan;
+  const mode = context.config.projection.mode;
+  const block = stateBlock({
+    ...context,
+    projectionMode: mode,
+    messagesOmitted: messages.length - retained.length,
+  });
+  if (!block) return fallbackResult(messages, { reason: "state_block_budget", mode });
+  const projected = addBlock(retained, target, block);
+  return {
+    messages: projected,
+    measurement: { ...measureProjection(messages, projected, mode), stateBlockChars: block.length },
+  };
+}
+
+function preflightFallback(
+  context: StateBlockContext & { compacting?: boolean },
+): Fallback | undefined {
+  const { config, state } = context;
+  if (!config.enabled || !config.projection.enabled)
+    return { reason: "disabled", mode: "disabled" };
+  if (state.stateHealth && state.stateHealth !== "valid")
+    return { reason: state.stateHealth, mode: config.projection.mode };
+  if (context.compacting) return { reason: "compacting", mode: "disabled" };
+  return undefined;
+}
+
+function planProjection(messages: Message[], context: StateBlockContext): ProjectionPlan {
+  const mode = context.config.projection.mode;
   const runs = splitRuns(messages);
   const current = runs.at(-1);
   if (!current || !containsGoal(current.messages, context))
-    return projectionResult(
-      messages,
-      messages,
-      "missing_user_prompt",
-      context.config.projection.mode,
-    );
+    return { fallback: { reason: "missing_user_prompt", mode } };
   if (!completeExchanges(current.messages))
-    return projectionResult(
-      messages,
-      messages,
-      "incomplete_exchange",
-      context.config.projection.mode,
-    );
-  const retained =
-    context.config.projection.mode === "append"
-      ? messages
-      : retainRecentRuns(messages, runs, context);
-  if (!retained) return projectionResult(messages, messages, "unsafe_boundary", "current-run");
+    return { fallback: { reason: "incomplete_exchange", mode } };
+  const retained = mode === "append" ? messages : retainRecentRuns(messages, runs, context);
+  if (!retained) return { fallback: { reason: "unsafe_boundary", mode: "current-run" } };
   const target = placementTarget(retained, current, context);
-  if (!target)
-    return projectionResult(
-      messages,
-      messages,
-      "unsupported_placement",
-      context.config.projection.mode,
-    );
-  const block = stateBlock({
-    ...context,
-    projectionMode: context.config.projection.mode,
-    messagesOmitted: messages.length - retained.length,
-  });
-  if (!block)
-    return projectionResult(
-      messages,
-      messages,
-      "state_block_budget",
-      context.config.projection.mode,
-    );
-  const projected = addBlock(retained, target, block);
-  return projectionResult(
-    messages,
-    projected,
-    undefined,
-    context.config.projection.mode,
-    block.length,
-  );
+  if (!target) return { fallback: { reason: "unsupported_placement", mode } };
+  return { retained, target };
 }
 
 interface Run {
@@ -104,14 +110,18 @@ function retainRecentRuns(
   const first = runs.at(-2);
   const last = runs.at(-1);
   if (!first || !last) return undefined;
-  if (runs[0]?.start !== 0) return undefined;
-  const omitted = messages.slice(0, first.start);
-  if (omitted.some((message) => !isSafeToOmit(message))) return undefined;
-  if (runs.slice(0, -2).some((run) => !completeExchanges(run.messages))) return undefined;
+  if (!hasSafeOmittedPrefix(messages, runs, first)) return undefined;
   if (messages.slice(last.end).length > 0) return undefined;
-  if (!completeExchanges(first.messages) || !completeExchanges(last.messages)) return undefined;
-  if (!containsGoal(last.messages, context)) return undefined;
-  return messages.slice(first.start, last.end);
+  if (![first, last].every((run) => completeExchanges(run.messages))) return undefined;
+  return containsGoal(last.messages, context) ? messages.slice(first.start, last.end) : undefined;
+}
+
+function hasSafeOmittedPrefix(messages: Message[], runs: readonly Run[], first: Run): boolean {
+  return (
+    runs[0]?.start === 0 &&
+    messages.slice(0, first.start).every(isSafeToOmit) &&
+    runs.slice(0, -2).every((run) => completeExchanges(run.messages))
+  );
 }
 
 function isSafeToOmit(message: Message): boolean {
@@ -122,12 +132,7 @@ function placementTarget(
   retained: Message[],
   current: Run,
   context: StateBlockContext,
-):
-  | {
-      readonly index: number;
-      readonly message: Message;
-    }
-  | undefined {
+): PlacementTarget | undefined {
   const first = current.messages.find((message) => message.role === "user");
   const last = current.messages.at(-1);
   const index =
@@ -188,41 +193,54 @@ function completeExchanges(messages: readonly Message[]): boolean {
   const pending = new Map<string, string>();
   const seen = new Set<string>();
   for (const message of messages) {
-    if (message.role === "assistant") {
-      if (pending.size) return false;
-      for (const block of message.content) {
-        if (block.type !== "toolCall") continue;
-        if (seen.has(block.id)) return false;
-        seen.add(block.id);
-        pending.set(block.id, block.name);
-      }
-    }
-    if (message.role === "toolResult") {
-      if (pending.get(message.toolCallId) !== message.toolName) return false;
-      pending.delete(message.toolCallId);
-    }
+    if (message.role === "assistant" && !openToolCalls(message, pending, seen)) return false;
+    if (message.role === "toolResult" && !closeToolCall(message, pending)) return false;
   }
   return pending.size === 0;
 }
 
-function projectionResult(
-  before: Message[],
-  messages: Message[],
-  fallback?: string,
-  mode: ProjectionMeasurement["mode"] = "current-run",
-  stateBlockChars?: number,
-): { messages: Message[]; measurement: ProjectionMeasurement } {
+function openToolCalls(
+  message: Extract<Message, { role: "assistant" }>,
+  pending: Map<string, string>,
+  seen: Set<string>,
+): boolean {
+  if (pending.size) return false;
+  for (const block of message.content) {
+    if (block.type !== "toolCall") continue;
+    if (seen.has(block.id)) return false;
+    seen.add(block.id);
+    pending.set(block.id, block.name);
+  }
+  return true;
+}
+
+function closeToolCall(
+  message: Extract<Message, { role: "toolResult" }>,
+  pending: Map<string, string>,
+): boolean {
+  if (pending.get(message.toolCallId) !== message.toolName) return false;
+  pending.delete(message.toolCallId);
+  return true;
+}
+
+function fallbackResult(messages: Message[], { reason, mode }: Fallback): Projection {
   return {
     messages,
-    measurement: {
-      mode,
-      messagesBefore: before.length,
-      messagesAfter: messages.length,
-      messagesOmitted: before.length - messages.length,
-      charsBefore: JSON.stringify(before).length,
-      charsAfter: JSON.stringify(messages).length,
-      ...(stateBlockChars === undefined ? {} : { stateBlockChars }),
-      ...(fallback ? { fallback } : {}),
-    },
+    measurement: { ...measureProjection(messages, messages, mode), fallback: reason },
+  };
+}
+
+function measureProjection(
+  before: Message[],
+  messages: Message[],
+  mode: ProjectionMode,
+): ProjectionMeasurement {
+  return {
+    mode,
+    messagesBefore: before.length,
+    messagesAfter: messages.length,
+    messagesOmitted: before.length - messages.length,
+    charsBefore: JSON.stringify(before).length,
+    charsAfter: JSON.stringify(messages).length,
   };
 }

@@ -4,6 +4,7 @@ export { StateEngine } from "./core/engine.js";
 export { extractFacts } from "./core/extraction.js";
 export type { ExtractionContext } from "./core/extraction.js";
 export {
+  classifyToolCall,
   classifyVerification,
   normalizeCommand,
   normalizeCwd,

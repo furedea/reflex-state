@@ -13,7 +13,7 @@ import {
 } from "./cli.js";
 import { FakeActorProvider, FakeJevProvider, FakeRepairProvider } from "./providers.js";
 import { PersistenceError, requiresIsolation, runClosedLoop } from "./runner.js";
-import type { HybridConfig, HybridTask } from "./types.js";
+import type { HybridConfig, HybridTask, TrialScore } from "./types.js";
 
 const STAGE_A_ROOT = "experiments/hybrid-state/tasks/stage-a";
 
@@ -138,17 +138,9 @@ describe("Stage A closed loop", () => {
       expect(calc.map((test) => test.passed)).toEqual([false, true]);
       const syntax = trial.actorTests.filter((test) => test.testId === "syntax-check");
       expect(syntax.map((test) => test.passed)).toEqual([true]);
-      const decoy = trial.checkpoints
-        .find((checkpoint) => checkpoint.checkpointId === "decoy-pass-visible")
-        ?.items.find((item) => item.id === "syntax-check-passed");
-      expect(decoy?.retained, `${trial.mode} ${decoy?.reason ?? ""}`).toBe(true);
-      const recovered = trial.checkpoints.find(
-        (checkpoint) => checkpoint.checkpointId === "recovered-check-retained",
-      );
-      const verification = recovered?.items.find((item) => item.id === "calc-check-recovered");
-      expect(verification?.retained, `${trial.mode} ${verification?.reason ?? ""}`).toBe(true);
-      const failure = recovered?.items.find((item) => item.id === "transient-failure");
-      expect(failure?.retained, `${trial.mode} ${failure?.reason ?? ""}`).toBe(true);
+      expectRetained(trial, "decoy-pass-visible", "syntax-check-passed");
+      expectRetained(trial, "recovered-check-retained", "calc-check-recovered");
+      expectRetained(trial, "recovered-check-retained", "transient-failure");
     }
   }, 60_000);
 
@@ -166,6 +158,26 @@ describe("Stage A closed loop", () => {
     }
   }, 60_000);
 });
+
+function expectRetained(trial: TrialScore, checkpointId: string, itemId: string): void {
+  const item = trial.checkpoints
+    .find((checkpoint) => checkpoint.checkpointId === checkpointId)
+    ?.items.find((entry) => entry.id === itemId);
+  expect(item?.retained, `${trial.mode} ${item?.reason ?? ""}`).toBe(true);
+}
+
+async function hashJsonFiles(root: string, directory: string): Promise<Record<string, string>> {
+  const { createHash } = await import("node:crypto");
+  const { readFile, readdir } = await import("node:fs/promises");
+  const hashes: Record<string, string> = {};
+  const names = (await readdir(join(root, directory))).filter((entry) => entry.endsWith(".json"));
+  for (const name of names) {
+    const relative = join(directory, name);
+    const content = await readFile(join(root, relative), "utf8");
+    hashes[relative] = createHash("sha256").update(content).digest("hex");
+  }
+  return hashes;
+}
 
 describe("live gating", () => {
   const liveConfig = (overrides: Partial<HybridConfig> = {}): HybridConfig =>
@@ -192,21 +204,14 @@ describe("live gating", () => {
   });
 
   it("rejects tampered, missing, and extra task files by content hash", async () => {
-    const { createHash } = await import("node:crypto");
-    const { readFile, readdir } = await import("node:fs/promises");
     const dir = await mkdtemp(join(tmpdir(), "stage-a-tampered-"));
     try {
       const root = join(dir, "tasks");
       await cp(STAGE_A_ROOT, root, { recursive: true });
-      const files: Record<string, string> = {};
-      const hash = async (name: string) =>
-        createHash("sha256")
-          .update(await readFile(join(root, name), "utf8"))
-          .digest("hex");
-      for (const entry of await readdir(root))
-        if (entry.endsWith(".json")) files[entry] = await hash(entry);
-      for (const entry of await readdir(join(root, "scoring")))
-        if (entry.endsWith(".json")) files[`scoring/${entry}`] = await hash(`scoring/${entry}`);
+      const files = {
+        ...(await hashJsonFiles(root, ".")),
+        ...(await hashJsonFiles(root, "scoring")),
+      };
       const manifestPath = join(dir, "manifest.json");
       const writeManifest = async (filesMap: Record<string, string>) =>
         writeFile(manifestPath, JSON.stringify({ taskRoot: root, files: filesMap }));
