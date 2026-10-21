@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
+import { parseHybridConfig, parseHybridTask, parseTaskScoring } from "./config_parsing.js";
 import { reportMarkdown, loadLabels } from "./evaluation.js";
 import { captureFreeze, verifyFreeze, type FreezeRecord } from "./freeze.js";
 import {
@@ -34,14 +35,7 @@ import type {
   TaskScoring,
   TraceData,
 } from "./types.js";
-import {
-  parseHybridConfig,
-  parseHybridTask,
-  parseTaskScoring,
-  PROMPT_VERSION,
-  PROTOCOL_ID,
-  RESULT_SCHEMA_VERSION,
-} from "./types.js";
+import { PROMPT_VERSION, PROTOCOL_ID, RESULT_SCHEMA_VERSION } from "./types.js";
 
 interface CliOptions {
   readonly config?: string;

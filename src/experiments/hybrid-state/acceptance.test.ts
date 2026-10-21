@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { loadHybridConfig, parseManifest, ResultWriter } from "./cli.js";
+import { parseHybridConfig } from "./config_parsing.js";
 import { reportMarkdown } from "./evaluation.js";
 import { buildProjection } from "./projection.js";
 import { buildActorRequest } from "./prompts.js";
@@ -23,7 +24,7 @@ import {
 import { runClosedLoop } from "./runner.js";
 import { safePath, TaskEnvironment } from "./task_environment.js";
 import type { ActorRequest, HybridConfig, HybridTask, JevQuestion, TraceMessage } from "./types.js";
-import { emptyMemory, emptyUsage, parseHybridConfig } from "./types.js";
+import { emptyMemory, emptyUsage } from "./types.js";
 import { applyOperations, initialFacts } from "./update.js";
 
 const budgets = {
