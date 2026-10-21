@@ -30,30 +30,11 @@ export function parseTraceEntries(
   options: TraceReadOptions = {},
 ): TraceData {
   const branch = selectBranch(entries, options.leaf);
-  const messages: TraceMessage[] = [];
-  const missingText: string[] = [];
-  let sequence = 0;
-  for (const entry of branch) {
-    const message = isRecord(entry.message) ? entry.message : entry;
-    if (!isRecord(message)) continue;
-    const sourceId = typeof entry.id === "string" ? entry.id : `entry-${sequence + 1}`;
-    const parsed = parseMessage(message, sourceId, sequence);
-    if (
-      !parsed.length &&
-      ((entry.type === "message" && message.role !== "system") || entry.type === "agent_end")
-    )
-      missingText.push(sourceId);
-    for (const item of parsed) messages.push({ ...item, sequence: sequence++ });
-  }
-  const format = options.synthetic
-    ? "synthetic"
-    : branch.some((entry) => entry.type === "message")
-      ? "pi"
-      : "event-only";
+  const { messages, missingText } = collectMessages(branch);
   const sourceHash = hash(JSON.stringify(messages));
   const events = deriveEvents(messages);
   return {
-    format,
+    format: traceFormat(branch, options),
     ...(options.session ? { sessionPath: options.session } : {}),
     leaf: options.leaf ?? branch.at(-1)?.id?.toString() ?? null,
     messages,
@@ -61,6 +42,33 @@ export function parseTraceEntries(
     missingText,
     sourceHash,
   };
+}
+
+function collectMessages(branch: readonly Record<string, unknown>[]) {
+  const messages: TraceMessage[] = [];
+  const missingText: string[] = [];
+  let sequence = 0;
+  for (const entry of branch) {
+    const message = isRecord(entry.message) ? entry.message : entry;
+    const sourceId = typeof entry.id === "string" ? entry.id : `entry-${sequence + 1}`;
+    const parsed = parseMessage(message, sourceId, sequence);
+    if (!parsed.length && expectsText(entry, message)) missingText.push(sourceId);
+    for (const item of parsed) messages.push({ ...item, sequence: sequence++ });
+  }
+  return { messages, missingText };
+}
+
+function expectsText(entry: Record<string, unknown>, message: Record<string, unknown>): boolean {
+  if (entry.type === "agent_end") return true;
+  return entry.type === "message" && message.role !== "system";
+}
+
+function traceFormat(
+  branch: readonly Record<string, unknown>[],
+  options: TraceReadOptions,
+): TraceData["format"] {
+  if (options.synthetic) return "synthetic";
+  return branch.some((entry) => entry.type === "message") ? "pi" : "event-only";
 }
 
 export function generateCandidates(
@@ -77,7 +85,7 @@ export function generateCandidates(
       const truncated = Buffer.byteLength(text) > maxBytes;
       const category = classify(message);
       const candidate: Candidate = {
-        id: candidateId(message, unit.start, unit.end, text),
+        id: candidateId(message, unit, text),
         category,
         sourceId: message.sourceId,
         sourceIds: [message.sourceId],
@@ -109,11 +117,10 @@ export function latestGroup(history: readonly TraceMessage[], fromIndex = 0): Ob
 
 export function candidateId(
   message: TraceMessage,
-  start: number,
-  end: number,
+  span: { readonly start: number; readonly end: number },
   text: string,
 ): string {
-  const digest = hash(`${message.id}:${start}:${end}:${text}`).slice(0, 12);
+  const digest = hash(`${message.id}:${span.start}:${span.end}:${text}`).slice(0, 12);
   return `cand-${digest}`;
 }
 
@@ -149,116 +156,185 @@ function selectBranch(
   return branch.reverse();
 }
 
+type MessageParser = (
+  message: Record<string, unknown>,
+  sourceId: string,
+  sequence: number,
+) => TraceMessage[];
+
+const MESSAGE_PARSERS = new Map<unknown, MessageParser>([
+  ["user", parseUser],
+  ["toolResult", parseToolResult],
+  ["user_prompt", parseUserPrompt],
+  ["tool_call", parseToolCall],
+  ["tool_result", parseRecordedToolResult],
+  ["agent_end", parseAgentEnd],
+  ["assistant", parseAssistant],
+]);
+
 function parseMessage(
   message: Record<string, unknown>,
   sourceId: string,
   sequence: number,
 ): TraceMessage[] {
   const role = typeof message.role === "string" ? message.role : message.type;
-  if (role === "user") {
-    const text = visibleText(message.content);
-    return text
-      ? [{ id: `${sourceId}:text`, role, text, sequence, sourceId, truncated: false }]
-      : [];
-  }
-  if (role === "toolResult") {
-    const text = visibleText(message.content);
-    return [
-      {
-        id: `${sourceId}:result`,
-        role: "tool_result",
-        text,
-        sequence,
-        sourceId,
-        ...(typeof message.toolName === "string" ? { toolName: message.toolName } : {}),
-        ...(typeof message.toolCallId === "string" ? { toolCallId: message.toolCallId } : {}),
-        isError: message.isError === true,
-        truncated: false,
-      },
-    ];
-  }
-  if (role === "user_prompt") {
-    const text = typeof message.text === "string" ? message.text : "";
-    return text
-      ? [{ id: `${sourceId}:text`, role: "user", text, sequence, sourceId, truncated: false }]
-      : [];
-  }
-  if (role === "tool_call") {
-    const input = isRecord(message.input) ? message.input : {};
-    return [
-      {
-        id: `${sourceId}:call`,
-        role: "tool_call",
-        text: JSON.stringify(input),
-        sequence,
-        sourceId,
-        ...(typeof message.toolName === "string" ? { toolName: message.toolName } : {}),
-        ...(typeof message.toolCallId === "string" ? { toolCallId: message.toolCallId } : {}),
-        truncated: false,
-      },
-    ];
-  }
-  if (role === "tool_result") {
-    const excerpt = isRecord(message.excerpt) ? message.excerpt : undefined;
-    const text = typeof excerpt?.head === "string" ? excerpt.head : "";
-    return [
-      {
-        id: `${sourceId}:result`,
-        role: "tool_result",
-        text,
-        sequence,
-        sourceId,
-        ...(typeof message.toolName === "string" ? { toolName: message.toolName } : {}),
-        ...(typeof message.toolCallId === "string" ? { toolCallId: message.toolCallId } : {}),
-        isError: message.isError === true,
-        truncated: excerpt?.truncated === true,
-      },
-    ];
-  }
-  if (role === "agent_end") {
-    const finalText = isRecord(message.finalText) ? message.finalText.head : undefined;
-    return typeof finalText === "string" && finalText
-      ? [
-          {
-            id: `${sourceId}:text`,
-            role: "assistant",
-            text: finalText,
-            sequence,
-            sourceId,
-            truncated: isRecord(message.finalText) && message.finalText.truncated === true,
-          },
-        ]
-      : [];
-  }
-  if (role !== "assistant" || !Array.isArray(message.content)) return [];
+  const parser = MESSAGE_PARSERS.get(role);
+  return parser ? parser(message, sourceId, sequence) : [];
+}
+
+function toolFields(
+  name: unknown,
+  callId: unknown,
+): { readonly toolName?: string; readonly toolCallId?: string } {
+  return {
+    ...(typeof name === "string" ? { toolName: name } : {}),
+    ...(typeof callId === "string" ? { toolCallId: callId } : {}),
+  };
+}
+
+function userMessages(text: string, sourceId: string, sequence: number): TraceMessage[] {
+  return text
+    ? [{ id: `${sourceId}:text`, role: "user", text, sequence, sourceId, truncated: false }]
+    : [];
+}
+
+function parseUser(
+  message: Record<string, unknown>,
+  sourceId: string,
+  sequence: number,
+): TraceMessage[] {
+  return userMessages(visibleText(message.content), sourceId, sequence);
+}
+
+function parseUserPrompt(
+  message: Record<string, unknown>,
+  sourceId: string,
+  sequence: number,
+): TraceMessage[] {
+  const text = typeof message.text === "string" ? message.text : "";
+  return userMessages(text, sourceId, sequence);
+}
+
+function parseToolResult(
+  message: Record<string, unknown>,
+  sourceId: string,
+  sequence: number,
+): TraceMessage[] {
+  return [
+    {
+      id: `${sourceId}:result`,
+      role: "tool_result",
+      text: visibleText(message.content),
+      sequence,
+      sourceId,
+      ...toolFields(message.toolName, message.toolCallId),
+      isError: message.isError === true,
+      truncated: false,
+    },
+  ];
+}
+
+function parseToolCall(
+  message: Record<string, unknown>,
+  sourceId: string,
+  sequence: number,
+): TraceMessage[] {
+  const input = isRecord(message.input) ? message.input : {};
+  return [
+    {
+      id: `${sourceId}:call`,
+      role: "tool_call",
+      text: JSON.stringify(input),
+      sequence,
+      sourceId,
+      ...toolFields(message.toolName, message.toolCallId),
+      truncated: false,
+    },
+  ];
+}
+
+function parseRecordedToolResult(
+  message: Record<string, unknown>,
+  sourceId: string,
+  sequence: number,
+): TraceMessage[] {
+  const excerpt = isRecord(message.excerpt) ? message.excerpt : undefined;
+  const text = typeof excerpt?.head === "string" ? excerpt.head : "";
+  return [
+    {
+      id: `${sourceId}:result`,
+      role: "tool_result",
+      text,
+      sequence,
+      sourceId,
+      ...toolFields(message.toolName, message.toolCallId),
+      isError: message.isError === true,
+      truncated: excerpt?.truncated === true,
+    },
+  ];
+}
+
+function parseAgentEnd(
+  message: Record<string, unknown>,
+  sourceId: string,
+  sequence: number,
+): TraceMessage[] {
+  const finalText = isRecord(message.finalText) ? message.finalText : undefined;
+  const head = finalText?.head;
+  if (typeof head !== "string" || !head) return [];
+  return [
+    {
+      id: `${sourceId}:text`,
+      role: "assistant",
+      text: head,
+      sequence,
+      sourceId,
+      truncated: finalText?.truncated === true,
+    },
+  ];
+}
+
+function parseAssistant(
+  message: Record<string, unknown>,
+  sourceId: string,
+  sequence: number,
+): TraceMessage[] {
+  if (!Array.isArray(message.content)) return [];
   const result: TraceMessage[] = [];
   for (const block of message.content) {
     if (!isRecord(block)) continue;
-    if (block.type === "text" && typeof block.text === "string" && block.text) {
-      result.push({
-        id: `${sourceId}:text:${result.length}`,
-        role,
-        text: block.text,
-        sequence,
-        sourceId,
-        truncated: false,
-      });
-    }
-    if (block.type === "toolCall") {
-      const args = isRecord(block.arguments) ? block.arguments : {};
-      result.push({
-        id: `${sourceId}:call:${result.length}`,
-        role: "tool_call",
-        text: JSON.stringify(args),
-        sequence,
-        sourceId,
-        ...(typeof block.name === "string" ? { toolName: block.name } : {}),
-        ...(typeof block.id === "string" ? { toolCallId: block.id } : {}),
-        truncated: false,
-      });
-    }
+    const parsed = parseAssistantBlock(block, { sourceId, sequence }, result.length);
+    if (parsed) result.push(parsed);
   }
   return result;
+}
+
+function parseAssistantBlock(
+  block: Record<string, unknown>,
+  origin: { readonly sourceId: string; readonly sequence: number },
+  index: number,
+): TraceMessage | undefined {
+  const { sourceId, sequence } = origin;
+  if (block.type === "text" && typeof block.text === "string" && block.text)
+    return {
+      id: `${sourceId}:text:${index}`,
+      role: "assistant",
+      text: block.text,
+      sequence,
+      sourceId,
+      truncated: false,
+    };
+  if (block.type !== "toolCall") return undefined;
+  const args = isRecord(block.arguments) ? block.arguments : {};
+  return {
+    id: `${sourceId}:call:${index}`,
+    role: "tool_call",
+    text: JSON.stringify(args),
+    sequence,
+    sourceId,
+    ...toolFields(block.name, block.id),
+    truncated: false,
+  };
 }
 
 function visibleText(value: unknown): string {

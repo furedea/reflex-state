@@ -74,12 +74,11 @@ export function buildJevRequest(
 export function buildRepairRequest(
   input: UpdateInput,
   reasons: readonly RepairRequest["reasons"][number][],
-  candidates: readonly Candidate[],
   model: string,
 ): RepairRequest {
   return {
     state: serializeState(input.facts, input.memory),
-    observations: candidates,
+    observations: input.candidates.filter((candidate) => candidate.contextComplete),
     reasons,
     model,
     promptVersion: promptHash("repair", JSON.stringify(reasons)),

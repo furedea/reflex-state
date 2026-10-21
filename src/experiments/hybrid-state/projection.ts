@@ -48,7 +48,7 @@ export function buildProjection(input: ProjectionInput): ProjectedInput {
       action_budget: input.actionBudget,
     });
     const bytes = {
-      ...sizes("", "", "", history, feedback),
+      ...sizes({ history, feedback }),
       total: byteLength(userText),
     };
     return {
@@ -68,28 +68,24 @@ export function buildProjection(input: ProjectionInput): ProjectedInput {
   }
   const facts = JSON.stringify(input.facts);
   if (byteLength(facts) > input.budgets.factsBytes)
-    return unavailable(input, "facts_metadata_exceeds_budget", fixedTools, allowedTests, facts);
+    return unavailable(input, "facts_metadata_exceeds_budget", { fixedTools, allowedTests, facts });
   const memoryResult = boundedMemory(input.memory, input.budgets.memoryBytes);
   if (memoryResult.unavailable)
-    return unavailable(
-      input,
-      memoryResult.unavailable,
+    return unavailable(input, memoryResult.unavailable, {
       fixedTools,
       allowedTests,
       facts,
-      memoryResult.text,
-    );
+      memory: memoryResult.text,
+    });
   const latestText = renderObservationGroup(input.latest);
   if (byteLength(latestText) > input.budgets.latestObservationBytes)
-    return unavailable(
-      input,
-      "latest_observation_exceeds_budget",
+    return unavailable(input, "latest_observation_exceeds_budget", {
       fixedTools,
       allowedTests,
       facts,
-      memoryResult.text,
-      latestText,
-    );
+      memory: memoryResult.text,
+      latest: latestText,
+    });
   const userText = sentText({
     instruction: input.instruction,
     tools: fixedTools,
@@ -104,16 +100,14 @@ export function buildProjection(input: ProjectionInput): ProjectedInput {
   });
   const truncated = memoryResult.truncated;
   if (byteLength(userText) > input.budgets.requestBytes)
-    return unavailable(
-      input,
-      "state_first_request_exceeds_budget",
+    return unavailable(input, "state_first_request_exceeds_budget", {
       fixedTools,
       allowedTests,
       facts,
-      memoryResult.text,
-      latestText,
+      memory: memoryResult.text,
+      latest: latestText,
       truncated,
-    );
+    });
   return {
     bundle: {
       mode: input.mode,
@@ -123,7 +117,7 @@ export function buildProjection(input: ProjectionInput): ProjectedInput {
       memory: memoryResult.text,
       latest: latestText,
       bytes: {
-        ...sizes(facts, memoryResult.text, latestText, "", feedback),
+        ...sizes({ facts, memory: memoryResult.text, latest: latestText, feedback }),
         total: byteLength(userText),
       },
       truncated,
@@ -243,16 +237,21 @@ function boundedMemory(
   return { text, truncated: omitted.length ? ["memory"] : [] };
 }
 
+interface UnavailableDetail {
+  readonly fixedTools: readonly string[];
+  readonly allowedTests: readonly string[];
+  readonly facts?: string;
+  readonly memory?: string;
+  readonly latest?: string;
+  readonly truncated?: readonly string[];
+}
+
 function unavailable(
   input: ProjectionInput,
   reason: string,
-  fixedTools: readonly string[],
-  allowedTests: readonly string[],
-  facts = "",
-  memory = "",
-  latest = "",
-  truncated: readonly string[] = [],
+  detail: UnavailableDetail,
 ): ProjectedInput {
+  const { fixedTools, allowedTests, facts = "", memory = "", latest = "", truncated = [] } = detail;
   const userText = sentText({
     instruction: input.instruction,
     tools: fixedTools,
@@ -268,7 +267,7 @@ function unavailable(
         }
       : {}),
   });
-  const bytes = sizes(facts, memory, latest, "", feedbackBytes(input));
+  const bytes = sizes({ facts, memory, latest, feedback: feedbackBytes(input) });
   return {
     bundle: {
       mode: input.mode,
@@ -301,13 +300,16 @@ function feedbackBytes(input: ProjectionInput): number {
   );
 }
 
-function sizes(
-  facts: string,
-  memory: string,
-  latest: string,
-  history: string,
-  feedback: number,
-): InputBundle["bytes"] {
+interface SizedParts {
+  readonly facts?: string;
+  readonly memory?: string;
+  readonly latest?: string;
+  readonly history?: string;
+  readonly feedback: number;
+}
+
+function sizes(parts: SizedParts): InputBundle["bytes"] {
+  const { facts = "", memory = "", latest = "", history = "", feedback } = parts;
   return {
     total: 0,
     facts: byteLength(facts),
