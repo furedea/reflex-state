@@ -107,14 +107,12 @@ function relevanceCandidates({ event, facts, state, config }: StateUpdateContext
   );
   if (!admitsEvidence(event, facts) || remaining.length + 1 <= config.limits.maxWorkingSetEvents)
     return [];
-  return remaining.slice(0, 4).map(
-    (id): RequestPlanItem => ({
-      id: "relevant_" + id,
-      kind: "relevance",
-      eventId: id,
-      requiredEvidence: [id],
-    }),
-  );
+  return remaining.slice(0, 4).map((id): RequestPlanItem => ({
+    id: "relevant_" + id,
+    kind: "relevance",
+    eventId: id,
+    requiredEvidence: [id],
+  }));
 }
 
 function withinInputBudget(
